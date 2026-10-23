@@ -275,6 +275,24 @@ column max width: 760px.
   been shown by a real Show action, every frame re-asserts
   `Visible(false)` (the launch hold, `enforce_launch_hold`) so
   the window can neither flash nor stick open.
+  **Window placement memory (v1.2.5):** while the window is
+  visible, `track_window_geometry` records its outer position,
+  inner size and maximized flag into `prefs.window_geom`
+  (throttled to one config write per second, flushed again on
+  every quit path — `quit_now`'s save and `on_exit`). Hidden or
+  taskbar-minimized frames never record (their rects are junk),
+  and a maximized window only updates the flag — the stored
+  pos/size stay the restore rect. At startup, main() feeds the
+  saved geometry through `restore_placement` with the current
+  virtual desktop (GetSystemMetrics, converted to points via
+  the system DPI): a position is applied only if ≥120×40 pt of
+  the window would intersect the virtual desktop — otherwise
+  the position (and maximized) is dropped and the window opens
+  with default placement, keeping a sane saved size. The
+  placement composes with the launch mode: a Minimized launch
+  still starts hidden, with the geometry applied underneath so
+  the eventual Show lands in the right place; a saved maximized
+  state is restored when the launch mode itself is Normal.
 - **Single instance & tray event pumping (v1.2.2) — Windows.** The
   app is single-instance: the first process holds the named mutex
   `SmartLifeTuyaDesktop.SingleInstance` for its lifetime. A later

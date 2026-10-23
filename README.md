@@ -105,6 +105,20 @@ instructions below.)
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.2.5
+
+- **The app remembers where its window was (Windows app).**
+  Window position, size and maximized state are saved as you
+  use the app, and the next launch reopens on the same monitor
+  in the same place — including a second monitor in portrait.
+  The saved spot is checked against the monitors you actually
+  have now: if that monitor was unplugged or your layout
+  changed so the window would land off-screen, it falls back
+  to the default placement instead of vanishing. Starts
+  minimized to the tray exactly as before — the placement
+  applies underneath, so opening from the tray lands in the
+  right place.
+
 ## What's new in 1.2.4
 
 - **Fixed: "Minimized (to tray)" launches opening as a normal
