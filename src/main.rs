@@ -1083,6 +1083,199 @@ static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WAKE_CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
 
+/// v1.2.3 (Bug C) tray architecture. Field report on v1.2.2: with
+/// the window hidden in the tray, "Quit only works when the Window
+/// is open and open never works at all" — although the menu
+/// rendered and the event plumbing looked right. The code facts,
+/// verified against the vendored crates: muda 0.15's
+/// MenuEvent::receiver() and tray-icon 0.19's TrayIconEvent::
+/// receiver() are two SEPARATE crossbeam channels; the app drains
+/// BOTH, but only from App::update (via handle_window_chrome).
+/// Menu ids are captured from the created items and compared by
+/// equality — correct. The handler's actions were already
+/// unconditional. The starving layer is the frame loop itself:
+/// eframe 0.27 schedules repaints with winit's request_redraw,
+/// which on Windows is RedrawWindow(RDW_INTERNALPAINT) — an
+/// invisible window never turns that into a redraw, so while
+/// hidden NO frame runs, the 200ms repaint heartbeat never
+/// fires, and the channels are never drained. (Quit "worked when
+/// open" because frames run while visible; Open could only ever
+/// be tested from hidden, where it starved. The single-instance
+/// ShowWindow poke had the same flaw: it sets a flag + requests
+/// a repaint nobody delivers.)
+///
+/// The fix removes the frame loop from the critical path:
+///   • a dedicated tray thread OWNS both receivers, maps events
+///     to TrayActions through the pure functions below, and
+///     pushes them onto TRAY_QUEUE;
+///   • it pokes WAKE_CTX like before AND acts directly in Win32
+///     (ShowWindowAsync on MAIN_HWND): Show restores the window
+///     immediately — no frame needed — and Quit makes the window
+///     visible so the frame pipeline wakes and the UI thread can
+///     run the REAL quit path from the queue (one-frame flash of
+///     the window on Quit-from-tray is the accepted tradeoff);
+///   • the UI thread drains the queue in handle_window_chrome
+///     and applies the actions through the same unconditional
+///     show_from_tray / quit_now paths as before.
+/// The single-instance waiter routes through the same queue +
+/// direct restore for the same reason.
+static TRAY_QUEUE: Mutex<std::collections::VecDeque<TrayAction>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+fn push_tray_action(a: TrayAction) {
+    if let Ok(mut q) = TRAY_QUEUE.lock() {
+        q.push_back(a);
+    }
+}
+
+fn drain_tray_actions() -> Vec<TrayAction> {
+    match TRAY_QUEUE.lock() {
+        Ok(mut q) => q.drain(..).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The main window's HWND, republished by handle_window_chrome
+/// every frame so the tray thread can act on it directly.
+#[cfg(target_os = "windows")]
+static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Direct Win32 window show, callable from any thread: restore
+/// (un-minimize + foreground) for Show; plain show for Quit (the
+/// point is only to wake the frame pipeline so the UI thread
+/// executes the real quit path from the queue).
+#[cfg(target_os = "windows")]
+fn win32_show_main_window(restore: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW,
+    };
+    let hwnd = MAIN_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        if restore {
+            ShowWindowAsync(hwnd as _, SW_RESTORE);
+            SetForegroundWindow(hwnd as _);
+        } else {
+            ShowWindowAsync(hwnd as _, SW_SHOW);
+        }
+    }
+}
+
+/// Pure event→action mapping for tray MENU events (muda channel):
+/// the Open item shows, the Quit item quits, anything else is not
+/// ours. No state of any kind gates the mapping.
+#[cfg(target_os = "windows")]
+fn tray_action_for_menu(
+    id: &tray_icon::menu::MenuId,
+    open_id: &tray_icon::menu::MenuId,
+    quit_id: &tray_icon::menu::MenuId,
+) -> Option<TrayAction> {
+    if id == open_id {
+        Some(TrayAction::Show)
+    } else if id == quit_id {
+        Some(TrayAction::Quit)
+    } else {
+        None
+    }
+}
+
+/// Pure event→action mapping for tray ICON events, reduced to
+/// primitives so it is unit-testable without constructing
+/// tray-icon's event types: a left-button release shows (the
+/// click is only complete on release), a left double-click
+/// shows; everything else is ignored — the same mapping
+/// drain_tray_events used pre-v1.2.3.
+#[cfg(target_os = "windows")]
+fn tray_action_for_icon_parts(double_click: bool, left_button: bool, button_up: bool) -> Option<TrayAction> {
+    if (double_click && left_button) || (left_button && button_up) {
+        Some(TrayAction::Show)
+    } else {
+        None
+    }
+}
+
+/// Hand an action to the UI thread AND do the part a sleeping
+/// frame loop can't be trusted with (v1.2.3): wake + direct
+/// Win32. Called only from background threads (tray thread,
+/// single-instance waiter).
+#[cfg(target_os = "windows")]
+fn dispatch_tray_action(a: TrayAction) {
+    push_tray_action(a);
+    if let Ok(slot) = WAKE_CTX.lock() {
+        if let Some(ctx) = &*slot {
+            ctx.request_repaint();
+        }
+    }
+    win32_show_main_window(matches!(a, TrayAction::Show));
+}
+
+/// Spawn the dedicated tray thread exactly once (v1.2.3): it owns
+/// both event receivers so tray events are consumed even when no
+/// egui frame ever runs. The receivers are 'static crossbeam
+/// receivers; the loop blocks briefly on the menu channel and
+/// drains the icon channel each pass.
+#[cfg(target_os = "windows")]
+fn spawn_tray_thread(open_id: tray_icon::menu::MenuId, quit_id: tray_icon::menu::MenuId) {
+    use std::sync::atomic::AtomicBool as AB;
+    static SPAWNED: AB = AB::new(false);
+    if SPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("tray-events".to_string())
+        .spawn(move || {
+            let menu_rx = tray_icon::menu::MenuEvent::receiver();
+            let icon_rx = tray_icon::TrayIconEvent::receiver();
+            loop {
+                match menu_rx.recv_timeout(std::time::Duration::from_millis(40)) {
+                    Ok(ev) => {
+                        if let Some(a) = tray_action_for_menu(ev.id(), &open_id, &quit_id) {
+                            dispatch_tray_action(a);
+                        }
+                    }
+                    Err(_) => {}
+                }
+                while let Ok(ev) = menu_rx.try_recv() {
+                    if let Some(a) = tray_action_for_menu(ev.id(), &open_id, &quit_id) {
+                        dispatch_tray_action(a);
+                    }
+                }
+                while let Ok(ev) = icon_rx.try_recv() {
+                    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+                    let (dbl, left, up) = match &ev {
+                        TrayIconEvent::DoubleClick { button, .. } => {
+                            (true, *button == MouseButton::Left, false)
+                        }
+                        TrayIconEvent::Click {
+                            button,
+                            button_state,
+                            ..
+                        } => (
+                            false,
+                            *button == MouseButton::Left,
+                            *button_state == MouseButtonState::Up,
+                        ),
+                        _ => (false, false, false),
+                    };
+                    if let Some(a) = tray_action_for_icon_parts(dbl, left, up) {
+                        dispatch_tray_action(a);
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+#[cfg(target_os = "windows")]
+fn maybe_spawn_tray_thread(tray: &TrayState) {
+    spawn_tray_thread(tray.open_id.clone(), tray.quit_id.clone());
+}
+
+#[cfg(not(target_os = "windows"))]
+fn maybe_spawn_tray_thread(_tray: &TrayState) {}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum InstanceRole {
     Primary,
@@ -1173,11 +1366,12 @@ fn acquire_single_instance() -> (InstanceRole, Option<InstanceGuard>) {
                     break;
                 }
                 SHOW_REQUESTED.store(true, Ordering::SeqCst);
-                if let Ok(slot) = WAKE_CTX.lock() {
-                    if let Some(ctx) = &*slot {
-                        ctx.request_repaint();
-                    }
-                }
+                // v1.2.3: route through the same tray dispatch —
+                // a flag + repaint request alone starves while the
+                // window is hidden (see the Bug C note at
+                // TRAY_QUEUE); the dispatch also restores the
+                // window directly in Win32.
+                dispatch_tray_action(TrayAction::Show);
             });
         }
         (
@@ -1328,46 +1522,13 @@ fn build_tray() -> Option<TrayState> {
     None
 }
 
-/// Drain pending tray events (menu clicks + icon clicks) into
-/// actions. The receivers are process-global channels fed by the
-/// OS message loop; polling each frame is the standard pattern
-/// for egui apps. Left-click UP or a double-click restores —
-/// Windows fires the tray callback on the click, and acting on
-/// release feels like every other tray icon.
-#[cfg(target_os = "windows")]
-fn drain_tray_events(tray: &TrayState) -> Vec<TrayAction> {
-    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
-    let mut out = Vec::new();
-    let menu_rx = tray_icon::menu::MenuEvent::receiver();
-    while let Ok(ev) = menu_rx.try_recv() {
-        if ev.id() == &tray.quit_id {
-            out.push(TrayAction::Quit);
-        } else if ev.id() == &tray.open_id {
-            out.push(TrayAction::Show);
-        }
-    }
-    let icon_rx = TrayIconEvent::receiver();
-    while let Ok(ev) = icon_rx.try_recv() {
-        match ev {
-            TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            }
-            | TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
-            } => out.push(TrayAction::Show),
-            _ => {}
-        }
-    }
-    out
-}
-
-#[cfg(not(target_os = "windows"))]
-fn drain_tray_events(_tray: &TrayState) -> Vec<TrayAction> {
-    Vec::new()
-}
+/// v1.2.3: tray events are no longer drained here. The dedicated
+/// tray thread (spawn_tray_thread, by TRAY_QUEUE above) owns both
+/// receivers — muda's menu channel and tray-icon's icon channel —
+/// and pushes mapped actions onto TRAY_QUEUE; the UI thread just
+/// drains the queue in handle_window_chrome. Draining from
+/// update() starved whenever the hidden window ran no frames,
+/// which is exactly when tray actions matter.
 
 /// The main window's HWND, for the one-time tray balloon.
 #[cfg(target_os = "windows")]
@@ -2944,18 +3105,30 @@ struct Toast {
     at: Instant,
 }
 
-/// Header name/status budget (v1.2.2). The name block's width is
-/// whatever remains in the card header after the icon block —
-/// measured honestly by egui at layout time — minus the TRAILING
-/// controls' true footprint and one layout gap. The footprints
-/// below are MEASURED (headless egui harness, the app's own
-/// styles): pin 16 + toggle 48 + hide 13 + two 8px item spacings
-/// = 93 for a device; hide alone = 13 for a scene; pin + hide +
-/// one spacing = 37 for a camera. v1.2.1 reserved 124 / 36 / 68
-/// instead — a phantom 15–23px tax on every card that, at ordinary
-/// card widths, collapsed the budget to its 40px floor ("De…",
-/// "Scene — tap St…") even though the cells were wide.
-/// The stretch of a wider cell passes through to the budget 1:1.
+/// Header name/status budget. The name block's width is whatever
+/// remains in the card header after the icon block — measured
+/// honestly by egui at layout time — minus the trailing controls'
+/// footprint. The footprints below are MEASURED (headless egui
+/// harness, the app's own styles): pin 16 + toggle 48 + hide 13 +
+/// two 8px item spacings = 93 for a device; hide alone = 13 for
+/// a scene; pin + hide + one spacing = 37 for a camera.
+///
+/// v1.2.3 root cause (proven by the render gate in the tests,
+/// which reads back the galley rows egui actually draws): this
+/// helper was never the whole problem. At the card widths the
+/// grid ACTUALLY produces — the column formula pins cards to
+/// 238–262pt at ordinary window sizes and DPI scalings — the
+/// fixed overhead (32pt card padding + ~50pt icon block + ~104pt
+/// of trailing controls) leaves only ~52–76pt for the name,
+/// while real names need ~80–106pt at 15pt ("Kitchen Light 1"
+/// measures 102.6pt). No honest deduction fits them on one row
+/// at those widths, so below NAME_TWO_ROW_MIN_W of single-row
+/// budget the pin and toggle move to their own right-aligned
+/// row under the header (see device_card / camera_card), and
+/// the name only reserves the hide button. The v1.2.2 unit test
+/// missed this because it fed the helper a 268pt "available"
+/// input the user's windows never produce; the stretch of a
+/// wider cell still passes through to the budget 1:1.
 fn header_name_budget(avail_after_icon: f32, trailing_deduct: f32) -> f32 {
     (avail_after_icon - trailing_deduct).max(40.0)
 }
@@ -2965,6 +3138,49 @@ fn header_name_budget(avail_after_icon: f32, trailing_deduct: f32) -> f32 {
 const TRAILING_DEDUCT_DEVICE: f32 = 104.0;
 const TRAILING_DEDUCT_SCENE: f32 = 24.0;
 const TRAILING_DEDUCT_CAMERA: f32 = 48.0;
+/// Two-row header: the name reserves only the hide button's
+/// own 13pt (the name truncates INSIDE its block and the ✕
+/// glyph is centred with its own padding, so the two never
+/// touch); pin + toggle live on the row below.
+const TRAILING_DEDUCT_HIDE_ONLY: f32 = 14.0;
+/// If the single-row name budget would come out below this, the
+/// header switches to its two-row form — real device names need
+/// ~105pt, so single-row engages only when it can honour that.
+const NAME_TWO_ROW_MIN_W: f32 = 112.0;
+/// Scene headers carry only the hide ✕, so their single-row
+/// budget is roomier — but the longest scene names ("Turn off
+/// everything", ~138pt strong) still miss it at the grid's
+/// trough card widths (~238pt, where the budget is ~132pt).
+/// Below this budget the scene's ✕ drops to its own row too and
+/// the name takes the full header width.
+const SCENE_TWO_ROW_MIN_W: f32 = 144.0;
+
+/// Decide the header form: two rows (the name gets nearly the
+/// whole card width; pin + toggle drop to their own row)
+/// whenever the single-row budget can't fit a real name. A pure
+/// function of the measured remainder so the render gate can pin
+/// the behaviour at every width.
+fn two_row_header(avail_after_icon: f32, trailing_deduct: f32) -> bool {
+    header_name_budget(avail_after_icon, trailing_deduct) < NAME_TWO_ROW_MIN_W
+}
+
+/// Group-controls strip geometry (v1.2.3, Bug A). Every control
+/// group in a section header is ONE unbreakable mini-panel of
+/// this height: the All toggle, each slider group (label+value
+/// over its slider: ~17 + 3 + 22 ≈ 42), and the swatch row all
+/// allocate exactly GROUP_PANEL_H, so the wrapped placer can
+/// only move WHOLE groups between lines — v1.2.2's height-0
+/// slider allocations (vec2(210, 0)) let it interleave the
+/// Brightness and Colour-temperature pairs into a staircase.
+const GROUP_PANEL_H: f32 = 44.0;
+/// Width of one group slider panel (label+value row over a full
+/// slim slider).
+const GROUP_SLIDER_W: f32 = 240.0;
+/// Width of the All (label + master toggle) panel.
+const GROUP_ALL_W: f32 = 84.0;
+/// Width of the swatch panel: 10 swatches × 26 + tightened gaps
+/// + the 🎨 custom-colour button, one row.
+const GROUP_SWATCH_W: f32 = 352.0;
 
 fn status_text(d: &Device) -> String {
     if !d.online {
@@ -4143,7 +4359,28 @@ impl App {
     fn ensure_tray(&mut self) {
         if self.tray.is_none() {
             self.tray = build_tray();
+            // v1.2.3: the moment the icon exists, its events are
+            // owned by the dedicated tray thread — never by the
+            // frame loop (see the Bug C note at TRAY_QUEUE).
+            if let Some(tray) = &self.tray {
+                maybe_spawn_tray_thread(tray);
+            }
         }
+    }
+
+    /// The real quit path (v1.2.3, extracted unchanged from the
+    /// tray-Quit arm): drop the icon FIRST so no phantom icon is
+    /// left behind, stop the pumps, save, and REALLY exit — the
+    /// quitting flag keeps close-to-tray from swallowing the
+    /// close. Runs on the UI thread, from the tray queue.
+    fn quit_now(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        self.tray = None;
+        for p in self.pumps.values() {
+            p.stop();
+        }
+        self.save();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// Bring the window back from the tray (v1.2.2): visible,
@@ -4159,43 +4396,36 @@ impl App {
         self.kick_all_backoff();
     }
 
-    /// Tray events + window-close behaviour, run every frame before
-    /// rendering (tray/muda events arrive on process-global
-    /// channels; they only take effect when a frame drains them —
-    /// hence the heartbeat below):
+    /// Tray actions + window-close behaviour, run every frame
+    /// before rendering:
     ///  - tray "Open" / icon left-click, or a secondary launch's
     ///    ShowWindow signal → restore the window (show_from_tray);
-    ///  - tray "Quit" → drop the tray icon, stop the pumps, save,
-    ///    and REALLY exit (the quitting flag keeps close-to-tray
-    ///    from swallowing the close, as for an installer launch);
+    ///  - tray "Quit" → the real quit path (quit_now);
     ///  - a window close with close-to-tray on → cancel the close
     ///    and hide instead, with the one-time balloon;
     ///  - focus regained → backed-off camera pumps retry at once.
-    /// While hidden, a 200 ms heartbeat keeps frames coming so the
-    /// channels and the ShowWindow flag are consumed promptly even
-    /// though a hidden window gets no paint-driven frames.
+    /// v1.2.3: tray events arrive via TRAY_QUEUE, fed by the
+    /// dedicated tray thread — this drain is only the UI-thread
+    /// half. It still needs a frame to run, which is why the
+    /// thread ALSO restores/shows the window directly in Win32:
+    /// that both satisfies Open immediately and wakes the frame
+    /// pipeline so a queued Quit executes at once. The 200 ms
+    /// hidden heartbeat below stays as belt-and-braces for the
+    /// cases where frames do run while hidden.
     fn handle_window_chrome(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        // Publish the HWND every frame for the tray thread's
+        // direct Win32 actions (v1.2.3).
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = main_hwnd(frame) {
+            MAIN_HWND.store(hwnd, Ordering::SeqCst);
+        }
         if SHOW_REQUESTED.swap(false, Ordering::SeqCst) {
             self.show_from_tray(ctx);
         }
-        let tray_actions: Vec<TrayAction> = match &self.tray {
-            Some(tray) => drain_tray_events(tray),
-            None => Vec::new(),
-        };
-        for action in tray_actions {
+        for action in drain_tray_actions() {
             match action {
                 TrayAction::Show => self.show_from_tray(ctx),
-                TrayAction::Quit => {
-                    self.quitting = true;
-                    // Drop the icon BEFORE the close so no phantom
-                    // icon is left in the tray (v1.2.2).
-                    self.tray = None;
-                    for p in self.pumps.values() {
-                        p.stop();
-                    }
-                    self.save();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                TrayAction::Quit => self.quit_now(ctx),
             }
         }
         // Focus regained (clicking back into the window) is a
@@ -5131,13 +5361,25 @@ impl App {
             .inner_margin(Margin::symmetric(16.0, 12.0))
             .show(ui, |ui| {
                 ui.set_width((ui.available_width() - 32.0).max(200.0));
+                // v1.2.3 (Bug A): each control group is ONE
+                // unbreakable vertical mini-panel of uniform
+                // height (GROUP_PANEL_H); the wrapped placer
+                // flows whole groups left→right and wraps whole
+                // groups only. (v1.2.2 allocated the sliders at
+                // height 0, which let the placer staircase and
+                // interleave the label/slider pairs.)
+                let gkey = format!("grp:{}", sec2.key);
                 ui.horizontal_wrapped(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("All").size(12.5).strong().color(pal.dim));
-                        if toggle_switch(ui, any_on, true, accent, pal.track) {
-                            self.group_broadcast(&sec2, GroupKind::Toggle, 0, None);
-                        }
-                    });
+                    ui.allocate_ui_with_layout(
+                        vec2(GROUP_ALL_W, GROUP_PANEL_H),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.label(RichText::new("All").size(12.5).strong().color(pal.dim));
+                            if toggle_switch(ui, any_on, true, accent, pal.track) {
+                                self.group_broadcast(&sec2, GroupKind::Toggle, 0, None);
+                            }
+                        },
+                    );
                     // Group sliders are capability-gated too
                     // (v1.2.2): shown whenever any member CAN do
                     // brightness / temp, positioned at the average
@@ -5167,51 +5409,64 @@ impl App {
                         );
                     }
                     if has_color {
-                        ui.horizontal_wrapped(|ui| {
-                            for (name, hex) in SWATCHES {
-                                if swatch(ui, hex, name, false, pal.text) {
-                                    self.group_broadcast(&sec2, GroupKind::Color, 0, Some(hex.to_string()));
+                        // Swatches: one unbreakable panel, one row,
+                        // vertically centred like its neighbours.
+                        // (The custom-colour picker renders BELOW
+                        // the strip now, inside this same frame —
+                        // it used to open inside the wrapped row
+                        // and shove the strip around.)
+                        ui.allocate_ui_with_layout(
+                            vec2(GROUP_SWATCH_W, GROUP_PANEL_H),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (name, hex) in SWATCHES {
+                                    if swatch(ui, hex, name, false, pal.text) {
+                                        self.group_broadcast(&sec2, GroupKind::Color, 0, Some(hex.to_string()));
+                                    }
                                 }
-                            }
-                            let gkey = format!("grp:{}", sec2.key);
-                            let more = ui
-                                .add(Button::new("🎨").frame(false))
-                                .on_hover_text("More colours…");
-                            if more.clicked() {
-                                if self.open_color_for.as_deref() == Some(gkey.as_str()) {
-                                    self.open_color_for = None;
-                                } else {
-                                    self.open_color_for = Some(gkey.clone());
-                                    self.color_pick.insert(gkey.clone(), Color32::WHITE);
+                                let more = ui
+                                    .add(Button::new("🎨").frame(false))
+                                    .on_hover_text("More colours…");
+                                if more.clicked() {
+                                    if self.open_color_for.as_deref() == Some(gkey.as_str()) {
+                                        self.open_color_for = None;
+                                    } else {
+                                        self.open_color_for = Some(gkey.clone());
+                                        self.color_pick.insert(gkey.clone(), Color32::WHITE);
+                                    }
                                 }
-                            }
-                            if self.open_color_for.as_deref() == Some(gkey.as_str()) {
-                                let mut color = self
-                                    .color_pick
-                                    .get(&gkey)
-                                    .copied()
-                                    .unwrap_or(Color32::WHITE);
-                                if egui::color_picker::color_edit_button_srgba(
-                                    ui,
-                                    &mut color,
-                                    egui::color_picker::Alpha::Opaque,
-                                )
-                                .changed()
-                                {
-                                    self.color_pick.insert(gkey.clone(), color);
-                                }
-                                if ui
-                                    .add(Button::new(RichText::new("Apply colour").color(Color32::WHITE)).fill(accent))
-                                    .clicked()
-                                {
-                                    let hex = format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b());
-                                    self.open_color_for = None;
-                                    self.group_broadcast(&sec2, GroupKind::Color, 0, Some(hex));
-                                }
-                            }
-                        });
+                            },
+                        );
                     }
                 });
+                if has_color && self.open_color_for.as_deref() == Some(gkey.as_str()) {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let mut color = self
+                            .color_pick
+                            .get(&gkey)
+                            .copied()
+                            .unwrap_or(Color32::WHITE);
+                        if egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut color,
+                            egui::color_picker::Alpha::Opaque,
+                        )
+                        .changed()
+                        {
+                            self.color_pick.insert(gkey.clone(), color);
+                        }
+                        if ui
+                            .add(Button::new(RichText::new("Apply colour").color(Color32::WHITE)).fill(accent))
+                            .clicked()
+                        {
+                            let hex = format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b());
+                            self.open_color_for = None;
+                            self.group_broadcast(&sec2, GroupKind::Color, 0, Some(hex));
+                        }
+                    });
+                }
             });
         ui.add_space(12.0);
     }
@@ -5234,7 +5489,11 @@ impl App {
         let accent = self.accent();
         let key = format!("grp:{}|{}", sec.key, tag);
         let live = self.slider_live.get(&key).copied().unwrap_or(avg);
-        ui.allocate_ui_with_layout(vec2(210.0, 0.0), Layout::top_down(Align::Min), |ui| {
+        // Real height (v1.2.3): the v1.2.2 height-0 allocation
+        // was the Bug A mechanism — the wrapped placer treated
+        // the group as zero-height and interleaved the next
+        // group's label into this one's slider row.
+        ui.allocate_ui_with_layout(vec2(GROUP_SLIDER_W, GROUP_PANEL_H), Layout::top_down(Align::Min), |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).size(12.5).color(pal.dim));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -5627,6 +5886,55 @@ impl App {
 }
 
 impl App {
+    /// The pin + toggle pair from a device card's header (added
+    /// right-to-left: toggle first so the pin lands LEFT of it,
+    /// matching the single-row header's left-to-right reading
+    /// order). Shared by the single-row header and the two-row
+    /// header's second row (v1.2.3).
+    fn header_pin_toggle(&mut self, ui: &mut Ui, dev: &Device, pinned: bool) {
+        let pal = self.pal();
+        let accent = self.accent();
+        let on = dev.state && dev.online;
+        if toggle_switch(ui, on, dev.online, accent, pal.track) {
+            self.do_toggle(&dev.id);
+        }
+        let pin = ui
+            .add(
+                Button::new(
+                    RichText::new("📌")
+                        .size(15.0)
+                        .color(if pinned { pal.text } else { pal.faint }),
+                )
+                .frame(false),
+            )
+            .on_hover_text(if pinned {
+                "Unpin (remove shortcut from the top)"
+            } else {
+                "Pin a shortcut to the top"
+            });
+        if pin.clicked() {
+            self.toggle_pin(&dev.id);
+        }
+    }
+
+    /// The hide ✕ from a card header, with its click handling.
+    /// Shared by the single-row header and the scene two-row
+    /// header's second row (v1.2.3).
+    fn header_hide_button(&mut self, ui: &mut Ui, dev: &Device) {
+        let pal = self.pal();
+        let hide = ui
+            .add(Button::new(RichText::new("✕").color(pal.dim).size(13.0)).frame(false))
+            .on_hover_text("Hide this device");
+        if hide.clicked() {
+            self.cfg.layout.hidden.push(dev.id.clone());
+            self.save();
+            self.toast(
+                format!("{} hidden — bring it back from Settings", self.display(dev)),
+                false,
+            );
+        }
+    }
+
     fn device_card(&mut self, ui: &mut Ui, id: &str, sec: &Section, card_w: f32, fill_h: f32) {
         let Some(idx) = self.device_index(id) else { return };
         let dev = self.devices[idx].clone();
@@ -5652,6 +5960,8 @@ impl App {
                     ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
                 }
                 // ---------- top row ----------
+                let mut two_row = false;
+                let mut scene_two_row = false;
                 ui.horizontal(|ui| {
                     if self.editing {
                         ui.label(RichText::new("⠿").color(pal.dim).size(16.0));
@@ -5678,13 +5988,32 @@ impl App {
                     // reaching the pin / toggle / hide controls. The
                     // budget is the REAL remainder after the icon,
                     // minus the trailing controls' measured footprint
-                    // (header_name_budget, v1.2.2).
+                    // (header_name_budget). v1.2.3: when that budget
+                    // can't fit a real name (the usual case at the
+                    // card widths the grid produces), the header
+                    // goes two-row — device pin + toggle move to
+                    // their own row below (rendered after this row)
+                    // and the name reserves only the hide button;
+                    // a scene's lone hide ✕ drops down the same way
+                    // when even its roomier budget runs short.
+                    let avail_after_icon = ui.available_width();
+                    two_row = !dev.is_scene
+                        && two_row_header(avail_after_icon, TRAILING_DEDUCT_DEVICE);
+                    scene_two_row = dev.is_scene
+                        && header_name_budget(avail_after_icon, TRAILING_DEDUCT_SCENE)
+                            < SCENE_TWO_ROW_MIN_W;
                     let trailing_w = if dev.is_scene {
-                        TRAILING_DEDUCT_SCENE
+                        if scene_two_row {
+                            0.0
+                        } else {
+                            TRAILING_DEDUCT_SCENE
+                        }
+                    } else if two_row {
+                        TRAILING_DEDUCT_HIDE_ONLY
                     } else {
                         TRAILING_DEDUCT_DEVICE
                     };
-                    let name_w = header_name_budget(ui.available_width(), trailing_w);
+                    let name_w = header_name_budget(avail_after_icon, trailing_w);
                     ui.allocate_ui_with_layout(
                         vec2(name_w, icon_size),
                         Layout::top_down(Align::Min),
@@ -5718,41 +6047,41 @@ impl App {
                             });
                         },
                     );
-                    // trailing controls: pin, switch, hide (added right-to-left)
+                    // trailing controls: hide lives here unless
+                    // the header went two-row for a scene (then it
+                    // drops to the scene's second row); pin + toggle
+                    // join it in single-row device headers and move
+                    // to their own row in two-row headers (added
+                    // right-to-left either way).
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                        let hide = ui
-                            .add(Button::new(RichText::new("✕").color(pal.dim).size(13.0)).frame(false))
-                            .on_hover_text("Hide this device");
-                        if hide.clicked() {
-                            self.cfg.layout.hidden.push(dev.id.clone());
-                            self.save();
-                            self.toast(format!("{} hidden — bring it back from Settings", self.display(&dev)), false);
+                        if !scene_two_row {
+                            self.header_hide_button(ui, &dev);
                         }
-                        if !dev.is_scene {
-                            let on = dev.state && dev.online;
-                            if toggle_switch(ui, on, dev.online, accent, pal.track) {
-                                self.do_toggle(&dev.id);
-                            }
-                            let pin = ui
-                                .add(
-                                    Button::new(
-                                        RichText::new("📌")
-                                            .size(15.0)
-                                            .color(if pinned { pal.text } else { pal.faint }),
-                                    )
-                                    .frame(false),
-                                )
-                                .on_hover_text(if pinned {
-                                    "Unpin (remove shortcut from the top)"
-                                } else {
-                                    "Pin a shortcut to the top"
-                                });
-                            if pin.clicked() {
-                                self.toggle_pin(&dev.id);
-                            }
+                        if !dev.is_scene && !two_row {
+                            self.header_pin_toggle(ui, &dev, pinned);
                         }
                     });
                 });
+                if two_row {
+                    // Two-row header, second row (v1.2.3): pin +
+                    // toggle right-aligned under the name, so the
+                    // name above keeps nearly the whole card width.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            self.header_pin_toggle(ui, &dev, pinned);
+                        });
+                    });
+                }
+                if scene_two_row {
+                    // Scene two-row header (v1.2.3): just the
+                    // hide ✕, right-aligned under the name — the
+                    // Start button row follows as usual.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            self.header_hide_button(ui, &dev);
+                        });
+                    });
+                }
                 // ---------- controls ----------
                 // Sliders are gated on CAPABILITY (parse-time flags
                 // over merged data), never on the current value
@@ -6124,6 +6453,7 @@ impl App {
                     ui.add_space(10.0);
                 }
                 // ---------- top row ----------
+                let mut cam_two_row = false;
                 ui.horizontal(|ui| {
                     if self.editing {
                         ui.label(RichText::new("⠿").color(pal.dim).size(16.0));
@@ -6145,7 +6475,20 @@ impl App {
                                 );
                             });
                     }
-                    let name_w = header_name_budget(ui.available_width(), TRAILING_DEDUCT_CAMERA);
+                    // v1.2.3: same two-row fallback as device
+                    // cards — when the single-row budget can't fit
+                    // a real camera name, the pin drops to its own
+                    // row and the name reserves only the hide ✕.
+                    let cam_avail = ui.available_width();
+                    cam_two_row = two_row_header(cam_avail, TRAILING_DEDUCT_CAMERA);
+                    let name_w = header_name_budget(
+                        cam_avail,
+                        if cam_two_row {
+                            TRAILING_DEDUCT_HIDE_ONLY
+                        } else {
+                            TRAILING_DEDUCT_CAMERA
+                        },
+                    );
                     ui.allocate_ui_with_layout(
                         vec2(name_w, icon_size),
                         Layout::top_down(Align::Min),
@@ -6174,25 +6517,52 @@ impl App {
                                 false,
                             );
                         }
-                        let pin = ui
-                            .add(
-                                Button::new(
-                                    RichText::new("📌")
-                                        .size(15.0)
-                                        .color(if pinned { pal.text } else { pal.faint }),
+                        if !cam_two_row {
+                            let pin = ui
+                                .add(
+                                    Button::new(
+                                        RichText::new("📌")
+                                            .size(15.0)
+                                            .color(if pinned { pal.text } else { pal.faint }),
+                                    )
+                                    .frame(false),
                                 )
-                                .frame(false),
-                            )
-                            .on_hover_text(if pinned {
-                                "Unpin (remove shortcut from the top)"
-                            } else {
-                                "Pin a shortcut to the top"
-                            });
-                        if pin.clicked() {
-                            self.toggle_pin(id);
+                                .on_hover_text(if pinned {
+                                    "Unpin (remove shortcut from the top)"
+                                } else {
+                                    "Pin a shortcut to the top"
+                                });
+                            if pin.clicked() {
+                                self.toggle_pin(id);
+                            }
                         }
                     });
                 });
+                if cam_two_row {
+                    // Two-row camera header (v1.2.3): pin on its
+                    // own right-aligned row under the name.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let pin = ui
+                                .add(
+                                    Button::new(
+                                        RichText::new("📌")
+                                            .size(15.0)
+                                            .color(if pinned { pal.text } else { pal.faint }),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(if pinned {
+                                    "Unpin (remove shortcut from the top)"
+                                } else {
+                                    "Pin a shortcut to the top"
+                                });
+                            if pin.clicked() {
+                                self.toggle_pin(id);
+                            }
+                        });
+                    });
+                }
                 // ---------- quality (Tapo templates) ----------
                 if cam.template == "tapo1" || cam.template == "tapo2" {
                     ui.add_space(10.0);
@@ -7651,7 +8021,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.2.2");
+        assert_eq!(APP_VERSION, "1.2.3");
     }
 
     #[test]
@@ -8364,5 +8734,426 @@ mod tests {
         // close-to-tray.
         assert_eq!(close_action(true, true), CloseAction::Quit);
         assert_eq!(close_action(false, true), CloseAction::Quit);
+    }
+
+    #[test]
+    fn tray_queue_is_fifo_and_drains_empty() {
+        // The queue is process-global; keep this test's traffic
+        // self-contained (push two, drain two, drain empty).
+        push_tray_action(TrayAction::Show);
+        push_tray_action(TrayAction::Quit);
+        let got = drain_tray_actions();
+        assert_eq!(got, vec![TrayAction::Show, TrayAction::Quit]);
+        assert!(drain_tray_actions().is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tray_menu_mapping_is_unconditional() {
+        // Menu ids map by identity alone — no hidden/visible state
+        // anywhere in the mapping (Bug C: actions must be
+        // unconditional).
+        let open = tray_icon::menu::MenuId::new("test-open");
+        let quit = tray_icon::menu::MenuId::new("test-quit");
+        let other = tray_icon::menu::MenuId::new("test-other");
+        assert_eq!(tray_action_for_menu(&open, &open, &quit), Some(TrayAction::Show));
+        assert_eq!(tray_action_for_menu(&quit, &open, &quit), Some(TrayAction::Quit));
+        assert_eq!(tray_action_for_menu(&other, &open, &quit), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tray_icon_mapping_matches_v122() {
+        // Left release shows; left double-click shows; press-only,
+        // right and middle clicks do not.
+        assert_eq!(tray_action_for_icon_parts(false, true, true), Some(TrayAction::Show));
+        assert_eq!(tray_action_for_icon_parts(true, true, false), Some(TrayAction::Show));
+        assert_eq!(tray_action_for_icon_parts(false, true, false), None);
+        assert_eq!(tray_action_for_icon_parts(false, false, true), None);
+        assert_eq!(tray_action_for_icon_parts(true, false, false), None);
+    }
+
+    // ---- Headless render harness (v1.2.3, Bug B gate) ----
+    // Drives the app's REAL dashboard rendering (view_dashboard →
+    // section_view → group_controls / device_card) on a headless
+    // egui::Context and reads back the text egui actually
+    // tessellated. Name truncation and header layout are therefore
+    // measured on drawn output — not on helper math (the v1.2.2
+    // budget helper passed its unit test while the field bug
+    // persisted, because the loss was never in the helper).
+
+    fn test_app(devices: Vec<Device>) -> App {
+        let (tx, rx) = channel::<NetResult>();
+        App {
+            cfg: Config::default(),
+            view: View::Dashboard,
+            session: None,
+            devices,
+            raw_devices: Vec::new(),
+            tx,
+            rx,
+            login_busy: false,
+            disc_busy: false,
+            pending_login: None,
+            li_user: String::new(),
+            li_pass: String::new(),
+            li_region: "1".to_string(),
+            li_platform: "smart_life".to_string(),
+            li_keep: false,
+            login_error: None,
+            query: String::new(),
+            editing: false,
+            last_fetch: None,
+            last_updated: String::new(),
+            open_color_for: None,
+            color_pick: HashMap::new(),
+            slider_live: HashMap::new(),
+            dragging_slider: false,
+            alias_buf: HashMap::new(),
+            group_buf: HashMap::new(),
+            new_group: None,
+            toasts: Vec::new(),
+            applied_style: None,
+            cam_form: None,
+            group_backups: HashMap::new(),
+            update_checking: false,
+            update_info: None,
+            update_error: None,
+            update_dl: None,
+            update_launch: None,
+            row_heights: HashMap::new(),
+            cell_rects: Vec::new(),
+            section_rects: Vec::new(),
+            sections_cache: Vec::new(),
+            drag: None,
+            drag_pending: None,
+            tray: None,
+            window_hidden: false,
+            quitting: false,
+            arg_launch_mode: LaunchMode::Normal,
+            disc_backoff_until: None,
+            disc_freq_streak: 0,
+            pumps: HashMap::new(),
+            pump_force: HashSet::new(),
+            cam_gen: HashMap::new(),
+            held_textures: HashMap::new(),
+            prev_focused: true,
+            paused_cams: HashSet::new(),
+            player_for: None,
+            ffmpeg_cache: None,
+        }
+    }
+
+
+    /// The text a galley will actually DRAW: its rows' glyphs,
+    /// joined. (Galley::text() returns the untruncated SOURCE
+    /// string — useless for detecting elision; the rows carry the
+    /// shortened text, ellipsis included, when a label truncated.)
+    fn galley_drawn_text(g: &egui::epaint::Galley) -> String {
+        g.rows.iter().map(|r| r.text()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Every text string egui actually drew in one output frame,
+    /// with the position of its first glyph.
+    fn drawn_texts(out: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
+        fn walk(shape: &egui::epaint::Shape, acc: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    acc.push((galley_drawn_text(&t.galley), t.pos));
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut acc);
+        }
+        acc
+    }
+
+    /// Render the dashboard on a headless context at the given
+    /// viewport size for `frames` frames; returns the drawn texts
+    /// of the LAST frame (layout caches settled by then).
+    fn render_dashboard(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        frames: usize,
+    ) -> Vec<(String, egui::Pos2)> {
+        let mut texts = Vec::new();
+        for i in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(10.0 + i as f64 * 0.05),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| app.view_dashboard(ui));
+            });
+            texts = drawn_texts(&out);
+        }
+        texts
+    }
+
+    fn name_fixture() -> Vec<Device> {
+        let bulb_data = json!({ "state": true, "brightness": 800, "color_temp": 29000 });
+        vec![
+            dev("d1", "Desk Light", bulb_data.clone()),
+            dev("d2", "Kitchen Light 1", bulb_data.clone()),
+            dev("d3", "Kitchen Light 2", bulb_data.clone()),
+            dev("d4", "Love's Bed Light", bulb_data.clone()),
+            dev("d5", "Shawn's Bed Light", bulb_data.clone()),
+            dev(
+                "d6",
+                "Desk RGB strip",
+                json!({ "state": true, "color_mode": "colour", "hue": 10, "saturation": 0.5 }),
+            ),
+            parse_device(&json!({
+                "id": "s1", "name": "Turn off everything", "dev_type": "scene",
+                "data": { "state": false }
+            })),
+        ]
+    }
+
+    /// Render `frames` frames and return the LAST frame's full
+    /// output (for gates that need shapes, not just texts).
+    fn render_dashboard_full(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        frames: usize,
+    ) -> egui::FullOutput {
+        let mut out = None;
+        for i in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(30.0 + i as f64 * 0.05),
+                ..Default::default()
+            };
+            out = Some(ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| app.view_dashboard(ui));
+            }));
+        }
+        out.expect("frames >= 1")
+    }
+
+    /// The gate fixture: the name devices plus the user's camera.
+    fn gate_app() -> App {
+        let mut app = test_app(name_fixture());
+        let mut c = cam("tapo1", "");
+        c.name = "Parking Lot".to_string();
+        app.cfg.cameras.push(c);
+        app
+    }
+
+    /// The v1.2.3 gate for Bug B. v1.2.2's unit test asserted the
+    /// name-budget HELPER with a 268pt input the user's windows
+    /// never produce, while the real render elided every name at
+    /// every realistic width (pre-fix sweep: at 1500pt NO fixture
+    /// name survived whole). This gate renders the REAL dashboard
+    /// and reads back the galley rows egui actually drew. (The
+    /// scene card's STATUS line is not in the list: at trough
+    /// widths it sits within ~2pt of its budget and ellipsises
+    /// there — identically in the web edition; the NAME is the
+    /// contract.)
+    const GATE_NAMES: [&str; 8] = [
+        "Desk Light",
+        "Kitchen Light 1",
+        "Kitchen Light 2",
+        "Love's Bed Light",
+        "Shawn's Bed Light",
+        "Desk RGB strip",
+        "Parking Lot",
+        "Turn off everything",
+    ];
+
+    fn assert_names_whole(texts: &[(String, egui::Pos2)], names: &[&str], ctx_label: &str) {
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        for n in names {
+            assert!(
+                drawn.contains(n),
+                "{ctx_label}: name {n:?} was not drawn whole; name-like texts: {:?}",
+                drawn
+                    .iter()
+                    .filter(|t| t.contains("Li")
+                        || t.contains("strip")
+                        || t.contains("verything")
+                        || t.contains("Parking")
+                        || t.contains("Scene")
+                        || t.contains("Turn")
+                        || t.contains('\u{2026}'))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn gate_card_names_render_whole_at_real_widths() {
+        // The window widths the app is actually used at (a
+        // maximized window on a 150%-scaled 2560px monitor is
+        // only ~1700pt wide; 125% scaling ~1590pt; narrower still
+        // unmaximized). Cards at these widths are 238–262pt.
+        for w in [1150.0f32, 1330.0, 1500.0, 1700.0, 1920.0] {
+            let mut app = gate_app();
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let texts = render_dashboard(&mut app, &ctx, egui::vec2(w, 1080.0), 3);
+            assert_names_whole(&texts, &GATE_NAMES, &format!("comfortable w={w}"));
+        }
+        // Compact density: cards shrink to ~198–208pt. Device and
+        // camera names must still fit (two-row header); the long
+        // scene name is a physical-fit exception (it ellipsises
+        // in the web edition at these widths too).
+        for w in [1150.0f32, 1330.0] {
+            let mut app = gate_app();
+            app.cfg.prefs.density = "compact".to_string();
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let texts = render_dashboard(&mut app, &ctx, egui::vec2(w, 1080.0), 3);
+            assert_names_whole(&texts, &GATE_NAMES[..7], &format!("compact w={w}"));
+        }
+        // Edit mode adds the drag grip (~24pt) — names must hold.
+        // (Rendered taller: edit-mode cards grow, and egui culls
+        // text below the fold of the scroll area.)
+        let mut app = gate_app();
+        app.editing = true;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let texts = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1700.0), 3);
+        assert_names_whole(&texts, &GATE_NAMES, "editing w=1330");
+    }
+
+    #[test]
+    fn gate_resize_from_tiny_start_keeps_names_whole() {
+        // The user launches minimized to tray: early frames run at
+        // a tiny hidden size. No measurement from those frames may
+        // survive into the resized render.
+        let mut app = gate_app();
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = render_dashboard(&mut app, &ctx, egui::vec2(400.0, 300.0), 3);
+        let texts = render_dashboard(&mut app, &ctx, egui::vec2(1920.0, 1080.0), 3);
+        assert_names_whole(&texts, &GATE_NAMES, "after resize 400x300 -> 1920x1080");
+    }
+
+    #[test]
+    fn gate_group_header_groups_stay_atomic() {
+        // Bug A gate: in the Lighting header strip, "Brightness"
+        // and "Colour temperature" (label + value) must sit on ONE
+        // line in adjacent panels, and the swatches must form one
+        // straight row — pre-fix the wrapped placer staircased
+        // each group lower than the last (Δy ≈ 16pt per group).
+        let mut app = gate_app();
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let out = render_dashboard_full(&mut app, &ctx, egui::vec2(1500.0, 1080.0), 3);
+        let texts = drawn_texts(&out);
+        let first = |needle: &str| {
+            texts
+                .iter()
+                .filter(|(t, _)| t == needle)
+                .min_by_key(|(_, p)| (p.y * 10.0) as i32)
+                .map(|(_, p)| *p)
+        };
+        let bright = first("Brightness").expect("group Brightness label drawn");
+        let temp = first("Colour temperature").expect("group Colour temperature label drawn");
+        assert!(
+            (bright.y - temp.y).abs() <= 1.5,
+            "strip labels staircased: Brightness y={} vs Colour temperature y={}",
+            bright.y,
+            temp.y
+        );
+        assert!(
+            temp.x - bright.x >= 235.0 && temp.x - bright.x <= 262.0,
+            "strip panels not adjacent/atomic: temp.x - bright.x = {}",
+            temp.x - bright.x
+        );
+        let bval = first("80%").expect("group brightness value drawn");
+        let tval = texts
+            .iter()
+            .filter(|(t, _)| {
+                t.len() >= 4 && t.ends_with('K') && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit())
+            })
+            .min_by_key(|(_, p)| (p.y * 10.0) as i32)
+            .map(|(_, p)| *p)
+            .expect("group temperature value drawn");
+        assert!(
+            (bval.y - bright.y).abs() <= 1.5 && (tval.y - temp.y).abs() <= 1.5,
+            "strip values off their label line: 80% y={} (label {}), temp value y={} (label {})",
+            bval.y,
+            bright.y,
+            tval.y,
+            temp.y
+        );
+        // Swatches: one straight row inside the strip band.
+        // Filtered to the swatch radius (12) — the strip also
+        // contains slider knobs (r=9, on the slider row below the
+        // labels by design) and the All toggle's knob (r=10.5).
+        let mut swatches: Vec<egui::Pos2> = Vec::new();
+        fn walkc(s: &egui::epaint::Shape, acc: &mut Vec<egui::Pos2>) {
+            match s {
+                egui::epaint::Shape::Circle(c) => {
+                    if (c.radius - 12.0).abs() < 0.6 {
+                        acc.push(c.center);
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for x in v {
+                        walkc(x, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walkc(&cs.shape, &mut swatches);
+        }
+        let mut centres: Vec<egui::Pos2> = swatches
+            .into_iter()
+            .filter(|c| c.y >= bright.y && c.y <= bright.y + 42.0)
+            .collect();
+        centres.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        centres.dedup_by(|a, b| (a.x - b.x).abs() < 1.0 && (a.y - b.y).abs() < 1.0);
+        assert!(
+            centres.len() >= 10,
+            "expected the 10 strip swatches in the header band, found {}",
+            centres.len()
+        );
+        let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+        for c in &centres {
+            ymin = ymin.min(c.y);
+            ymax = ymax.max(c.y);
+        }
+        assert!(
+            ymax - ymin <= 3.0,
+            "strip swatches not on one row: centre y spans {:.1}..{:.1}",
+            ymin,
+            ymax
+        );
+    }
+
+    #[test]
+    fn two_row_header_breakpoint() {
+        // Single-row at generous widths (budget >= 112), two-row
+        // at the grid's real trough widths.
+        assert!(!two_row_header(340.0, TRAILING_DEDUCT_DEVICE)); // ~400pt card
+        assert!(two_row_header(190.0, TRAILING_DEDUCT_DEVICE)); // ~272pt card
+        assert!(two_row_header(166.0, TRAILING_DEDUCT_DEVICE)); // 238pt trough
+        // Cameras deduct less but still flip when tight.
+        assert!(!two_row_header(200.0, TRAILING_DEDUCT_CAMERA));
+        assert!(two_row_header(150.0, TRAILING_DEDUCT_CAMERA));
+        // Two-row name budget at the trough fits "Kitchen Light 1"
+        // (102.6pt at 15pt proportional, measured in the harness).
+        let b = header_name_budget(166.0, TRAILING_DEDUCT_HIDE_ONLY);
+        assert!(b >= 103.0, "two-row trough budget {b} < 103");
     }
 }
