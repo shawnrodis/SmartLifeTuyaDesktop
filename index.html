@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.1.0">
+<meta name="version" content="1.2.0">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -247,6 +247,12 @@
   /* camera cards + dialogs */
   .cam-actions{display:flex; gap:8px; margin-top:13px}
   .cam-actions .btn{flex:1}
+  .cam-actions a.btn{text-decoration:none; text-align:center}
+  /* In-tile live feed (gateway embed — see gatewayTileEmbed) */
+  .cam-video{position:relative; margin-bottom:12px; border-radius:10px; overflow:hidden; background:#000; aspect-ratio:16/9}
+  .cam-video img, .cam-video video{width:100%; height:100%; object-fit:cover; display:block; border:0}
+  .cam-live-dot{position:absolute; top:8px; left:9px; display:flex; align-items:center; gap:5px; color:#fff; font-size:11px; font-weight:600; letter-spacing:.4px; text-shadow:0 1px 3px rgba(0,0,0,.7)}
+  .cam-live-dot i{width:8px; height:8px; border-radius:50%; background:#e53935; display:block}
   .seg{display:flex; gap:6px; margin-top:12px}
   .seg .btn{flex:1}
   .seg .btn.active{background:var(--accent); border-color:var(--accent); color:#fff}
@@ -436,7 +442,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.1.0</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.2.0</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -477,11 +483,17 @@
       <div class="panel">
         <h3>Stream gateway &amp; cameras</h3>
         <p class="hint">Cameras you add (✎ Edit → ＋ Add camera) stream over RTSP, which browsers
-        can't play directly. Point ▶ Watch at a small stream gateway on your network —
-        <b>go2rtc</b> or <b>MediaMTX</b> — and the stream plays right in this page. The gateway needs a
+        can't play directly. Point this page at a small stream gateway on your network —
+        <b>go2rtc</b> or <b>MediaMTX</b> — and the stream plays right in this page: inside each
+        camera tile (when previews are on) and in the ▶ Watch player. The gateway needs a
         stream with the <b>same name</b> as the camera here, fed from the same RTSP address
         (the card's Copy URL button gives you the exact address). Leave the address empty to hand
-        streams to an external player app (such as VLC) instead.</p>
+        streams to an external player app (such as VLC) instead. (The Windows edition needs no
+        gateway for tiles — it decodes them natively with a bundled ffmpeg.)</p>
+        <div class="field">
+          <label class="checkline"><input type="checkbox" id="set-previews"> Live camera previews</label>
+          <p class="hint">Show the gateway's feed inside each camera tile. Turn off to keep tiles compact.</p>
+        </div>
         <div class="field">
           <label for="set-gw-url">Stream gateway address (optional)</label>
           <input type="text" id="set-gw-url" placeholder="http://192.168.1.10:1984 (go2rtc) · http://192.168.1.10:8889 (MediaMTX)">
@@ -553,12 +565,16 @@
         <p><b>Watching a stream.</b> Web browsers can't play <code>rtsp://</code> directly. Without a
         gateway, ▶ Watch hands the stream address to a player app installed on your device (such as
         VLC) — or use <b>Copy URL</b> and paste the address into VLC's “Open Network Stream”. For
-        in-browser playback, run a small stream gateway such as <b>go2rtc</b> or <b>MediaMTX</b> on
+        in-page playback, run a small stream gateway such as <b>go2rtc</b> or <b>MediaMTX</b> on
         your network, give it a stream with the <b>same name</b> as the camera here (fed from the
         same RTSP address — Copy URL has it), and enter the gateway's address in
-        Settings → Stream gateway &amp; cameras. ▶ Watch then plays right in this page.</p>
-        <p><b>Limits.</b> Tuya rate-limits the device-list call; if you refresh very often the app may
-        briefly show the last known states. Autorefresh every 30s or slower is comfortable.</p>
+        Settings → Stream gateway &amp; cameras: the feed then plays inside each camera tile and in
+        the ▶ Watch player. (The Windows edition of this app decodes RTSP itself with a bundled
+        ffmpeg — no gateway needed there.)</p>
+        <p><b>Limits.</b> Tuya rate-limits how often the device list can be fetched and how fast
+        commands can be sent. When that happens this page quietly keeps showing the last known
+        states, retries commands a moment later, and stretches its refresh interval until Tuya is
+        happy again — no action needed. Autorefresh every 30s or slower is comfortable.</p>
       </div>
     </main>
   </div>
@@ -796,9 +812,19 @@ function parseDevice(raw) {
     raw: raw
   };
 }
+/* Rate limiting (v1.2.0): Tuya answers bursts with a "FrequentlyInvoke"
+   header code. By product decision the app NEVER surfaces rate-limit
+   warnings — discovery falls back to cached devices and backs off
+   internally, and control commands retry silently (see sendControl)
+   before anything counts as a failure. Genuine errors still report. */
+function isRateLimitCode(code) {
+  if (!code) return false;
+  var c = String(code).toLowerCase();
+  return c === "frequentlyinvoke" || c === "toomanyrequests" || c.indexOf("frequent") >= 0;
+}
 function parseDiscovery(json) {
   if (!json || typeof json !== "object") return { ok: false, error: "Empty response" };
-  if (json.header && json.header.code === "FrequentlyInvoke") return { ok: false, frequent: true };
+  if (json.header && isRateLimitCode(json.header.code)) return { ok: false, frequent: true };
   if (json.payload && Array.isArray(json.payload.devices)) {
     return { ok: true, devices: json.payload.devices.map(parseDevice), rawDevices: json.payload.devices };
   }
@@ -828,11 +854,12 @@ function mergeDeviceData(fresh, previous) {
    hiding. The camera password is stored obfuscated (slc "cameras" key)
    with the same scheme as the saved login. Browsers can't play rtsp://,
    so Watch either hands the URL to an external player or, when a stream
-   gateway (go2rtc / MediaMTX) is configured in Settings, plays in-page. */
+   gateway (go2rtc / MediaMTX) is configured in Settings, plays in-page —
+   and with a gateway the feed also plays inside the camera tiles. */
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.1.0";
+var APP_VERSION = "1.2.0";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -900,6 +927,20 @@ function gatewayWatchUrl(cam, prefs) {
   var name = encodeURIComponent(cam.name || cam.id);
   if (prefs.gatewayType === "mediamtx") return gw + "/" + name + "/index.m3u8";
   return gw + "/stream.html?src=" + name;
+}
+/* In-TILE live embed for a configured gateway (v1.2.0), or null.
+   go2rtc serves an MJPEG stream an <img> can show directly;
+   MediaMTX is embedded as a muted autoplaying HLS <video>.
+   Browsers can't decode RTSP, so without a gateway there is no
+   in-tile feed in this edition — the Windows edition decodes tiles
+   natively with its bundled ffmpeg instead (documented platform
+   difference, DESIGN.md). */
+function gatewayTileEmbed(cam, prefs) {
+  var gw = ((prefs && prefs.gatewayUrl) || "").trim().replace(/\/+$/, "");
+  if (!gw) return null;
+  var name = encodeURIComponent(cam.name || cam.id);
+  if (prefs.gatewayType === "mediamtx") return { kind: "hls", url: gw + "/" + name + "/index.m3u8" };
+  return { kind: "mjpeg", url: gw + "/api/stream.mjpeg?src=" + name };
 }
 function cameraStatusText(cam) {
   var port = parseInt(cam.port, 10) || 554;
@@ -1143,7 +1184,7 @@ async function apiDiscovery(session, proxyCfg, previousRaw, fetchImpl) {
 async function apiControl(session, devId, action, value, proxyCfg, fetchImpl) {
   var json = await apiSkill(session, buildControlBody(session.accessToken, devId, action, value), proxyCfg, fetchImpl);
   var code = json && json.header && json.header.code;
-  return { ok: code === "SUCCESS", code: code || null, raw: json };
+  return { ok: code === "SUCCESS", code: code || null, frequent: isRateLimitCode(code), raw: json };
 }
 
 /* Exported for the node test harness (ignored in the browser). */
@@ -1161,6 +1202,7 @@ var SLC_API = {
   obfuscate: obfuscate, deobfuscate: deobfuscate,
   CAM_TEMPLATES: CAM_TEMPLATES, cameraPath: cameraPath,
   buildRtspUrl: buildRtspUrl, gatewayWatchUrl: gatewayWatchUrl,
+  gatewayTileEmbed: gatewayTileEmbed, isRateLimitCode: isRateLimitCode,
   cameraStatusText: cameraStatusText, cameraToItem: cameraToItem,
   migrateLayout: migrateLayout, displayNameWith: displayNameWith,
   orderSectionItems: orderSectionItems, buildSections: buildSections,
@@ -1195,7 +1237,8 @@ function defaultPrefs() {
     theme: "dark", accent: "#6366f1", density: "comfortable",
     autorefresh: true, interval: 30,
     proxyPreset: "auto", proxyCustom: "",
-    gatewayUrl: "", gatewayType: "go2rtc"
+    gatewayUrl: "", gatewayType: "go2rtc",
+    previews: true
   };
 }
 function defaultLayout() {
@@ -1291,6 +1334,18 @@ function sessionExpired() {
 }
 
 /* ---------------- Device fetching ---------------- */
+/* Tuya rate-limited a discovery call: never warn (v1.2.0) — keep
+   showing the last known states and stretch the effective refresh
+   interval instead. The backoff grows with consecutive hits
+   (interval ×2, ×4, ×8; at least 60 s, at most 5 min) and resets on
+   the next successful fetch. The autorefresh loop skips cycles
+   while it runs. */
+function noteRateLimited() {
+  S.freqStreak = (S.freqStreak || 0) + 1;
+  var shift = Math.min(S.freqStreak, 3);
+  var secs = Math.min(Math.max((S.prefs ? S.prefs.interval : 30) * Math.pow(2, shift), 60), 300);
+  S.freqUntil = Date.now() + secs * 1000;
+}
 async function fetchDevices(isRefresh) {
   if (!S.session) return false;
   await ensureSession(false);
@@ -1308,11 +1363,14 @@ async function fetchDevices(isRefresh) {
     }
   }
   if (res.frequent) {
-    if (S.devices.length) { if (isRefresh) toast("Tuya is rate-limiting — showing last known states"); return true; }
-    toast("Tuya is rate-limiting the device list — wait a few seconds and press Refresh", true);
-    return false;
+    /* Silent (v1.2.0): fall back to whatever devices are already
+       known and back off internally — no toast, no banner. */
+    noteRateLimited();
+    return S.devices.length > 0;
   }
   if (!res.ok) { toast(res.error || "Could not fetch devices", true); return false; }
+  S.freqStreak = 0;
+  S.freqUntil = 0;
   S.rawDevices = res.rawDevices;
   slcSet("cache_devices", res.rawDevices);
   S.devices = res.devices;
@@ -1354,9 +1412,19 @@ async function sendControl(device, action, value, applyLocal, quiet) {
   var backup = JSON.stringify(device.raw.data || {});
   if (applyLocal) { applyLocal(); renderAll(); }
   var res;
-  try {
-    res = await apiControl(S.session, device.id, action, value, proxyCfg());
-  } catch (e) { res = { ok: false }; }
+  /* Silent rate-limit retries (v1.2.0): when Tuya answers
+     FrequentlyInvoke, wait ~1 s and try again, up to 2 extra
+     attempts — the wait doubles as the extra spacing group
+     broadcasts need, so a group summary only ever names genuine
+     failures. Only a genuine failure (or a third rate-limit)
+     rolls back and reports. */
+  for (var attempt = 0; attempt < 3; attempt++) {
+    try {
+      res = await apiControl(S.session, device.id, action, value, proxyCfg());
+    } catch (e) { res = { ok: false }; }
+    if (res.ok || !res.frequent || attempt === 2) break;
+    await sleepMs(1000);
+  }
   if (!res.ok) {
     device.raw.data = JSON.parse(backup);
     var fresh = parseDevice(device.raw);
@@ -1391,8 +1459,10 @@ function applyOptimistic(device, action, value) {
 function sleepMs(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
 /* Broadcast one group action to the section's members, sequentially
-   with a short delay (Tuya rate-limits bursts), then reconcile with a
-   refresh. A summary toast names any member that didn't respond. */
+   with a short delay between members, then reconcile with a
+   refresh. Rate-limited members are retried silently inside
+   sendControl (~1 s spacing), so the summary toast only ever names
+   members that genuinely didn't respond (v1.2.0). */
 async function runGroupAction(sec, kind, value) {
   var full = fullSectionByKey(sec.key);
   var members = full ? full.devices : sec.devices;
@@ -1878,9 +1948,33 @@ function editTools(d, sec) {
 /* ---------------- Camera cards ---------------- */
 function fillCameraCard(card, d, sec) {
   var cam = d.cam;
+  /* In-tile live feed (v1.2.0): with previews on and a gateway
+     configured, the gateway's feed plays right in the tile and
+     replaces the plain icon header (name/quality/actions stay
+     below it) — mirroring the Windows edition's ffmpeg tiles. */
+  var embed = (S.prefs.previews !== false) ? gatewayTileEmbed(cam, S.prefs) : null;
+  if (embed) {
+    var vbox = el("div", "cam-video");
+    if (embed.kind === "mjpeg") {
+      var img = document.createElement("img");
+      img.src = embed.url;
+      img.alt = (cam.name || "Camera") + " live feed";
+      vbox.appendChild(img);
+    } else {
+      var vid = document.createElement("video");
+      vid.muted = true; vid.autoplay = true; vid.playsInline = true;
+      vid.src = embed.url;
+      vbox.appendChild(vid);
+    }
+    var badge = el("span", "cam-live-dot");
+    badge.appendChild(el("i"));
+    badge.appendChild(document.createTextNode("LIVE"));
+    vbox.appendChild(badge);
+    card.appendChild(vbox);
+  }
   var top = el("div", "card-top");
   if (isEditing()) top.appendChild(el("span", "drag-handle", "⠿"));
-  top.appendChild(el("div", "dev-icon", "📷"));
+  if (!embed) top.appendChild(el("div", "dev-icon", "📷"));
   var meta = el("div", "dev-meta");
   var nameRow = el("div", "dev-name");
   nameRow.appendChild(document.createTextNode(displayName(d)));
@@ -1917,6 +2011,12 @@ function fillCameraCard(card, d, sec) {
   copy.addEventListener("click", function () { copyStreamUrl(cam); });
   actions.appendChild(watch); actions.appendChild(copy);
   card.appendChild(actions);
+  var extRow = el("div", "cam-actions");
+  var ext = el("a", "btn small", "Open in external player");
+  ext.href = buildRtspUrl(cam);
+  ext.title = "Hand the stream to a player app installed on your device";
+  extRow.appendChild(ext);
+  card.appendChild(extRow);
   if (isEditing()) card.appendChild(cameraEditTools(d, sec));
 }
 
@@ -2247,6 +2347,9 @@ function startAutorefresh() {
   if (!S.prefs.autorefresh || !S.session) return;
   S.timer = setInterval(async function () {
     if (S.interacting || isEditing()) return;
+    /* Rate-limit backoff (v1.2.0): skip this cycle silently — the
+       cached devices stay on screen meanwhile. */
+    if (Date.now() < (S.freqUntil || 0)) return;
     await fetchDevices(true);
     if (!S.interacting) renderAll();
   }, S.prefs.interval * 1000);
@@ -2351,6 +2454,7 @@ function renderSettings() {
   syncProxyUI();
   $("set-gw-url").value = S.prefs.gatewayUrl;
   $("set-gw-type").value = S.prefs.gatewayType;
+  $("set-previews").checked = S.prefs.previews !== false;
   var creds = loadCreds();
   $("saved-login-info").textContent = creds
     ? "A login is saved for " + creds.userName + " in this browser (used for silent re-login when the session expires)."
@@ -2416,6 +2520,9 @@ function init() {
   });
   $("set-gw-type").addEventListener("change", function (ev) {
     S.prefs.gatewayType = ev.target.value; savePrefs();
+  });
+  $("set-previews").addEventListener("change", function (ev) {
+    S.prefs.previews = ev.target.checked; savePrefs(); renderAll();
   });
   $("btn-settings").addEventListener("click", showSettings);
   $("btn-back").addEventListener("click", function () { showApp(); renderAll(); });
