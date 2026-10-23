@@ -210,6 +210,32 @@
     width:52px; height:38px; border:1px solid var(--card-border); border-radius:11px; padding:2px; background:var(--card); cursor:pointer;
   }
   .scene-btn{width:100%; margin-top:13px; padding:10px; font-size:14px}
+
+  /* camera cards + dialogs */
+  .cam-actions{display:flex; gap:8px; margin-top:13px}
+  .cam-actions .btn{flex:1}
+  .seg{display:flex; gap:6px; margin-top:12px}
+  .seg .btn{flex:1}
+  .seg .btn.active{background:var(--accent); border-color:var(--accent); color:#fff}
+  #modal-root:empty{display:none}
+  .modal-scrim{
+    position:fixed; inset:0; z-index:90; background:rgba(3,6,12,.62);
+    display:flex; align-items:center; justify-content:center; padding:18px;
+  }
+  .modal{
+    background:var(--card); border:1px solid var(--card-border); border-radius:22px;
+    padding:24px 26px; width:100%; max-width:520px; max-height:92vh; overflow:auto;
+  }
+  .modal h3{margin:0 0 3px; font-size:17px}
+  .modal .sub{color:var(--text-dim); font-size:13px; line-height:1.55; margin-bottom:14px}
+  .modal video, .modal iframe.player{
+    width:100%; aspect-ratio:16/9; background:#000; border:1px solid var(--card-border);
+    border-radius:12px; display:block;
+  }
+  .modal .actions{display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; align-items:center}
+  .modal .actions .spacer{flex:1}
+  .modal .actions a.btn{text-decoration:none}
+
   .empty-note{color:var(--text-dim); font-size:14px; padding:26px 4px; text-align:center}
 
   /* edit mode extras */
@@ -330,6 +356,7 @@
     <div id="editbar" class="hidden">
       <span>✎ <b>Edit mode</b> — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.</span>
       <button class="btn small" id="btn-addgroup">＋ New group</button>
+      <button class="btn small" id="btn-addcamera">＋ Add camera</button>
       <button class="btn small primary" id="btn-doneedit">Done</button>
     </div>
     <main id="dash"></main>
@@ -392,6 +419,27 @@
       </div>
 
       <div class="panel">
+        <h3>Stream gateway &amp; cameras</h3>
+        <p class="hint">Cameras you add (✎ Edit → ＋ Add camera) stream over RTSP, which browsers
+        can't play directly. Point ▶ Watch at a small stream gateway on your network —
+        <b>go2rtc</b> or <b>MediaMTX</b> — and the stream plays right in this page. The gateway needs a
+        stream with the <b>same name</b> as the camera here, fed from the same RTSP address
+        (the card's Copy URL button gives you the exact address). Leave the address empty to hand
+        streams to an external player app (such as VLC) instead.</p>
+        <div class="field">
+          <label for="set-gw-url">Stream gateway address (optional)</label>
+          <input type="text" id="set-gw-url" placeholder="http://192.168.1.10:1984 (go2rtc) · http://192.168.1.10:8889 (MediaMTX)">
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="set-gw-type">Gateway type</label>
+          <select id="set-gw-type">
+            <option value="go2rtc">go2rtc</option>
+            <option value="mediamtx">MediaMTX (HLS)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="panel">
         <h3>Saved login</h3>
         <p class="hint" id="saved-login-info">No login is saved in this browser.</p>
         <button class="btn danger" id="btn-forget">Forget saved login</button>
@@ -399,7 +447,7 @@
 
       <div class="panel">
         <h3>Hidden devices</h3>
-        <p class="hint">Devices you hid with the ✕ on their card. They stay hidden until you bring them back here.</p>
+        <p class="hint">Devices and cameras you hid with the ✕ on their card. They stay hidden until you bring them back here.</p>
         <div id="hidden-list"></div>
       </div>
 
@@ -426,12 +474,29 @@
         Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top —
         the device also stays in its group below. Scenes always live in their own Scenes section.
         Everything is remembered in this browser.</p>
+        <p><b>Cameras (RTSP).</b> Tapo cameras: in the Tapo app, open the camera → Settings →
+        Advanced Settings → <b>Camera Account</b> and create a camera account, and make sure RTSP is
+        enabled for the camera. The username and password you add here are that <b>camera account</b> —
+        not your TP-Link cloud account. Then use ✎ Edit → <b>＋ Add camera</b> and enter the camera's
+        IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app
+        builds the stream address for you: <code>rtsp://user:pass@IP:554/stream1</code> (high quality)
+        or <code>/stream2</code> (standard) — or pick “Custom path” for other RTSP cameras. Camera
+        cards sit alongside your devices and can be pinned, grouped and reordered just like them;
+        their passwords are stored in this browser with the same light obfuscation as the saved login.</p>
+        <p><b>Watching a stream.</b> Web browsers can't play <code>rtsp://</code> directly. Without a
+        gateway, ▶ Watch hands the stream address to a player app installed on your device (such as
+        VLC) — or use <b>Copy URL</b> and paste the address into VLC's “Open Network Stream”. For
+        in-browser playback, run a small stream gateway such as <b>go2rtc</b> or <b>MediaMTX</b> on
+        your network, give it a stream with the <b>same name</b> as the camera here (fed from the
+        same RTSP address — Copy URL has it), and enter the gateway's address in
+        Settings → Stream gateway &amp; cameras. ▶ Watch then plays right in this page.</p>
         <p><b>Limits.</b> Tuya rate-limits the device-list call; if you refresh very often the app may
         briefly show the last known states. Autorefresh every 30s or slower is comfortable.</p>
       </div>
     </main>
   </div>
 
+  <div id="modal-root"></div>
   <div id="toast-wrap"></div>
 
 <script>
@@ -478,7 +543,7 @@ var SWATCHES = [
 ];
 var TYPE_ICONS = {
   light: "💡", strip: "🌈", switch: "🔌", scene: "🎬", cover: "🪟",
-  climate: "🌡️", fan: "🌀", lock: "🔒", sensor: "📡", default: "🔘"
+  climate: "🌡️", fan: "🌀", lock: "🔒", sensor: "📡", camera: "📷", default: "🔘"
 };
 
 /* ---------------- Storage helpers ---------------- */
@@ -689,6 +754,78 @@ function mergeDeviceData(fresh, previous) {
   });
 }
 
+/* ---------------- Camera model (pure) ----------------
+   Cameras are local RTSP streams (e.g. Tapo) that the user adds by hand.
+   They are NOT Tuya devices — but on the dashboard they are peers of
+   devices: same sections, name sort / custom order, pinning, groups and
+   hiding. The camera password is stored obfuscated (slc "cameras" key)
+   with the same scheme as the saved login. Browsers can't play rtsp://,
+   so Watch either hands the URL to an external player or, when a stream
+   gateway (go2rtc / MediaMTX) is configured in Settings, plays in-page. */
+var CAM_TEMPLATES = {
+  tapo1: { label: "Tapo Stream 1 — High Quality", path: "/stream1" },
+  tapo2: { label: "Tapo Stream 2 — Standard", path: "/stream2" },
+  custom: { label: "Custom path" }
+};
+function cameraPath(cam) {
+  if (cam.template === "custom") {
+    var p = (cam.path || "").trim();
+    if (!p) return "/";
+    return p.charAt(0) === "/" ? p : "/" + p;
+  }
+  return cam.template === "tapo2" ? "/stream2" : "/stream1";
+}
+/* Build the RTSP URL from the template the user supplied:
+   rtsp://user:pass@host:port/path — credentials percent-encoded so
+   passwords containing @ : / # etc. survive. The stored password is
+   obfuscated; it is deobfuscated here. */
+function buildRtspUrl(cam) {
+  var port = parseInt(cam.port, 10) || 554;
+  var creds = encodeURIComponent(cam.user || "") + ":" + encodeURIComponent(deobfuscate(cam.pass || ""));
+  return "rtsp://" + creds + "@" + (cam.host || "").trim() + ":" + port + cameraPath(cam);
+}
+/* In-app playback URL for a configured stream gateway, or null.
+   The gateway stream must be named exactly like the camera here.
+   go2rtc: {gw}/stream.html?src={name} · MediaMTX: {gw}/{name}/index.m3u8 */
+function gatewayWatchUrl(cam, prefs) {
+  var gw = (prefs.gatewayUrl || "").trim().replace(/\/+$/, "");
+  if (!gw) return null;
+  var name = encodeURIComponent(cam.name || cam.id);
+  if (prefs.gatewayType === "mediamtx") return gw + "/" + name + "/index.m3u8";
+  return gw + "/stream.html?src=" + name;
+}
+function cameraStatusText(cam) {
+  var port = parseInt(cam.port, 10) || 554;
+  var q = cam.template === "custom" ? cameraPath(cam)
+    : (cam.template === "tapo2" ? "Stream 2 · Standard" : "Stream 1 · High");
+  return (cam.host || "") + ":" + port + " · " + q;
+}
+/* Adapt a stored camera record to the card/section item shape devices use. */
+function cameraToItem(cam) {
+  return {
+    id: cam.id, name: cam.name || cam.id, devType: "camera", kind: "camera",
+    iconKind: "camera", isScene: false, isCamera: true, online: true,
+    state: false, hasBrightness: false, hasTemp: false, hasColor: false,
+    brightnessPct: null, tempSlider: null, hue: null, saturation: null,
+    colorMode: null, cam: cam, raw: {}
+  };
+}
+/* The dashboard's item list: Tuya devices + the user's cameras. */
+function allItems() {
+  return S.devices.concat((S.cameras || []).map(cameraToItem));
+}
+function cameraById(id) {
+  var cams = S.cameras || [];
+  for (var i = 0; i < cams.length; i++) if (cams[i].id === id) return cams[i];
+  return null;
+}
+function itemById(id) {
+  var d = deviceById(id);
+  if (d) return d;
+  var cam = cameraById(id);
+  return cam ? cameraToItem(cam) : null;
+}
+
 /* ---------------- Layout / section model (pure) ----------------
    Ordering rule (identical in the Windows edition): within every section,
    devices render A–Z by display name (alias if set) UNLESS a custom order
@@ -838,6 +975,9 @@ var SLC_API = {
   parseDiscovery: parseDiscovery, mergeDeviceData: mergeDeviceData,
   apiAuth: apiAuth, apiRefresh: apiRefresh, apiDiscovery: apiDiscovery, apiControl: apiControl,
   obfuscate: obfuscate, deobfuscate: deobfuscate,
+  CAM_TEMPLATES: CAM_TEMPLATES, cameraPath: cameraPath,
+  buildRtspUrl: buildRtspUrl, gatewayWatchUrl: gatewayWatchUrl,
+  cameraStatusText: cameraStatusText, cameraToItem: cameraToItem,
   migrateLayout: migrateLayout, displayNameWith: displayNameWith,
   orderSectionItems: orderSectionItems, buildSections: buildSections,
   filterDevices: filterDevices
@@ -850,6 +990,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = SLC_API;
 var S = {
   session: null,          /* {accessToken, refreshToken, expiresAt, region} */
   devices: [],            /* parsed device models */
+  cameras: [],            /* user's RTSP camera records (slc "cameras") */
   rawDevices: null,       /* last raw discovery payload devices */
   timer: null,
   interacting: false,
@@ -864,7 +1005,8 @@ function defaultPrefs() {
   return {
     theme: "dark", accent: "#6366f1", density: "comfortable",
     autorefresh: true, interval: 30,
-    proxyPreset: "auto", proxyCustom: ""
+    proxyPreset: "auto", proxyCustom: "",
+    gatewayUrl: "", gatewayType: "go2rtc"
   };
 }
 function defaultLayout() {
@@ -890,6 +1032,8 @@ function loadPrefs() { S.prefs = Object.assign(defaultPrefs(), slcGet("prefs", {
 function savePrefs() { slcSet("prefs", S.prefs); }
 function loadLayout() { S.layout = migrateLayout(slcGet("layout", {})); }
 function saveLayout() { slcSet("layout", S.layout); }
+function loadCameras() { S.cameras = slcGet("cameras", []); if (!Array.isArray(S.cameras)) S.cameras = []; }
+function saveCameras() { slcSet("cameras", S.cameras); }
 function proxyCfg() { return { preset: S.prefs.proxyPreset, custom: S.prefs.proxyCustom }; }
 
 function $(id) { return document.getElementById(id); }
@@ -990,6 +1134,7 @@ async function fetchDevices(isRefresh) {
 function syncLayoutWithDevices() {
   var idSet = {};
   S.devices.forEach(function (d) { idSet[d.id] = true; });
+  (S.cameras || []).forEach(function (c) { idSet[c.id] = true; });
   var keep = function (id) { return !!idSet[id]; };
   S.layout.pins = S.layout.pins.filter(keep);
   S.layout.hidden = S.layout.hidden.filter(keep);
@@ -1007,7 +1152,7 @@ function deviceById(id) {
 }
 function displayName(d) { return displayNameWith(S.layout, d); }
 function togglePin(id) {
-  var d = deviceById(id);
+  var d = itemById(id);
   if (d && d.isScene) return;   /* scenes can't be pinned */
   var i = S.layout.pins.indexOf(id);
   if (i >= 0) S.layout.pins.splice(i, 1); else S.layout.pins.push(id);
@@ -1079,7 +1224,7 @@ function doColor(device, hex) {
 function isEditing() { return document.body.classList.contains("editing"); }
 
 function sectionsModel() {
-  return buildSections(filterDevices(S.devices, S.layout, S.query), S.layout, isEditing());
+  return buildSections(filterDevices(allItems(), S.layout, S.query), S.layout, isEditing());
 }
 function sectionByKey(key) {
   var secs = sectionsModel();
@@ -1098,6 +1243,7 @@ function resetSectionOrder(sec) {
 }
 
 function statusText(d) {
+  if (d.isCamera) return cameraStatusText(d.cam);
   if (!d.online) return "Offline";
   var parts = [];
   if (d.isScene) return "Scene — tap Start to run";
@@ -1211,6 +1357,8 @@ function renderCard(d, sec) {
     toast(displayName(d) + " hidden — bring it back from Settings");
   });
   card.appendChild(hideBtn);
+
+  if (d.isCamera) { fillCameraCard(card, d, sec); return card; }
 
   var top = el("div", "card-top");
   if (isEditing()) top.appendChild(el("span", "drag-handle", "⠿"));
@@ -1344,6 +1492,288 @@ function editTools(d, sec) {
   box.appendChild(r3);
   return box;
 }
+/* ---------------- Camera cards ---------------- */
+function fillCameraCard(card, d, sec) {
+  var cam = d.cam;
+  var top = el("div", "card-top");
+  if (isEditing()) top.appendChild(el("span", "drag-handle", "⠿"));
+  top.appendChild(el("div", "dev-icon", "📷"));
+  var meta = el("div", "dev-meta");
+  var nameRow = el("div", "dev-name");
+  nameRow.appendChild(document.createTextNode(displayName(d)));
+  meta.appendChild(nameRow);
+  var st = el("div", "dev-status");
+  st.appendChild(el("span", "dot"));
+  st.appendChild(document.createTextNode(statusText(d)));
+  meta.appendChild(st);
+  top.appendChild(meta);
+  var isPinned = S.layout.pins.indexOf(d.id) >= 0;
+  var pinBtn = el("button", "pin-btn" + (isPinned ? " pinned" : ""), "📌");
+  pinBtn.title = isPinned ? "Unpin (remove shortcut from the top)" : "Pin a shortcut to the top";
+  pinBtn.setAttribute("aria-label", pinBtn.title);
+  pinBtn.addEventListener("click", function () { togglePin(d.id); });
+  top.appendChild(pinBtn);
+  card.appendChild(top);
+
+  if (cam.template !== "custom") {
+    var seg = el("div", "seg");
+    [["tapo1", "Stream 1 · HD"], ["tapo2", "Stream 2 · SD"]].forEach(function (opt) {
+      var b = el("button", "btn small" + (cam.template === opt[0] ? " active" : ""), opt[1]);
+      b.title = opt[0] === "tapo1" ? "High quality (/stream1)" : "Standard quality (/stream2)";
+      b.addEventListener("click", function () {
+        cam.template = opt[0]; saveCameras(); renderAll();
+      });
+      seg.appendChild(b);
+    });
+    card.appendChild(seg);
+  }
+  var actions = el("div", "cam-actions");
+  var watch = el("button", "btn primary", "▶ Watch");
+  watch.addEventListener("click", function () { watchCamera(cam); });
+  var copy = el("button", "btn", "Copy URL");
+  copy.addEventListener("click", function () { copyStreamUrl(cam); });
+  actions.appendChild(watch); actions.appendChild(copy);
+  card.appendChild(actions);
+  if (isEditing()) card.appendChild(cameraEditTools(d, sec));
+}
+
+function cameraEditTools(d, sec) {
+  var box = el("div", "edit-tools");
+  var r1 = el("div", "row");
+  var edit = el("button", "btn small", "✎ Edit camera");
+  edit.addEventListener("click", function () { openCameraDialog(d.cam); });
+  var del = el("button", "btn small danger", "🗑 Delete");
+  del.addEventListener("click", function () {
+    if (confirm("Delete camera “" + displayName(d) + "”?")) deleteCamera(d.id);
+  });
+  r1.appendChild(edit); r1.appendChild(del);
+  box.appendChild(r1);
+  var r2 = el("div", "row");
+  var sel = el("select");
+  var optU = el("option", null, "Ungrouped"); optU.value = ""; sel.appendChild(optU);
+  S.layout.groups.forEach(function (g) {
+    var o = el("option", null, g.name); o.value = g.id; sel.appendChild(o);
+  });
+  sel.value = S.layout.assign[d.id] || "";
+  sel.addEventListener("change", function () {
+    if (sel.value) S.layout.assign[d.id] = sel.value; else delete S.layout.assign[d.id];
+    saveLayout(); renderAll();
+  });
+  r2.appendChild(sel);
+  var pinned = S.layout.pins.indexOf(d.id) >= 0;
+  var pinBtn = el("button", "btn small", pinned ? "📌 Unpin" : "📌 Pin");
+  pinBtn.addEventListener("click", function () { togglePin(d.id); });
+  r2.appendChild(pinBtn);
+  box.appendChild(r2);
+  var r3 = el("div", "row");
+  var up = el("button", "btn small", "↑ Move up");
+  up.addEventListener("click", function () { moveWithinSection(d.id, sec, -1); });
+  var down = el("button", "btn small", "↓ Move down");
+  down.addEventListener("click", function () { moveWithinSection(d.id, sec, 1); });
+  r3.appendChild(up); r3.appendChild(down);
+  box.appendChild(r3);
+  return box;
+}
+
+function deleteCamera(id) {
+  S.cameras = (S.cameras || []).filter(function (c) { return c.id !== id; });
+  S.layout.pins = S.layout.pins.filter(function (x) { return x !== id; });
+  S.layout.hidden = S.layout.hidden.filter(function (x) { return x !== id; });
+  delete S.layout.assign[id];
+  delete S.layout.alias[id];
+  Object.keys(S.layout.sectionOrder).forEach(function (k) {
+    S.layout.sectionOrder[k] = S.layout.sectionOrder[k].filter(function (x) { return x !== id; });
+    if (!S.layout.sectionOrder[k].length) delete S.layout.sectionOrder[k];
+  });
+  saveCameras(); saveLayout(); renderAll();
+  toast("Camera deleted");
+}
+
+/* ---------------- Clipboard + modal ---------------- */
+function copyText(text, okMsg) {
+  function done() { toast(okMsg); }
+  function fallback() {
+    var ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); done(); }
+    catch (e) { toast("Copy failed — the address is: " + text, true); }
+    ta.remove();
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else fallback();
+}
+function copyStreamUrl(cam) {
+  copyText(buildRtspUrl(cam), "Stream URL copied for " + (cam.name || "camera"));
+}
+
+function modalEsc(ev) { if (ev.key === "Escape") closeModal(); }
+function closeModal() {
+  $("modal-root").innerHTML = "";
+  document.removeEventListener("keydown", modalEsc);
+}
+function openModal(build) {
+  var root = $("modal-root");
+  root.innerHTML = "";
+  var scrim = el("div", "modal-scrim");
+  var modal = el("div", "modal");
+  scrim.addEventListener("click", function (ev) { if (ev.target === scrim) closeModal(); });
+  scrim.appendChild(modal);
+  root.appendChild(scrim);
+  document.addEventListener("keydown", modalEsc);
+  build(modal);
+  return modal;
+}
+
+/* ---------------- Watch ---------------- */
+function watchCamera(cam) {
+  var rtsp = buildRtspUrl(cam);
+  var gwUrl = gatewayWatchUrl(cam, S.prefs);
+  openModal(function (modal) {
+    modal.appendChild(el("h3", null, "▶ " + (cam.name || "Camera")));
+    modal.appendChild(el("p", "sub", cameraStatusText(cam) + " · " + (cam.user || "") + "@" + (cam.host || "")));
+    if (gwUrl) {
+      modal.appendChild(el("p", "sub",
+        "Playing via your stream gateway (" + (S.prefs.gatewayType === "mediamtx" ? "MediaMTX" : "go2rtc") +
+        "). If the picture stays black, check the gateway has a stream named exactly “" + (cam.name || "") + "”."));
+      if (S.prefs.gatewayType === "mediamtx") {
+        var v = document.createElement("video");
+        v.controls = true; v.autoplay = true; v.muted = true; v.playsInline = true;
+        v.src = gwUrl;
+        modal.appendChild(v);
+        var note = el("p", "sub", "HLS plays natively in Safari; in other browsers, open the gateway page or use an external player.");
+        note.style.margin = "10px 0 0";
+        modal.appendChild(note);
+      } else {
+        var f = document.createElement("iframe");
+        f.className = "player";
+        f.src = gwUrl;
+        f.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
+        modal.appendChild(f);
+      }
+    } else {
+      modal.appendChild(el("p", "sub",
+        "Browsers can't play rtsp:// streams directly, so this hands the stream to a player app " +
+        "installed on your device (such as VLC). If nothing opens, copy the address and paste it into " +
+        "VLC → Media → Open Network Stream. To watch right here instead, set up a stream gateway " +
+        "(go2rtc / MediaMTX) in Settings → Stream gateway & cameras."));
+      var fwrap = el("div", "field");
+      var urlIn = el("input"); urlIn.type = "text"; urlIn.readOnly = true; urlIn.value = rtsp;
+      urlIn.addEventListener("click", function () { urlIn.select(); });
+      fwrap.appendChild(urlIn);
+      modal.appendChild(fwrap);
+    }
+    var actions = el("div", "actions");
+    if (gwUrl) {
+      var openGw = el("a", "btn", "Open gateway page ↗");
+      openGw.href = gwUrl; openGw.target = "_blank"; openGw.rel = "noopener";
+      actions.appendChild(openGw);
+    } else {
+      var openA = el("a", "btn primary", "▶ Open in player app");
+      openA.href = rtsp;
+      actions.appendChild(openA);
+    }
+    var copy = el("button", "btn", "Copy RTSP URL");
+    copy.addEventListener("click", function () { copyText(rtsp, "Stream URL copied"); });
+    actions.appendChild(copy);
+    actions.appendChild(el("span", "spacer"));
+    var close = el("button", "btn", "Close");
+    close.addEventListener("click", closeModal);
+    actions.appendChild(close);
+    modal.appendChild(actions);
+  });
+}
+
+/* ---------------- Add / edit camera ---------------- */
+function openCameraDialog(existing) {
+  var cam = existing || null;
+  openModal(function (modal) {
+    modal.appendChild(el("h3", null, cam ? "Edit camera" : "Add camera"));
+    modal.appendChild(el("p", "sub",
+      "For Tapo cameras, the username and password are the Camera Account from the Tapo app " +
+      "(camera Settings → Advanced Settings → Camera Account, with RTSP enabled) — " +
+      "not your TP-Link cloud account."));
+    var err = el("div", "login-error hidden");
+    modal.appendChild(err);
+    function field(labelText, input) {
+      var f = el("div", "field");
+      f.appendChild(el("label", null, labelText));
+      f.appendChild(input);
+      modal.appendChild(f);
+      return input;
+    }
+    function textIn(val, ph) {
+      var i = el("input"); i.type = "text"; i.value = val || "";
+      if (ph) i.placeholder = ph;
+      return i;
+    }
+    var nameI = field("Camera name", textIn(cam ? cam.name : "", "e.g. Front Door"));
+    var userI = field("Username (camera account)", textIn(cam ? cam.user : ""));
+    var passI = el("input"); passI.type = "password";
+    passI.value = cam ? deobfuscate(cam.pass || "") : "";
+    field("Password (camera account)", passI);
+    var hostI = field("IP address / host", textIn(cam ? cam.host : "", "e.g. 192.168.1.50"));
+    var portI = field("Port", textIn(cam ? String(cam.port || 554) : "554"));
+    var tplSel = el("select");
+    Object.keys(CAM_TEMPLATES).forEach(function (k) {
+      var o = el("option", null, CAM_TEMPLATES[k].label); o.value = k; tplSel.appendChild(o);
+    });
+    tplSel.value = cam ? cam.template : "tapo1";
+    field("Template", tplSel);
+    var pathWrap = el("div", "field");
+    pathWrap.appendChild(el("label", null, "Stream path"));
+    var pathI = el("input"); pathI.type = "text";
+    pathI.value = cam ? (cam.path || "") : ""; pathI.placeholder = "/stream1";
+    pathWrap.appendChild(pathI);
+    modal.appendChild(pathWrap);
+    function syncTpl() { pathWrap.classList.toggle("hidden", tplSel.value !== "custom"); }
+    tplSel.addEventListener("change", syncTpl);
+    syncTpl();
+
+    var actions = el("div", "actions");
+    if (cam) {
+      var del = el("button", "btn danger", "🗑 Delete");
+      del.addEventListener("click", function () {
+        if (confirm("Delete camera “" + cam.name + "”?")) { closeModal(); deleteCamera(cam.id); }
+      });
+      actions.appendChild(del);
+    }
+    actions.appendChild(el("span", "spacer"));
+    var cancel = el("button", "btn", "Cancel");
+    cancel.addEventListener("click", closeModal);
+    var save = el("button", "btn primary", cam ? "Save changes" : "Add camera");
+    save.addEventListener("click", function () {
+      var name = nameI.value.trim(), host = hostI.value.trim();
+      if (!name || !host) {
+        err.textContent = "Give the camera a name and an IP address / host.";
+        err.classList.remove("hidden");
+        return;
+      }
+      var rec = {
+        id: cam ? cam.id : ("cam:" + Date.now().toString(36)),
+        name: name,
+        user: userI.value.trim(),
+        pass: obfuscate(passI.value),
+        host: host,
+        port: parseInt(portI.value, 10) || 554,
+        template: tplSel.value,
+        path: pathI.value.trim()
+      };
+      if (cam) {
+        var i = S.cameras.indexOf(cam);
+        if (i >= 0) S.cameras[i] = rec; else S.cameras.push(rec);
+      } else {
+        S.cameras.push(rec);
+      }
+      saveCameras(); closeModal(); renderAll();
+      toast(cam ? "Camera saved" : "Camera added — it's in Ungrouped (pin it with 📌)");
+    });
+    actions.appendChild(cancel); actions.appendChild(save);
+    modal.appendChild(actions);
+  });
+}
+
 function moveWithinSection(id, sec, dir) {
   if (!sec) return;
   var ids = sec.devices.map(function (d) { return d.id; });
@@ -1354,7 +1784,7 @@ function moveWithinSection(id, sec, dir) {
   renderAll();
 }
 function dropDevice(dragId, beforeId, targetSection) {
-  var dragDev = deviceById(dragId);
+  var dragDev = itemById(dragId);
   S.dragId = null;
   if (!dragDev || !targetSection) { renderAll(); return; }
   /* Scenes live only in the Scenes section; devices never enter it. */
@@ -1536,6 +1966,8 @@ function applyPrefs() {
 function renderSettings() {
   applyPrefs();
   syncProxyUI();
+  $("set-gw-url").value = S.prefs.gatewayUrl;
+  $("set-gw-type").value = S.prefs.gatewayType;
   var creds = loadCreds();
   $("saved-login-info").textContent = creds
     ? "A login is saved for " + creds.userName + " in this browser (used for silent re-login when the session expires)."
@@ -1547,7 +1979,7 @@ function renderSettings() {
     return;
   }
   S.layout.hidden.forEach(function (id) {
-    var d = deviceById(id);
+    var d = itemById(id);
     var row = el("div", "hidden-item");
     row.appendChild(el("span", "grow", d ? displayName(d) : id));
     var btn = el("button", "btn small", "Unhide");
@@ -1568,7 +2000,7 @@ function setEditing(on) {
   renderAll();
 }
 function init() {
-  loadPrefs(); loadLayout();
+  loadPrefs(); loadLayout(); loadCameras();
   fillProxySelect($("li-proxy-preset"));
   fillProxySelect($("set-proxy-preset"));
   bindProxyUI("li"); bindProxyUI("set");
@@ -1595,6 +2027,13 @@ function init() {
   $("btn-edit").addEventListener("click", function () { setEditing(!isEditing()); });
   $("btn-doneedit").addEventListener("click", function () { setEditing(false); });
   $("btn-addgroup").addEventListener("click", addGroup);
+  $("btn-addcamera").addEventListener("click", function () { openCameraDialog(null); });
+  $("set-gw-url").addEventListener("change", function (ev) {
+    S.prefs.gatewayUrl = ev.target.value.trim(); savePrefs();
+  });
+  $("set-gw-type").addEventListener("change", function (ev) {
+    S.prefs.gatewayType = ev.target.value; savePrefs();
+  });
   $("btn-settings").addEventListener("click", showSettings);
   $("btn-back").addEventListener("click", function () { showApp(); renderAll(); });
   $("set-theme").addEventListener("change", function (ev) { S.prefs.theme = ev.target.value; savePrefs(); applyPrefs(); });
