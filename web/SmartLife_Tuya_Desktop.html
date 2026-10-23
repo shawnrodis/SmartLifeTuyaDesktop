@@ -1,0 +1,1627 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SmartLife &amp; Tuya Desktop</title>
+<style>
+  /* ============ Design tokens ============ */
+  :root{
+    --accent:#6366f1;
+    --accent-soft:rgba(99,102,241,.16);
+    --bg:#0b0e14;
+    --bg-grad:radial-gradient(1200px 600px at 80% -10%, rgba(99,102,241,.14), transparent 60%),
+               radial-gradient(900px 500px at -10% 110%, rgba(20,184,166,.08), transparent 55%);
+    --card:#151a24;
+    --card-border:#232b3a;
+    --text:#e7ebf2;
+    --text-dim:#8b94a7;
+    --text-faint:#5b6478;
+    --track:#2a3245;
+    --danger:#f43f5e;
+    --ok:#22c55e;
+    --shadow:none;
+    --radius:18px;
+  }
+  [data-theme="light"]{
+    --bg:#eef1f6;
+    --bg-grad:radial-gradient(1200px 600px at 80% -10%, rgba(99,102,241,.12), transparent 60%),
+               radial-gradient(900px 500px at -10% 110%, rgba(20,184,166,.10), transparent 55%);
+    --card:#ffffff;
+    --card-border:#dde3ee;
+    --text:#17202e;
+    --text-dim:#5d6879;
+    --track:#dbe1ec;
+    --shadow:none;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
+    background:var(--bg); background-image:var(--bg-grad); background-attachment:fixed;
+    color:var(--text); min-height:100vh;
+  }
+  button{font-family:inherit;cursor:pointer}
+  input,select{font-family:inherit}
+  .hidden{display:none !important}
+
+  /* ============ Buttons & inputs ============ */
+  .btn{
+    border:1px solid var(--card-border); background:var(--card); color:var(--text);
+    border-radius:11px; padding:8px 14px; font-size:13.5px; font-weight:600;
+    transition:transform .08s ease, background .15s ease, border-color .15s ease;
+  }
+  .btn:hover{border-color:var(--accent)}
+  .btn:active{transform:scale(.97)}
+  .btn.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+  .btn.primary:hover{filter:brightness(1.1)}
+  .btn.danger{color:var(--danger)}
+  .btn.small{padding:5px 10px; font-size:12.5px; border-radius:9px}
+  .btn.icon{padding:7px 10px}
+  .btn[disabled]{opacity:.45; cursor:default; transform:none}
+  .field{margin-bottom:13px}
+  .field label{display:block; font-size:12.5px; font-weight:600; color:var(--text-dim); margin-bottom:6px; letter-spacing:.02em}
+  .field input[type=text], .field input[type=password], .field select{
+    width:100%; padding:11px 13px; border-radius:12px; border:1px solid var(--card-border);
+    background:var(--bg); color:var(--text); font-size:14.5px; outline:none;
+  }
+  .field input:focus, .field select:focus{border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft)}
+  .checkline{display:flex; align-items:center; gap:9px; font-size:13.5px; color:var(--text-dim); cursor:pointer; user-select:none}
+  .checkline input{accent-color:var(--accent); width:16px; height:16px}
+
+  /* ============ Login ============ */
+  #view-login{min-height:100vh; display:flex; align-items:center; justify-content:center; padding:22px}
+  .login-card{
+    width:100%; max-width:400px; background:var(--card); border:1px solid var(--card-border);
+    border-radius:22px; padding:30px 28px 24px; box-shadow:var(--shadow);
+  }
+  .login-logo{font-size:40px; text-align:center}
+  .login-card h1{margin:8px 0 2px; text-align:center; font-size:23px; letter-spacing:-.01em}
+  .login-card .sub{text-align:center; color:var(--text-dim); font-size:13.5px; margin-bottom:22px}
+  .login-error{
+    background:rgba(244,63,94,.12); border:1px solid rgba(244,63,94,.4); color:#fb7185;
+    padding:9px 12px; border-radius:11px; font-size:13px; margin-bottom:14px;
+  }
+  [data-theme="light"] .login-error{color:#be123c}
+  .login-card .btn.primary{width:100%; padding:12px; font-size:15px; border-radius:13px}
+  details.conn{margin-top:16px; border-top:1px dashed var(--card-border); padding-top:12px}
+  details.conn summary{cursor:pointer; font-size:13px; font-weight:600; color:var(--text-dim)}
+  details.conn .field{margin-top:12px; margin-bottom:10px}
+  .fineprint{font-size:12px; color:var(--text-dim); line-height:1.55; margin-top:14px}
+
+  /* ============ App header ============ */
+  header.app{
+    position:sticky; top:0; z-index:40; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding:12px 18px; border-bottom:1px solid var(--card-border);
+    background:var(--card);
+  }
+  header.app .brand{display:flex; align-items:center; gap:10px; font-size:18px; font-weight:800; letter-spacing:-.01em; margin-right:auto}
+  header.app .brand .logo{font-size:22px}
+  header.app .updated{font-size:12px; color:var(--text-dim)}
+  header.app .hgroup{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+  header.app select{
+    padding:7px 9px; border-radius:10px; border:1px solid var(--card-border);
+    background:var(--card); color:var(--text); font-size:13px;
+  }
+  header.app input[type=text]{
+    padding:7px 10px; border-radius:10px; border:1px solid var(--card-border);
+    background:var(--bg); color:var(--text); font-size:13px; min-width:180px; outline:none;
+  }
+  header.app input[type=text]:focus{border-color:var(--accent)}
+  #editbar{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding:9px 18px; background:var(--accent-soft); border-bottom:1px solid var(--card-border);
+    font-size:13px; color:var(--text-dim);
+  }
+
+  /* ============ Dashboard ============ */
+  main{max-width:1240px; margin:0 auto; padding:20px 18px 70px}
+  .section-head{
+    display:flex; align-items:center; gap:9px; margin:24px 2px 12px; cursor:pointer; user-select:none;
+  }
+  .section-head:first-child{margin-top:2px}
+  .section-head h2{font-size:16.5px; margin:0; font-weight:750; letter-spacing:-.01em}
+  .section-head .chev{color:var(--text-dim); transition:transform .18s ease; font-size:13px}
+  .section-head.collapsed .chev{transform:rotate(-90deg)}
+  .section-head .count{font-size:12px; color:var(--text-dim); background:var(--card); border:1px solid var(--card-border); padding:1px 8px; border-radius:20px}
+  .section-head .spacer{flex:1}
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(238px,1fr)); gap:14px}
+  body[data-density="compact"] .grid{grid-template-columns:repeat(auto-fill,minmax(198px,1fr)); gap:10px}
+
+  .card{
+    position:relative; background:var(--card); border:1px solid var(--card-border);
+    border-radius:var(--radius); padding:15px 16px 14px; box-shadow:var(--shadow);
+    transition:border-color .2s ease, box-shadow .25s ease, opacity .2s ease;
+  }
+  body[data-density="compact"] .card{padding:11px 13px 10px; border-radius:14px}
+  .card.on{border-color:var(--accent)}
+  .card.offline{opacity:.55}
+  .card.dragging{opacity:.4; outline:2px dashed var(--accent)}
+  .card.drop-target{outline:2px solid var(--accent)}
+  .card-top{display:flex; align-items:flex-start; gap:11px}
+  .dev-icon{
+    width:42px; height:42px; flex:0 0 42px; border-radius:13px; display:flex; align-items:center; justify-content:center;
+    font-size:21px; background:var(--track);
+  }
+  .card.on .dev-icon{background:var(--accent-soft)}
+  body[data-density="compact"] .dev-icon{width:36px;height:36px;flex-basis:36px;font-size:18px;border-radius:11px}
+  .dev-meta{flex:1; min-width:0}
+  .dev-name{font-weight:700; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .dev-status{font-size:12.5px; color:var(--text-dim); margin-top:2px}
+  .dev-status .dot{display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--text-dim); margin-right:5px; vertical-align:1px}
+  .card.on .dev-status .dot{background:var(--ok)}
+  .badge-offline{
+    font-size:10.5px; font-weight:700; letter-spacing:.05em; color:#fff; background:#64748b;
+    border-radius:6px; padding:2px 6px; margin-left:6px; vertical-align:2px;
+  }
+  .hide-x{
+    position:absolute; top:8px; right:9px; border:none; background:transparent; color:var(--text-dim);
+    font-size:13px; line-height:1; padding:4px; opacity:.55;
+  }
+  .hide-x:hover{color:var(--danger); opacity:1}
+  .pin-btn{
+    border:none; background:transparent; font-size:15px; line-height:1; padding:4px 5px;
+    filter:grayscale(1); opacity:.35; flex:0 0 auto;
+  }
+  .pin-btn:hover{opacity:.75}
+  .pin-btn.pinned{filter:none; opacity:1}
+
+  /* toggle switch */
+  .switch{position:relative; width:48px; height:27px; flex:0 0 48px; border:none; border-radius:20px; background:var(--track); transition:background .18s ease; padding:0; margin-top:3px}
+  .switch::after{
+    content:""; position:absolute; top:3px; left:3px; width:21px; height:21px; border-radius:50%;
+    background:#fff; transition:left .18s ease;
+  }
+  .switch[aria-checked="true"]{background:var(--accent)}
+  .switch[aria-checked="true"]::after{left:24px}
+  .switch[disabled]{opacity:.4; cursor:default}
+
+  /* sliders */
+  .ctl{margin-top:13px}
+  .ctl-row{display:flex; justify-content:space-between; align-items:baseline; font-size:12.5px; color:var(--text-dim); margin-bottom:5px}
+  .ctl-row b{color:var(--text); font-size:12.5px; font-weight:700}
+  input[type=range].slim{
+    -webkit-appearance:none; appearance:none; width:100%; height:22px; background:transparent; margin:0; --p:50%;
+  }
+  input[type=range].slim::-webkit-slider-runnable-track{
+    height:6px; border-radius:4px;
+    background:linear-gradient(to right, var(--accent) var(--p), var(--track) var(--p));
+  }
+  input[type=range].slim::-webkit-slider-thumb{
+    -webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:#fff;
+    margin-top:-6px; border:none; cursor:pointer;
+  }
+  input[type=range].slim::-moz-range-track{height:6px; border-radius:4px; background:var(--track)}
+  input[type=range].slim::-moz-range-progress{height:6px; border-radius:4px; background:var(--accent)}
+  input[type=range].slim::-moz-range-thumb{width:18px; height:18px; border-radius:50%; background:#fff; border:none; cursor:pointer}
+  input[type=range].slim[disabled]{opacity:.4}
+
+  /* colour controls */
+  .swatches{display:flex; gap:7px; flex-wrap:wrap; margin-top:12px}
+  .swatch{
+    width:26px; height:26px; border-radius:50%; border:2px solid rgba(127,127,127,.35); padding:0;
+    transition:transform .1s ease;
+  }
+  .swatch:hover{transform:scale(1.15)}
+  .swatch.active{border-color:var(--text); transform:scale(1.12)}
+  .color-panel{margin-top:12px; border-top:1px dashed var(--card-border); padding-top:12px}
+  .color-panel .row{display:flex; align-items:center; gap:10px}
+  input[type=color].picker{
+    width:52px; height:38px; border:1px solid var(--card-border); border-radius:11px; padding:2px; background:var(--card); cursor:pointer;
+  }
+  .scene-btn{width:100%; margin-top:13px; padding:10px; font-size:14px}
+  .empty-note{color:var(--text-dim); font-size:14px; padding:26px 4px; text-align:center}
+
+  /* edit mode extras */
+  .edit-tools{margin-top:13px; border-top:1px dashed var(--card-border); padding-top:11px; display:flex; flex-direction:column; gap:8px}
+  .edit-tools .row{display:flex; gap:7px; align-items:center}
+  .edit-tools input[type=text], .edit-tools select{
+    flex:1; min-width:0; padding:7px 9px; border-radius:9px; border:1px solid var(--card-border);
+    background:var(--bg); color:var(--text); font-size:13px;
+  }
+  .drag-handle{cursor:grab; color:var(--text-dim); font-size:16px; padding:2px 4px; user-select:none}
+  body.editing .card{border-style:dashed}
+
+  /* ============ Settings ============ */
+  #view-settings main{max-width:760px}
+  .panel{background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius); padding:20px 22px; box-shadow:var(--shadow); margin-bottom:16px}
+  .panel h3{margin:0 0 4px; font-size:15.5px}
+  .panel .hint{font-size:12.5px; color:var(--text-dim); line-height:1.55; margin:4px 0 12px}
+  .accent-row{display:flex; gap:9px; flex-wrap:wrap; margin-top:6px}
+  .accent-dot{width:30px; height:30px; border-radius:50%; border:3px solid transparent; padding:0}
+  .accent-dot.active{border-color:var(--text)}
+  .hidden-item{display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px dashed var(--card-border); font-size:14px}
+  .hidden-item:last-child{border-bottom:none}
+  .hidden-item .grow{flex:1}
+  .help p, .help li{font-size:13.5px; color:var(--text-dim); line-height:1.65}
+  .help ul{padding-left:19px; margin:6px 0}
+
+  /* ============ Toast ============ */
+  #toast-wrap{position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:99; display:flex; flex-direction:column; gap:8px; align-items:center; pointer-events:none}
+  .toast{
+    background:#1e2534; color:#eef1f7; border:1px solid #333f58; padding:10px 17px; border-radius:13px;
+    font-size:13.5px; animation:toast-in .22s ease; max-width:88vw; text-align:center;
+  }
+  [data-theme="light"] .toast{background:#17202e; border-color:#17202e}
+  .toast.err{background:#4c1120; border-color:#881337}
+  @keyframes toast-in{from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none}}
+  .spinner{
+    width:34px; height:34px; border-radius:50%; border:4px solid var(--track); border-top-color:var(--accent);
+    animation:spin .8s linear infinite; margin:26px auto;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body data-density="comfortable">
+
+  <!-- ================= LOGIN ================= -->
+  <div id="view-login">
+    <form class="login-card" id="login-form" autocomplete="on">
+      <div class="login-logo">🏠</div>
+      <h1>SmartLife &amp; Tuya Desktop</h1>
+      <div class="sub">Your Smart Life / Tuya devices, in one clean dashboard</div>
+      <div class="login-error hidden" id="login-error"></div>
+      <div class="field">
+        <label for="li-user">Smart Life / Tuya username</label>
+        <input type="text" id="li-user" autocomplete="username" placeholder="email or phone" required>
+      </div>
+      <div class="field">
+        <label for="li-pass">Password</label>
+        <input type="password" id="li-pass" autocomplete="current-password" placeholder="Your Smart Life password" required>
+      </div>
+      <div class="field">
+        <label for="li-region">Region (where your account was registered)</label>
+        <select id="li-region">
+          <option value="1" selected>United States (US)</option>
+          <option value="44">Europe (EU)</option>
+          <option value="86">China (CN)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="li-platform">App platform</label>
+        <select id="li-platform">
+          <option value="smart_life" selected>Smart Life</option>
+          <option value="tuya">Tuya Smart</option>
+        </select>
+      </div>
+      <label class="checkline" style="margin:4px 0 16px">
+        <input type="checkbox" id="li-keep"> Keep me logged in on this browser
+      </label>
+      <button type="submit" class="btn primary" id="li-submit">Log in</button>
+      <div class="spinner hidden" id="login-spinner"></div>
+      <details class="conn">
+        <summary>Connection / proxy settings</summary>
+        <div class="field">
+          <label for="li-proxy-preset">CORS proxy</label>
+          <select id="li-proxy-preset"></select>
+        </div>
+        <div class="field hidden" id="li-proxy-custom-wrap">
+          <label for="li-proxy-custom">Custom proxy prefix</label>
+          <input type="text" id="li-proxy-custom" placeholder="https://my-proxy.example/ or …?url={url}">
+        </div>
+        <p class="fineprint">Most regions connect directly. A proxy is only needed where Tuya's
+        servers don't accept direct browser calls (China region, some networks). See Help in Settings.</p>
+      </details>
+      <p class="fineprint">Your credentials are only sent to Tuya's own servers and are stored
+      only in this browser (and only if you tick “Keep me logged in”). Nothing is sent anywhere else.</p>
+    </form>
+  </div>
+
+  <!-- ================= APP ================= -->
+  <div id="view-app" class="hidden">
+    <header class="app">
+      <div class="brand"><span class="logo">🏠</span> SmartLife &amp; Tuya Desktop</div>
+      <span class="updated" id="last-updated"></span>
+      <div class="hgroup">
+        <input type="text" id="inp-search" placeholder="🔍 Search devices…" aria-label="Search devices">
+        <label class="checkline"><input type="checkbox" id="chk-autorefresh"> Autorefresh</label>
+        <select id="sel-interval" title="Refresh interval">
+          <option value="15">15s</option>
+          <option value="30" selected>30s</option>
+          <option value="60">60s</option>
+          <option value="120">2 min</option>
+        </select>
+        <button class="btn" id="btn-refresh">↻ Refresh</button>
+        <button class="btn" id="btn-edit">✎ Edit</button>
+        <button class="btn" id="btn-settings">⚙ Settings</button>
+        <button class="btn" id="btn-logout">Log out</button>
+      </div>
+    </header>
+    <div id="editbar" class="hidden">
+      <span>✎ <b>Edit mode</b> — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.</span>
+      <button class="btn small" id="btn-addgroup">＋ New group</button>
+      <button class="btn small primary" id="btn-doneedit">Done</button>
+    </div>
+    <main id="dash"></main>
+  </div>
+
+  <!-- ================= SETTINGS ================= -->
+  <div id="view-settings" class="hidden">
+    <header class="app">
+      <div class="brand"><span class="logo">⚙️</span> Settings</div>
+      <div class="hgroup">
+        <button class="btn" id="btn-back">← Back to dashboard</button>
+      </div>
+    </header>
+    <main>
+      <div class="panel">
+        <h3>Appearance</h3>
+        <div class="field" style="margin-top:12px">
+          <label for="set-theme">Theme</label>
+          <select id="set-theme">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Accent colour</label>
+          <div class="accent-row" id="accent-row"></div>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="set-density">Card density</label>
+          <select id="set-density">
+            <option value="comfortable">Comfortable</option>
+            <option value="compact">Compact</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Connection</h3>
+        <p class="hint">Tuya's cloud API is called straight from your browser. The US and EU
+        endpoints accept direct browser calls; the China endpoint (and some networks) need a CORS proxy in between.</p>
+        <div class="field">
+          <label for="set-proxy-preset">CORS proxy</label>
+          <select id="set-proxy-preset"></select>
+        </div>
+        <div class="field hidden" id="set-proxy-custom-wrap">
+          <label for="set-proxy-custom">Custom proxy prefix</label>
+          <input type="text" id="set-proxy-custom" placeholder="https://my-proxy.example/ or …?url={url}">
+          <p class="hint">Leave empty for a direct connection. Use <code>{url}</code> in the text if your
+          proxy expects the target address as an encoded query parameter.</p>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="set-interval">Autorefresh interval</label>
+          <select id="set-interval">
+            <option value="15">15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="60">60 seconds</option>
+            <option value="120">2 minutes</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Saved login</h3>
+        <p class="hint" id="saved-login-info">No login is saved in this browser.</p>
+        <button class="btn danger" id="btn-forget">Forget saved login</button>
+      </div>
+
+      <div class="panel">
+        <h3>Hidden devices</h3>
+        <p class="hint">Devices you hid with the ✕ on their card. They stay hidden until you bring them back here.</p>
+        <div id="hidden-list"></div>
+      </div>
+
+      <div class="panel help">
+        <h3>Help</h3>
+        <p><b>How login works.</b> This page signs in to Tuya's cloud with the same account you use in the
+        Smart Life (or Tuya Smart) app, then asks Tuya for your device list and sends control commands —
+        the same approach as the classic Smart Life web dashboards. Pick the <b>region where your account
+        was registered</b> (the country you chose when you created the account in the app); the wrong region
+        is the most common cause of “login failed”.</p>
+        <p><b>Your credentials.</b> Your username and password go directly to Tuya's servers
+        (<code>px1.tuya*.com</code>) over HTTPS. If you tick “Keep me logged in”, they are kept in this
+        browser's local storage so the app can silently sign back in when the session token expires —
+        use it only on your own devices, and use “Forget saved login” above to erase them.</p>
+        <p><b>The proxy.</b> Browsers block some cross-site calls. The US and EU Tuya endpoints allow
+        direct calls from web pages, so no proxy is normally needed there. The China endpoint doesn't,
+        so in “Auto” mode CN traffic is routed through a community CORS proxy
+        (<code>cors.smartathome.co.uk</code>). You can pick a different proxy or your own above —
+        note a proxy can see the requests it forwards (they contain a session token, never your password
+        after sign-in… the sign-in request itself does contain your password, so only use proxies you trust for CN logins).</p>
+        <p><b>Customising.</b> Sections sort A–Z by name by default. Use ✎ Edit to drag devices into your
+        own order inside a section (that order then sticks, and each section has a “Reset to name order”
+        button), create groups (rooms), rename devices with an alias, or hide devices you never use.
+        Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top —
+        the device also stays in its group below. Scenes always live in their own Scenes section.
+        Everything is remembered in this browser.</p>
+        <p><b>Limits.</b> Tuya rate-limits the device-list call; if you refresh very often the app may
+        briefly show the last known states. Autorefresh every 30s or slower is comfortable.</p>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast-wrap"></div>
+
+<script>
+"use strict";
+/* ================================================================
+   SmartLife & Tuya Desktop (web edition) — single-file Smart Life / Tuya dashboard.
+   Talks to Tuya's legacy consumer cloud API ("homeassistant" API,
+   the same one the Smart Life app-era web dashboards use):
+     POST {base}auth.do                 — login / token refresh
+     POST {base}skill  Discovery        — device list
+     POST {base}skill  Control          — device commands
+   All state lives in localStorage under the "slc_" prefix.
+   ================================================================ */
+
+/* ---------------- Constants ---------------- */
+var REGION_BASE = {
+  US: "https://px1.tuyaus.com/homeassistant/",
+  EU: "https://px1.tuyaeu.com/homeassistant/",
+  CN: "https://px1.tuyacn.com/homeassistant/"
+};
+var REGION_CODE_TO_KEY = { "1": "US", "86": "CN", "44": "EU" };
+var SMARTATHOME_PROXY = "https://cors.smartathome.co.uk/";
+var PROXY_PRESETS = [
+  { id: "auto",          label: "Auto — direct for US/EU, community proxy for CN (recommended)" },
+  { id: "smartathome",   label: "SmartAtHome community proxy (all requests)" },
+  { id: "corsproxy",     label: "corsproxy.io (encoded URL)" },
+  { id: "cors-anywhere", label: "cors-anywhere.herokuapp.com (may need activation)" },
+  { id: "none",          label: "None — direct connection" },
+  { id: "custom",        label: "Custom…" }
+];
+var ACCENTS = [
+  { name: "Indigo", value: "#6366f1" }, { name: "Sky",    value: "#0ea5e9" },
+  { name: "Teal",   value: "#14b8a6" }, { name: "Green",  value: "#22c55e" },
+  { name: "Amber",  value: "#f59e0b" }, { name: "Rose",   value: "#f43f5e" },
+  { name: "Violet", value: "#8b5cf6" }
+];
+/* Colour swatches shown on colour-capable cards (whites + basics). */
+var SWATCHES = [
+  { name: "Warm white", hex: "#ffd9a0" }, { name: "Cool white", hex: "#eaf2ff" },
+  { name: "Red", hex: "#ff2d2d" }, { name: "Orange", hex: "#ff7a00" },
+  { name: "Yellow", hex: "#ffd400" }, { name: "Green", hex: "#22c55e" },
+  { name: "Cyan", hex: "#00c2ff" }, { name: "Blue", hex: "#2456ff" },
+  { name: "Purple", hex: "#8b3dff" }, { name: "Pink", hex: "#ff4fa3" }
+];
+var TYPE_ICONS = {
+  light: "💡", strip: "🌈", switch: "🔌", scene: "🎬", cover: "🪟",
+  climate: "🌡️", fan: "🌀", lock: "🔒", sensor: "📡", default: "🔘"
+};
+
+/* ---------------- Storage helpers ---------------- */
+function slcGet(key, fallback) {
+  try {
+    var raw = localStorage.getItem("slc_" + key);
+    if (raw === null) return fallback;
+    return JSON.parse(raw);
+  } catch (e) { return fallback; }
+}
+function slcSet(key, value) {
+  try {
+    if (value === null || value === undefined) localStorage.removeItem("slc_" + key);
+    else localStorage.setItem("slc_" + key, JSON.stringify(value));
+  } catch (e) { /* storage unavailable (private mode) — run session-only */ }
+}
+/* Light obfuscation so a saved password isn't plain text at a glance.
+   This is NOT encryption — see Help. */
+function obfuscate(str) {
+  var out = "";
+  for (var i = 0; i < str.length; i++) out += String.fromCharCode(str.charCodeAt(i) ^ 0x5A) ;
+  return btoa(out);
+}
+function deobfuscate(str) {
+  try {
+    var bin = atob(str), out = "";
+    for (var i = 0; i < bin.length; i++) out += String.fromCharCode(bin.charCodeAt(i) ^ 0x5A);
+    return out;
+  } catch (e) { return ""; }
+}
+
+/* ---------------- Region / proxy (pure) ---------------- */
+function regionKeyFromCode(countryCode) {
+  return REGION_CODE_TO_KEY[String(countryCode)] || "EU";
+}
+function regionFromToken(token) {
+  if (!token) return null;
+  var p = String(token).substring(0, 2);
+  if (p === "EU") return "EU";
+  if (p === "AY") return "CN";
+  if (p === "AZ") return "US";
+  return null;
+}
+function baseForRegion(regionKey) { return REGION_BASE[regionKey] || REGION_BASE.EU; }
+
+/* Resolve the final URL for a request.
+   preset: one of PROXY_PRESETS ids; customProxy: free text (may contain {url});
+   regionKey: 'US'|'EU'|'CN' of the target endpoint. */
+function applyProxy(url, preset, customProxy, regionKey) {
+  switch (preset) {
+    case "none": return url;
+    case "smartathome": return SMARTATHOME_PROXY + url;
+    case "cors-anywhere": return "https://cors-anywhere.herokuapp.com/" + url;
+    case "corsproxy": return "https://corsproxy.io/?url=" + encodeURIComponent(url);
+    case "custom": {
+      var c = (customProxy || "").trim();
+      if (!c) return url;
+      if (c.indexOf("{url}") >= 0) return c.split("{url}").join(encodeURIComponent(url));
+      return c + url;
+    }
+    case "auto":
+    default:
+      /* Mirrors the reference dashboard: US/EU endpoints accept direct
+         browser calls; CN traffic goes via the community proxy. */
+      return regionKey === "CN" ? SMARTATHOME_PROXY + url : url;
+  }
+}
+
+/* ---------------- Value-scale conversions (pure) ----------------
+   Scales mirror the reference implementation exactly:
+   - device brightness is reported 0..1000; UI % = brightness/10.
+     brightnessSet sends the % value; its useful range is 11..100.
+   - colour temperature is SENT on a 1000..10000 scale whose ends are
+     labelled 2700K / 6500K, but REPORTED on a stretched scale:
+       reported = (sent - 1000) * 4.033 + 1000
+       slider   = (reported - 1000) / 4.033 + 1000
+   - colour is HSV: hue 0..360, saturation 0..1, brightness = % .  */
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+function brightnessToPct(reported) {
+  if (reported === undefined || reported === null) return null;
+  return clamp(Math.round(reported / 10), 0, 100);
+}
+function tempReportedToSlider(reported) {
+  if (reported === undefined || reported === null) return null;
+  return clamp(Math.round(((reported - 1000) / 4.033) + 1000), 1000, 10000);
+}
+function tempSliderToReported(slider) {
+  return Math.round(((slider - 1000) * 4.033) + 1000);
+}
+function tempSliderToKelvin(slider) {
+  return Math.round((2700 + (clamp(slider, 1000, 10000) - 1000) * (3800 / 9000)) / 10) * 10;
+}
+
+/* ---------------- Colour helpers (pure) ---------------- */
+function hexToHsv(hex) {
+  var m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return { h: 0, s: 0, v: 1 };
+  var n = parseInt(m[1], 16);
+  var r = (n >> 16 & 255) / 255, g = (n >> 8 & 255) / 255, b = (n & 255) / 255;
+  var max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min, h = 0;
+  if (d) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+  }
+  return { h: Math.round(h), s: max ? d / max : 0, v: max };
+}
+function hsvToHex(h, s, v) {
+  h = ((h % 360) + 360) % 360; s = clamp(s, 0, 1); v = clamp(v, 0, 1);
+  var c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c, r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; } else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+  function p2(q) { var s2 = Math.round((q + m) * 255).toString(16); return s2.length < 2 ? "0" + s2 : s2; }
+  return "#" + p2(r) + p2(g) + p2(b);
+}
+/* Normalise a saturation that a device might report as 0..1 or 0..100. */
+function normSaturation(s) {
+  if (s === undefined || s === null) return 0;
+  return s > 1 ? clamp(s / 100, 0, 1) : clamp(s, 0, 1);
+}
+
+/* ---------------- Request builders (pure) ---------------- */
+function buildAuthBody(userName, password, countryCode, platform) {
+  var p = new URLSearchParams();
+  p.set("userName", userName);
+  p.set("password", password);
+  p.set("countryCode", String(countryCode));
+  p.set("bizType", platform);
+  p.set("from", "tuya");
+  return p.toString();
+}
+function buildSkillBody(name, namespace, payload) {
+  return { header: { name: name, namespace: namespace, payloadVersion: 1 }, payload: payload };
+}
+function buildDiscoveryBody(accessToken) {
+  return buildSkillBody("Discovery", "discovery", { accessToken: accessToken });
+}
+function buildControlBody(accessToken, devId, action, value) {
+  var payload = { accessToken: accessToken, devId: devId };
+  if (action === "colorSet") payload.color = value;   /* colour uses the "color" key */
+  else payload.value = value;                          /* everything else uses "value" */
+  return buildSkillBody(action, "control", payload);
+}
+
+/* ---------------- Device model parsing (pure) ---------------- */
+function parseDevice(raw) {
+  raw = raw || {};
+  var data = raw.data || {};
+  var devType = raw.dev_type || raw.devType || "default";
+  var isScene = devType === "scene";
+  var hasBrightness = ("brightness" in data);
+  var hasTemp = ("color_temp" in data);
+  var hasColor = ("color_mode" in data) || ("hue" in data) || ("saturation" in data);
+  var kind = "other";
+  if (isScene) kind = "scene";
+  else if (hasColor || hasTemp || hasBrightness) kind = "light";
+  else if (devType === "switch") kind = "switch";
+  var iconKind = devType;
+  if (kind === "light") {
+    var looksStrip = /strip|bar|led strip|tape/i.test(raw.name || "") || (hasColor && !hasTemp && !hasBrightness);
+    iconKind = looksStrip ? "strip" : "light";
+  }
+  return {
+    id: raw.id,
+    name: raw.name || raw.id || "Device",
+    devType: devType,
+    kind: kind,
+    iconKind: TYPE_ICONS[iconKind] ? iconKind : (TYPE_ICONS[devType] ? devType : "default"),
+    isScene: isScene,
+    online: data.online !== false,
+    state: data.state === true,
+    hasBrightness: hasBrightness,
+    hasTemp: hasTemp,
+    hasColor: hasColor,
+    brightnessPct: hasBrightness ? brightnessToPct(data.brightness) : null,
+    tempSlider: hasTemp ? tempReportedToSlider(data.color_temp) : null,
+    hue: ("hue" in data) ? data.hue : null,
+    saturation: ("saturation" in data) ? normSaturation(data.saturation) : null,
+    colorMode: data.color_mode || null,
+    raw: raw
+  };
+}
+function parseDiscovery(json) {
+  if (!json || typeof json !== "object") return { ok: false, error: "Empty response" };
+  if (json.header && json.header.code === "FrequentlyInvoke") return { ok: false, frequent: true };
+  if (json.payload && Array.isArray(json.payload.devices)) {
+    return { ok: true, devices: json.payload.devices.map(parseDevice), rawDevices: json.payload.devices };
+  }
+  var code = json.header && json.header.code;
+  return { ok: false, error: code ? ("API error: " + code) : "Unexpected response" };
+}
+/* Keep previously-known data fields when a fresh discovery omits them
+   (same merge the reference dashboard performs). */
+function mergeDeviceData(fresh, previous) {
+  if (!previous) return fresh;
+  var prevById = {};
+  previous.forEach(function (d) { prevById[d.id] = d; });
+  return fresh.map(function (d) {
+    var p = prevById[d.id];
+    if (!p || !p.data || !d.data) return d;
+    var merged = Object.assign({}, d);
+    merged.data = Object.assign({}, d.data);
+    Object.keys(p.data).forEach(function (k) { if (!(k in merged.data)) merged.data[k] = p.data[k]; });
+    return merged;
+  });
+}
+
+/* ---------------- Layout / section model (pure) ----------------
+   Ordering rule (identical in the Windows edition): within every section,
+   devices render A–Z by display name (alias if set) UNLESS a custom order
+   has been saved for that section (sectionOrder[orderKey]) — items covered
+   by the custom order come first, in that order; the rest follow A–Z.
+   Pins: a pinned device gets a shortcut card in the Pinned section AND
+   stays in its normal section below. Scenes always get their own section,
+   rendered last; they can't be pinned or assigned to a group. */
+function displayNameWith(layout, d) { return (layout.alias && layout.alias[d.id]) || d.name; }
+function compareByName(layout, a, b) {
+  var na = displayNameWith(layout, a).toLowerCase(), nb = displayNameWith(layout, b).toLowerCase();
+  if (na < nb) return -1;
+  if (na > nb) return 1;
+  return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+}
+function orderSectionItems(items, customOrder, layout) {
+  var byId = {};
+  items.forEach(function (d) { byId[d.id] = d; });
+  var used = {}, out = [];
+  (customOrder || []).forEach(function (id) {
+    if (byId[id] && !used[id]) { out.push(byId[id]); used[id] = true; }
+  });
+  var rest = items.filter(function (d) { return !used[d.id]; });
+  rest.sort(function (a, b) { return compareByName(layout, a, b); });
+  return out.concat(rest);
+}
+function filterDevices(devices, layout, query) {
+  var q = (query || "").trim().toLowerCase();
+  if (!q) return devices;
+  return devices.filter(function (d) {
+    return displayNameWith(layout, d).toLowerCase().indexOf(q) >= 0 ||
+           (d.name || "").toLowerCase().indexOf(q) >= 0;
+  });
+}
+function buildSections(devices, layout, editing) {
+  var hidden = {};
+  (layout.hidden || []).forEach(function (id) { hidden[id] = true; });
+  var visible = devices.filter(function (d) { return !hidden[d.id]; });
+  var scenes = visible.filter(function (d) { return d.isScene; });
+  var normal = visible.filter(function (d) { return !d.isScene; });
+  var pinSet = {};
+  (layout.pins || []).forEach(function (id) { pinSet[id] = true; });
+  var so = layout.sectionOrder || {};
+  var sections = [];
+  var pinned = normal.filter(function (d) { return pinSet[d.id]; });
+  if (pinned.length) sections.push({ key: "pinned", orderKey: "pinned", title: "Pinned", kind: "pinned", groupId: null, devices: orderSectionItems(pinned, so["pinned"], layout) });
+  (layout.groups || []).forEach(function (g) {
+    var devs = normal.filter(function (d) { return layout.assign[d.id] === g.id; });
+    sections.push({ key: g.id, orderKey: "group:" + g.id, title: g.name, kind: "group", groupId: g.id, devices: orderSectionItems(devs, so["group:" + g.id], layout) });
+  });
+  var ungrouped = normal.filter(function (d) {
+    var g = layout.assign[d.id];
+    return !(g && (layout.groups || []).some(function (x) { return x.id === g; }));
+  });
+  sections.push({ key: "ungrouped", orderKey: "ungrouped", title: "Ungrouped", kind: "ungrouped", groupId: null, devices: orderSectionItems(ungrouped, so["ungrouped"], layout) });
+  if (scenes.length) sections.push({ key: "scenes", orderKey: "scenes", title: "Scenes", kind: "scenes", groupId: null, devices: orderSectionItems(scenes, so["scenes"], layout) });
+  return sections.filter(function (s) { return s.devices.length > 0 || (editing && s.kind === "group"); });
+}
+
+/* ---------------- API client (fetch injectable for tests) ---------------- */
+function pickFetch(fetchImpl) { return fetchImpl || (typeof fetch !== "undefined" ? fetch : null); }
+
+async function apiAuth(creds, proxyCfg, fetchImpl) {
+  var doFetch = pickFetch(fetchImpl);
+  var regionKey = regionKeyFromCode(creds.countryCode);
+  var url = applyProxy(baseForRegion(regionKey) + "auth.do", proxyCfg.preset, proxyCfg.custom, regionKey);
+  var res = await doFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: buildAuthBody(creds.userName, creds.password, creds.countryCode, creds.platform)
+  });
+  var json = await res.json();
+  if (json && json.access_token) {
+    return {
+      ok: true,
+      accessToken: json.access_token,
+      refreshToken: json.refresh_token || null,
+      expiresIn: json.expires_in || 0,
+      expiresAt: Date.now() + (json.expires_in || 0) * 1000,
+      region: regionFromToken(json.access_token) || regionKey
+    };
+  }
+  var msg = (json && (json.msg || json.errorCode || json.errorMsg)) || "Login failed — check username, password and region.";
+  return { ok: false, error: String(msg) };
+}
+
+async function apiRefresh(session, proxyCfg, fetchImpl) {
+  var doFetch = pickFetch(fetchImpl);
+  var q = new URLSearchParams();
+  q.set("grant_type", "refresh_token");
+  q.set("refresh_token", session.refreshToken);
+  q.set("rand", String(Math.random()));
+  var url = applyProxy(baseForRegion(session.region) + "auth.do?" + q.toString(), proxyCfg.preset, proxyCfg.custom, session.region);
+  var res = await doFetch(url, { method: "GET" });
+  var json = await res.json();
+  if (json && json.access_token) {
+    return {
+      ok: true,
+      accessToken: json.access_token,
+      refreshToken: json.refresh_token || session.refreshToken,
+      expiresIn: json.expires_in || 0,
+      expiresAt: Date.now() + (json.expires_in || 0) * 1000,
+      region: regionFromToken(json.access_token) || session.region
+    };
+  }
+  return { ok: false, error: "Session refresh failed" };
+}
+
+async function apiSkill(session, body, proxyCfg, fetchImpl) {
+  var doFetch = pickFetch(fetchImpl);
+  var url = applyProxy(baseForRegion(session.region) + "skill", proxyCfg.preset, proxyCfg.custom, session.region);
+  var res = await doFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+async function apiDiscovery(session, proxyCfg, previousRaw, fetchImpl) {
+  var json = await apiSkill(session, buildDiscoveryBody(session.accessToken), proxyCfg, fetchImpl);
+  var parsed = parseDiscovery(json);
+  if (parsed.ok && previousRaw) {
+    var merged = mergeDeviceData(parsed.rawDevices, previousRaw);
+    return { ok: true, devices: merged.map(parseDevice), rawDevices: merged, raw: json };
+  }
+  if (parsed.ok) parsed.raw = json;
+  return parsed;
+}
+
+async function apiControl(session, devId, action, value, proxyCfg, fetchImpl) {
+  var json = await apiSkill(session, buildControlBody(session.accessToken, devId, action, value), proxyCfg, fetchImpl);
+  var code = json && json.header && json.header.code;
+  return { ok: code === "SUCCESS", code: code || null, raw: json };
+}
+
+/* Exported for the node test harness (ignored in the browser). */
+var SLC_API = {
+  REGION_BASE: REGION_BASE, SMARTATHOME_PROXY: SMARTATHOME_PROXY,
+  regionKeyFromCode: regionKeyFromCode, regionFromToken: regionFromToken,
+  baseForRegion: baseForRegion, applyProxy: applyProxy,
+  brightnessToPct: brightnessToPct, tempReportedToSlider: tempReportedToSlider,
+  tempSliderToReported: tempSliderToReported, tempSliderToKelvin: tempSliderToKelvin,
+  hexToHsv: hexToHsv, hsvToHex: hsvToHex, normSaturation: normSaturation,
+  buildAuthBody: buildAuthBody, buildDiscoveryBody: buildDiscoveryBody,
+  buildControlBody: buildControlBody, parseDevice: parseDevice,
+  parseDiscovery: parseDiscovery, mergeDeviceData: mergeDeviceData,
+  apiAuth: apiAuth, apiRefresh: apiRefresh, apiDiscovery: apiDiscovery, apiControl: apiControl,
+  obfuscate: obfuscate, deobfuscate: deobfuscate,
+  migrateLayout: migrateLayout, displayNameWith: displayNameWith,
+  orderSectionItems: orderSectionItems, buildSections: buildSections,
+  filterDevices: filterDevices
+};
+if (typeof module !== "undefined" && module.exports) module.exports = SLC_API;
+
+/* ================================================================
+   App state + UI (browser only below this line)
+   ================================================================ */
+var S = {
+  session: null,          /* {accessToken, refreshToken, expiresAt, region} */
+  devices: [],            /* parsed device models */
+  rawDevices: null,       /* last raw discovery payload devices */
+  timer: null,
+  interacting: false,
+  dragId: null,
+  query: "",
+  openColorFor: null,
+  prefs: null,
+  layout: null
+};
+
+function defaultPrefs() {
+  return {
+    theme: "dark", accent: "#6366f1", density: "comfortable",
+    autorefresh: true, interval: 30,
+    proxyPreset: "auto", proxyCustom: ""
+  };
+}
+function defaultLayout() {
+  return { groups: [], assign: {}, alias: {}, hidden: [], pins: [], sectionOrder: {}, collapsed: {} };
+}
+/* Normalise a stored layout (pure). Migrates the old Favorites list into
+   Pins; the old global device order is retired — name order is the default
+   now, and order is customised per section via sectionOrder. */
+function migrateLayout(raw) {
+  raw = raw || {};
+  var L = Object.assign(defaultLayout(), raw);
+  if (!Array.isArray(raw.pins)) {
+    L.pins = Array.isArray(raw.favs) ? raw.favs.slice() : [];
+  }
+  if (!L.sectionOrder || typeof L.sectionOrder !== "object" || Array.isArray(L.sectionOrder)) L.sectionOrder = {};
+  if (!Array.isArray(L.groups)) L.groups = [];
+  if (!Array.isArray(L.hidden)) L.hidden = [];
+  delete L.favs;
+  delete L.order;
+  return L;
+}
+function loadPrefs() { S.prefs = Object.assign(defaultPrefs(), slcGet("prefs", {})); }
+function savePrefs() { slcSet("prefs", S.prefs); }
+function loadLayout() { S.layout = migrateLayout(slcGet("layout", {})); }
+function saveLayout() { slcSet("layout", S.layout); }
+function proxyCfg() { return { preset: S.prefs.proxyPreset, custom: S.prefs.proxyCustom }; }
+
+function $(id) { return document.getElementById(id); }
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function toast(msg, isErr) {
+  var t = el("div", "toast" + (isErr ? " err" : ""), msg);
+  $("toast-wrap").appendChild(t);
+  setTimeout(function () { t.remove(); }, 3600);
+}
+
+/* ---------------- Session ---------------- */
+function persistSession() {
+  /* Session is only persisted when a saved login exists ("keep me logged in"). */
+  if (slcGet("creds", null)) slcSet("session", S.session);
+  else slcSet("session", null);
+}
+function saveCreds(creds) {
+  slcSet("creds", {
+    userName: creds.userName, password: obfuscate(creds.password),
+    countryCode: creds.countryCode, platform: creds.platform
+  });
+}
+function loadCreds() {
+  var c = slcGet("creds", null);
+  if (!c) return null;
+  return { userName: c.userName, password: deobfuscate(c.password), countryCode: c.countryCode, platform: c.platform };
+}
+function clearSavedLogin() { slcSet("creds", null); slcSet("session", null); }
+
+async function doAuth(creds) {
+  var r = await apiAuth(creds, proxyCfg());
+  if (r.ok) {
+    S.session = { accessToken: r.accessToken, refreshToken: r.refreshToken, expiresAt: r.expiresAt, region: r.region };
+    persistSession();
+  }
+  return r;
+}
+/* Make sure the session token is fresh; refresh or silently re-login. */
+async function ensureSession(force) {
+  if (!S.session) return false;
+  if (!force && Date.now() < S.session.expiresAt - 60000) return true;
+  if (S.session.refreshToken) {
+    var rr = await apiRefresh(S.session, proxyCfg());
+    if (rr.ok) {
+      S.session = { accessToken: rr.accessToken, refreshToken: rr.refreshToken, expiresAt: rr.expiresAt, region: rr.region };
+      persistSession();
+      return true;
+    }
+  }
+  var creds = loadCreds();
+  if (creds) {
+    var ra = await doAuth(creds);
+    return ra.ok;
+  }
+  return false;
+}
+function sessionExpired() {
+  S.session = null;
+  slcSet("session", null);
+  showLogin("Your session expired — please log in again.");
+}
+
+/* ---------------- Device fetching ---------------- */
+async function fetchDevices(isRefresh) {
+  if (!S.session) return false;
+  await ensureSession(false);
+  var res;
+  try {
+    res = await apiDiscovery(S.session, proxyCfg(), S.rawDevices);
+  } catch (e) {
+    toast("Network error while fetching devices", true);
+    return false;
+  }
+  if (!res.ok && !res.frequent) {
+    /* One retry after a forced re-auth (token may have been revoked early). */
+    if (await ensureSession(true)) {
+      try { res = await apiDiscovery(S.session, proxyCfg(), S.rawDevices); } catch (e) { /* fall through */ }
+    }
+  }
+  if (res.frequent) {
+    if (S.devices.length) { if (isRefresh) toast("Tuya is rate-limiting — showing last known states"); return true; }
+    toast("Tuya is rate-limiting the device list — wait a few seconds and press Refresh", true);
+    return false;
+  }
+  if (!res.ok) { toast(res.error || "Could not fetch devices", true); return false; }
+  S.rawDevices = res.rawDevices;
+  slcSet("cache_devices", res.rawDevices);
+  S.devices = res.devices;
+  syncLayoutWithDevices();
+  $("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+  return true;
+}
+function syncLayoutWithDevices() {
+  var idSet = {};
+  S.devices.forEach(function (d) { idSet[d.id] = true; });
+  var keep = function (id) { return !!idSet[id]; };
+  S.layout.pins = S.layout.pins.filter(keep);
+  S.layout.hidden = S.layout.hidden.filter(keep);
+  Object.keys(S.layout.assign).forEach(function (id) { if (!keep(id)) delete S.layout.assign[id]; });
+  Object.keys(S.layout.alias).forEach(function (id) { if (!keep(id)) delete S.layout.alias[id]; });
+  Object.keys(S.layout.sectionOrder).forEach(function (k) {
+    S.layout.sectionOrder[k] = S.layout.sectionOrder[k].filter(keep);
+    if (!S.layout.sectionOrder[k].length) delete S.layout.sectionOrder[k];
+  });
+  saveLayout();
+}
+function deviceById(id) {
+  for (var i = 0; i < S.devices.length; i++) if (S.devices[i].id === id) return S.devices[i];
+  return null;
+}
+function displayName(d) { return displayNameWith(S.layout, d); }
+function togglePin(id) {
+  var d = deviceById(id);
+  if (d && d.isScene) return;   /* scenes can't be pinned */
+  var i = S.layout.pins.indexOf(id);
+  if (i >= 0) S.layout.pins.splice(i, 1); else S.layout.pins.push(id);
+  saveLayout(); renderAll();
+}
+
+/* ---------------- Control ---------------- */
+async function sendControl(device, action, value, applyLocal) {
+  await ensureSession(false);
+  var backup = JSON.stringify(device.raw.data || {});
+  if (applyLocal) { applyLocal(); renderAll(); }
+  var res;
+  try {
+    res = await apiControl(S.session, device.id, action, value, proxyCfg());
+  } catch (e) { res = { ok: false }; }
+  if (!res.ok) {
+    device.raw.data = JSON.parse(backup);
+    var fresh = parseDevice(device.raw);
+    Object.keys(fresh).forEach(function (k) { device[k] = fresh[k]; });
+    renderAll();
+    toast("Command failed for " + displayName(device), true);
+    return false;
+  }
+  return true;
+}
+function doToggle(device) {
+  var newVal = device.state ? 0 : 1;
+  sendControl(device, "turnOnOff", newVal, function () {
+    device.state = !device.state;
+    device.raw.data.state = device.state;
+  });
+}
+function doSceneStart(device) {
+  sendControl(device, "turnOnOff", 1, null).then(function (ok) {
+    if (ok) toast("▶ Scene started: " + displayName(device));
+  });
+}
+function doBrightness(device, pct) {
+  pct = clamp(Math.round(pct), 11, 100);
+  sendControl(device, "brightnessSet", pct, function () {
+    device.brightnessPct = pct;
+    device.raw.data.brightness = pct * 10;
+    device.state = true; device.raw.data.state = true;
+  });
+}
+function doTemp(device, sliderVal) {
+  sliderVal = clamp(Math.round(sliderVal), 1000, 10000);
+  sendControl(device, "colorTemperatureSet", sliderVal, function () {
+    device.tempSlider = sliderVal;
+    device.raw.data.color_temp = tempSliderToReported(sliderVal);
+    device.state = true; device.raw.data.state = true;
+    device.colorMode = "white"; device.raw.data.color_mode = "white";
+  });
+}
+function doColor(device, hex) {
+  var hsv = hexToHsv(hex);
+  var hue = hsv.h, sat = Math.round(hsv.s * 100) / 100;
+  if (sat < 0.02) { hue = 0; sat = 0; }           /* white, like the reference */
+  var value = { hue: hue, saturation: sat, brightness: device.brightnessPct !== null ? device.brightnessPct : 100 };
+  sendControl(device, "colorSet", value, function () {
+    device.hue = hue; device.saturation = sat;
+    device.state = true; device.raw.data.state = true;
+    device.colorMode = "colour"; device.raw.data.color_mode = "colour";
+    device.raw.data.hue = hue; device.raw.data.saturation = sat;
+  });
+}
+
+/* ---------------- Rendering ---------------- */
+function isEditing() { return document.body.classList.contains("editing"); }
+
+function sectionsModel() {
+  return buildSections(filterDevices(S.devices, S.layout, S.query), S.layout, isEditing());
+}
+function sectionByKey(key) {
+  var secs = sectionsModel();
+  for (var i = 0; i < secs.length; i++) if (secs[i].key === key) return secs[i];
+  return null;
+}
+function setSectionOrder(sec, ids) {
+  if (ids && ids.length) S.layout.sectionOrder[sec.orderKey] = ids.slice();
+  else delete S.layout.sectionOrder[sec.orderKey];
+  saveLayout();
+}
+function resetSectionOrder(sec) {
+  delete S.layout.sectionOrder[sec.orderKey];
+  saveLayout(); renderAll();
+  toast("“" + sec.title + "” is back to name order");
+}
+
+function statusText(d) {
+  if (!d.online) return "Offline";
+  var parts = [];
+  if (d.isScene) return "Scene — tap Start to run";
+  parts.push(d.state ? "On" : "Off");
+  if (d.state && d.brightnessPct !== null) parts.push(d.brightnessPct + "%");
+  if (d.state && d.tempSlider !== null && d.colorMode !== "colour") parts.push(tempSliderToKelvin(d.tempSlider) + "K");
+  if (d.state && d.colorMode === "colour") parts.push("Colour");
+  return parts.join(" · ");
+}
+
+function renderAll() {
+  var dash = $("dash");
+  dash.innerHTML = "";
+  var sections = sectionsModel();
+  if (!sections.length) {
+    dash.appendChild(el("div", "empty-note", "No devices to show. Press ↻ Refresh, or unhide devices in Settings."));
+    return;
+  }
+  sections.forEach(function (sec) { dash.appendChild(renderSection(sec)); });
+}
+
+function renderSection(sec) {
+  var wrap = el("div", "section");
+  wrap.dataset.sectionKey = sec.key;
+  var head = el("div", "section-head" + (S.layout.collapsed[sec.key] ? " collapsed" : ""));
+  head.appendChild(el("span", "chev", "▾"));
+  head.appendChild(el("h2", null, sec.title));
+  head.appendChild(el("span", "count", String(sec.devices.length)));
+  head.appendChild(el("span", "spacer"));
+  if (isEditing() && (S.layout.sectionOrder[sec.orderKey] || []).length) {
+    var rst = el("button", "btn small", "↺ Reset to name order");
+    rst.addEventListener("click", function (ev) { ev.stopPropagation(); resetSectionOrder(sec); });
+    head.appendChild(rst);
+  }
+  if (isEditing() && sec.groupId) {
+    var ren = el("button", "btn small", "Rename");
+    ren.addEventListener("click", function (ev) { ev.stopPropagation(); renameGroup(sec.groupId); });
+    var del = el("button", "btn small danger", "Delete");
+    del.addEventListener("click", function (ev) { ev.stopPropagation(); deleteGroup(sec.groupId); });
+    head.appendChild(ren); head.appendChild(del);
+  }
+  head.addEventListener("click", function () {
+    S.layout.collapsed[sec.key] = !S.layout.collapsed[sec.key];
+    saveLayout(); renderAll();
+  });
+  wrap.appendChild(head);
+  if (!S.layout.collapsed[sec.key]) {
+    var grid = el("div", "grid");
+    grid.dataset.sectionKey = sec.key;
+    sec.devices.forEach(function (d) { grid.appendChild(renderCard(d, sec)); });
+    if (isEditing() && !sec.devices.length) grid.appendChild(el("div", "empty-note", "Drop devices here"));
+    grid.addEventListener("dragover", function (ev) {
+      if (ev.target === grid && S.dragId) { ev.preventDefault(); }
+    });
+    grid.addEventListener("drop", function (ev) {
+      if (ev.target === grid && S.dragId) { ev.preventDefault(); dropDevice(S.dragId, null, sec); }
+    });
+    wrap.appendChild(grid);
+  }
+  return wrap;
+}
+
+function sliderRow(labelText, min, max, value, fmt) {
+  var wrap = el("div", "ctl");
+  var row = el("div", "ctl-row");
+  row.appendChild(el("span", null, labelText));
+  var val = el("b", null, fmt(value));
+  row.appendChild(val);
+  var input = el("input", "slim");
+  input.type = "range"; input.min = min; input.max = max; input.value = value;
+  input.style.setProperty("--p", ((value - min) / (max - min) * 100) + "%");
+  wrap.appendChild(row); wrap.appendChild(input);
+  return { wrap: wrap, input: input, val: val };
+}
+function bindSlider(s, fmt, onCommit) {
+  s.input.addEventListener("input", function () {
+    var v = parseFloat(s.input.value);
+    s.input.style.setProperty("--p", ((v - s.input.min) / (s.input.max - s.input.min) * 100) + "%");
+    s.val.textContent = fmt(v);
+  });
+  s.input.addEventListener("pointerdown", function () { S.interacting = true; });
+  s.input.addEventListener("change", function () {
+    S.interacting = false;
+    onCommit(parseFloat(s.input.value));
+  });
+}
+
+function renderCard(d, sec) {
+  var card = el("div", "card" + (d.state && d.online ? " on" : "") + (!d.online ? " offline" : ""));
+  card.dataset.devid = d.id;
+  if (isEditing()) {
+    card.draggable = true;
+    card.addEventListener("dragstart", function (ev) {
+      S.dragId = d.id; card.classList.add("dragging");
+      ev.dataTransfer.effectAllowed = "move";
+      try { ev.dataTransfer.setData("text/plain", d.id); } catch (e) {}
+    });
+    card.addEventListener("dragend", function () { S.dragId = null; renderAll(); });
+    card.addEventListener("dragover", function (ev) { ev.preventDefault(); card.classList.add("drop-target"); });
+    card.addEventListener("dragleave", function () { card.classList.remove("drop-target"); });
+    card.addEventListener("drop", function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      if (S.dragId && S.dragId !== d.id) dropDevice(S.dragId, d.id, sec);
+    });
+  }
+
+  var hideBtn = el("button", "hide-x", "✕");
+  hideBtn.title = "Hide this device";
+  hideBtn.addEventListener("click", function () {
+    S.layout.hidden.push(d.id); saveLayout(); renderAll();
+    toast(displayName(d) + " hidden — bring it back from Settings");
+  });
+  card.appendChild(hideBtn);
+
+  var top = el("div", "card-top");
+  if (isEditing()) top.appendChild(el("span", "drag-handle", "⠿"));
+  var icon = el("div", "dev-icon", TYPE_ICONS[d.iconKind] || TYPE_ICONS.default);
+  top.appendChild(icon);
+  var meta = el("div", "dev-meta");
+  var nameRow = el("div", "dev-name");
+  nameRow.appendChild(document.createTextNode(displayName(d)));
+  if (!d.online) nameRow.appendChild(el("span", "badge-offline", "OFFLINE"));
+  meta.appendChild(nameRow);
+  var st = el("div", "dev-status");
+  st.appendChild(el("span", "dot"));
+  st.appendChild(document.createTextNode(statusText(d)));
+  meta.appendChild(st);
+  top.appendChild(meta);
+
+  if (!d.isScene) {
+    var isPinned = S.layout.pins.indexOf(d.id) >= 0;
+    var pinBtn = el("button", "pin-btn" + (isPinned ? " pinned" : ""), "📌");
+    pinBtn.title = isPinned ? "Unpin (remove shortcut from the top)" : "Pin a shortcut to the top";
+    pinBtn.setAttribute("aria-label", pinBtn.title);
+    pinBtn.addEventListener("click", function () { togglePin(d.id); });
+    top.appendChild(pinBtn);
+  }
+
+  if (d.isScene) {
+    /* scene: no toggle in top row */
+  } else {
+    var sw = el("button", "switch");
+    sw.setAttribute("role", "switch");
+    sw.setAttribute("aria-checked", d.state && d.online ? "true" : "false");
+    sw.setAttribute("aria-label", "Toggle " + displayName(d));
+    if (!d.online) sw.disabled = true;
+    sw.addEventListener("click", function () { doToggle(d); });
+    top.appendChild(sw);
+  }
+  card.appendChild(top);
+
+  if (d.online && !d.isScene) {
+    if (d.hasBrightness && d.brightnessPct !== null) {
+      var bs = sliderRow("Brightness", 11, 100, Math.max(11, d.brightnessPct), function (v) { return Math.round(v) + "%"; });
+      if (!d.online) bs.input.disabled = true;
+      bindSlider(bs, function (v) { return Math.round(v) + "%"; }, function (v) { doBrightness(d, v); });
+      card.appendChild(bs.wrap);
+    }
+    if (d.hasTemp && d.tempSlider !== null) {
+      var ts = sliderRow("Colour temperature", 1000, 10000, d.tempSlider, function (v) { return tempSliderToKelvin(v) + "K"; });
+      ts.input.step = 50;
+      bindSlider(ts, function (v) { return tempSliderToKelvin(v) + "K"; }, function (v) { doTemp(d, v); });
+      card.appendChild(ts.wrap);
+    }
+    if (d.hasColor) {
+      var swRow = el("div", "swatches");
+      var currentHex = (d.hue !== null) ? hsvToHex(d.hue, d.saturation || 0, 1) : null;
+      SWATCHES.forEach(function (swd) {
+        var b = el("button", "swatch" + (currentHex === swd.hex ? " active" : ""));
+        b.style.background = swd.hex; b.title = swd.name;
+        b.addEventListener("click", function () { doColor(d, swd.hex); });
+        swRow.appendChild(b);
+      });
+      var more = el("button", "swatch", "🎨");
+      more.title = "More colours…";
+      more.style.background = "conic-gradient(#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)";
+      more.addEventListener("click", function () {
+        S.openColorFor = (S.openColorFor === d.id) ? null : d.id;
+        renderAll();
+      });
+      swRow.appendChild(more);
+      card.appendChild(swRow);
+      if (S.openColorFor === d.id) {
+        var panel = el("div", "color-panel");
+        var row = el("div", "row");
+        var picker = el("input", "picker");
+        picker.type = "color";
+        picker.value = currentHex || "#ffffff";
+        var apply = el("button", "btn small primary", "Apply colour");
+        apply.addEventListener("click", function () { doColor(d, picker.value); });
+        row.appendChild(picker); row.appendChild(apply);
+        panel.appendChild(row);
+        card.appendChild(panel);
+      }
+    }
+  }
+  if (d.isScene) {
+    var start = el("button", "btn primary scene-btn", "▶ Start scene");
+    if (!d.online) start.disabled = true;
+    start.addEventListener("click", function () { doSceneStart(d); });
+    card.appendChild(start);
+  }
+  if (isEditing()) card.appendChild(editTools(d, sec));
+  return card;
+}
+
+function editTools(d, sec) {
+  var box = el("div", "edit-tools");
+  var r1 = el("div", "row");
+  var alias = el("input");
+  alias.type = "text"; alias.placeholder = "Display name (alias)"; alias.value = S.layout.alias[d.id] || "";
+  alias.addEventListener("change", function () {
+    var v = alias.value.trim();
+    if (v) S.layout.alias[d.id] = v; else delete S.layout.alias[d.id];
+    saveLayout(); renderAll();
+  });
+  r1.appendChild(alias);
+  box.appendChild(r1);
+  if (!d.isScene) {
+    var r2 = el("div", "row");
+    var sel = el("select");
+    var optU = el("option", null, "Ungrouped"); optU.value = ""; sel.appendChild(optU);
+    S.layout.groups.forEach(function (g) {
+      var o = el("option", null, g.name); o.value = g.id; sel.appendChild(o);
+    });
+    sel.value = S.layout.assign[d.id] || "";
+    sel.addEventListener("change", function () {
+      if (sel.value) S.layout.assign[d.id] = sel.value; else delete S.layout.assign[d.id];
+      saveLayout(); renderAll();
+    });
+    r2.appendChild(sel);
+    var pinned = S.layout.pins.indexOf(d.id) >= 0;
+    var pinBtn = el("button", "btn small", pinned ? "📌 Unpin" : "📌 Pin");
+    pinBtn.addEventListener("click", function () { togglePin(d.id); });
+    r2.appendChild(pinBtn);
+    box.appendChild(r2);
+  }
+  var r3 = el("div", "row");
+  var up = el("button", "btn small", "↑ Move up");
+  up.addEventListener("click", function () { moveWithinSection(d.id, sec, -1); });
+  var down = el("button", "btn small", "↓ Move down");
+  down.addEventListener("click", function () { moveWithinSection(d.id, sec, 1); });
+  r3.appendChild(up); r3.appendChild(down);
+  box.appendChild(r3);
+  return box;
+}
+function moveWithinSection(id, sec, dir) {
+  if (!sec) return;
+  var ids = sec.devices.map(function (d) { return d.id; });
+  var i = ids.indexOf(id), j = i + dir;
+  if (i < 0 || j < 0 || j >= ids.length) return;
+  ids.splice(i, 1); ids.splice(j, 0, id);
+  setSectionOrder(sec, ids);
+  renderAll();
+}
+function dropDevice(dragId, beforeId, targetSection) {
+  var dragDev = deviceById(dragId);
+  S.dragId = null;
+  if (!dragDev || !targetSection) { renderAll(); return; }
+  /* Scenes live only in the Scenes section; devices never enter it. */
+  if (dragDev.isScene !== (targetSection.kind === "scenes")) { renderAll(); return; }
+  if (!dragDev.isScene) {
+    if (targetSection.kind === "group") S.layout.assign[dragId] = targetSection.groupId;
+    else if (targetSection.kind === "ungrouped") delete S.layout.assign[dragId];
+    else if (targetSection.kind === "pinned" && S.layout.pins.indexOf(dragId) < 0) S.layout.pins.push(dragId);
+  }
+  if (beforeId && beforeId !== dragId) {
+    /* Positional drop: materialise the section's order with the card inserted. */
+    var fresh = sectionByKey(targetSection.key);
+    if (fresh) {
+      var ids = fresh.devices.map(function (d) { return d.id; }).filter(function (x) { return x !== dragId; });
+      var idx = ids.indexOf(beforeId);
+      ids.splice(idx < 0 ? ids.length : idx, 0, dragId);
+      S.layout.sectionOrder[targetSection.orderKey] = ids;
+    }
+  }
+  saveLayout(); renderAll();
+}
+function renameGroup(gid) {
+  var g = S.layout.groups.filter(function (x) { return x.id === gid; })[0];
+  if (!g) return;
+  var name = prompt("Group name:", g.name);
+  if (name && name.trim()) { g.name = name.trim(); saveLayout(); renderAll(); }
+}
+function deleteGroup(gid) {
+  var g = S.layout.groups.filter(function (x) { return x.id === gid; })[0];
+  if (!g) return;
+  if (!confirm("Delete group “" + g.name + "”? Its devices become Ungrouped.")) return;
+  S.layout.groups = S.layout.groups.filter(function (x) { return x.id !== gid; });
+  Object.keys(S.layout.assign).forEach(function (k) { if (S.layout.assign[k] === gid) delete S.layout.assign[k]; });
+  saveLayout(); renderAll();
+}
+function addGroup() {
+  var name = prompt("Name for the new group (e.g. Living Room):");
+  if (!name || !name.trim()) return;
+  S.layout.groups.push({ id: "g" + Date.now().toString(36), name: name.trim() });
+  saveLayout(); renderAll();
+}
+
+/* ---------------- Views ---------------- */
+function showLogin(msg) {
+  stopAutorefresh();
+  document.body.classList.remove("editing");
+  $("view-app").classList.add("hidden");
+  $("view-settings").classList.add("hidden");
+  $("view-login").classList.remove("hidden");
+  var err = $("login-error");
+  if (msg) { err.textContent = msg; err.classList.remove("hidden"); }
+  else err.classList.add("hidden");
+  var creds = loadCreds();
+  if (creds) {
+    $("li-user").value = creds.userName;
+    $("li-region").value = String(creds.countryCode);
+    $("li-platform").value = creds.platform;
+    $("li-keep").checked = true;
+  }
+}
+function showApp() {
+  $("view-login").classList.add("hidden");
+  $("view-settings").classList.add("hidden");
+  $("view-app").classList.remove("hidden");
+}
+function showSettings() {
+  $("view-login").classList.add("hidden");
+  $("view-app").classList.add("hidden");
+  $("view-settings").classList.remove("hidden");
+  renderSettings();
+}
+
+/* ---------------- Autorefresh ---------------- */
+function stopAutorefresh() { if (S.timer) { clearInterval(S.timer); S.timer = null; } }
+function startAutorefresh() {
+  stopAutorefresh();
+  if (!S.prefs.autorefresh || !S.session) return;
+  S.timer = setInterval(async function () {
+    if (S.interacting || isEditing()) return;
+    await fetchDevices(true);
+    if (!S.interacting) renderAll();
+  }, S.prefs.interval * 1000);
+}
+
+/* ---------------- Login flow ---------------- */
+async function enterApp() {
+  showApp();
+  var cached = slcGet("cache_devices", null);
+  if (cached && !S.devices.length) {
+    S.rawDevices = cached;
+    S.devices = cached.map(parseDevice);
+    syncLayoutWithDevices();
+    renderAll();
+  }
+  var ok = await fetchDevices(false);
+  renderAll();
+  if (ok) startAutorefresh();
+}
+async function submitLogin(ev) {
+  ev.preventDefault();
+  var creds = {
+    userName: $("li-user").value.trim(),
+    password: $("li-pass").value,
+    countryCode: $("li-region").value,
+    platform: $("li-platform").value
+  };
+  var keep = $("li-keep").checked;
+  $("login-error").classList.add("hidden");
+  $("li-submit").disabled = true;
+  $("login-spinner").classList.remove("hidden");
+  var r;
+  try { r = await doAuth(creds); }
+  catch (e) { r = { ok: false, error: "Network error — could not reach Tuya. Check your connection / proxy setting." }; }
+  $("li-submit").disabled = false;
+  $("login-spinner").classList.add("hidden");
+  if (!r.ok) { showLogin(r.error || "Login failed"); return; }
+  if (keep) saveCreds(creds); else clearSavedLogin();
+  persistSession();
+  toast("Welcome back 👋");
+  enterApp();
+}
+function doLogout() {
+  S.session = null;
+  S.devices = [];
+  clearSavedLogin();
+  showLogin();
+  toast("Logged out");
+}
+
+/* ---------------- Proxy selects (login + settings) ---------------- */
+function fillProxySelect(sel) {
+  sel.innerHTML = "";
+  PROXY_PRESETS.forEach(function (p) {
+    var o = el("option", null, p.label); o.value = p.id; sel.appendChild(o);
+  });
+  sel.value = S.prefs.proxyPreset;
+}
+function syncProxyUI() {
+  ["li", "set"].forEach(function (prefix) {
+    var sel = $(prefix + "-proxy-preset"), wrap = $(prefix + "-proxy-custom-wrap"), inp = $(prefix + "-proxy-custom");
+    if (!sel) return;
+    sel.value = S.prefs.proxyPreset;
+    inp.value = S.prefs.proxyCustom;
+    wrap.classList.toggle("hidden", S.prefs.proxyPreset !== "custom");
+  });
+}
+function bindProxyUI(prefix) {
+  $(prefix + "-proxy-preset").addEventListener("change", function (ev) {
+    S.prefs.proxyPreset = ev.target.value; savePrefs(); syncProxyUI();
+  });
+  $(prefix + "-proxy-custom").addEventListener("change", function (ev) {
+    S.prefs.proxyCustom = ev.target.value; savePrefs(); syncProxyUI();
+  });
+}
+
+/* ---------------- Appearance ---------------- */
+function applyPrefs() {
+  document.documentElement.setAttribute("data-theme", S.prefs.theme);
+  document.documentElement.style.setProperty("--accent", S.prefs.accent);
+  var soft = S.prefs.accent + "29";
+  document.documentElement.style.setProperty("--accent-soft", soft);
+  document.body.setAttribute("data-density", S.prefs.density);
+  $("chk-autorefresh").checked = S.prefs.autorefresh;
+  $("sel-interval").value = String(S.prefs.interval);
+  $("set-interval").value = String(S.prefs.interval);
+  $("set-theme").value = S.prefs.theme;
+  $("set-density").value = S.prefs.density;
+  var row = $("accent-row");
+  row.innerHTML = "";
+  ACCENTS.forEach(function (a) {
+    var b = el("button", "accent-dot" + (S.prefs.accent === a.value ? " active" : ""));
+    b.style.background = a.value; b.title = a.name;
+    b.addEventListener("click", function () { S.prefs.accent = a.value; savePrefs(); applyPrefs(); });
+    row.appendChild(b);
+  });
+}
+
+/* ---------------- Settings ---------------- */
+function renderSettings() {
+  applyPrefs();
+  syncProxyUI();
+  var creds = loadCreds();
+  $("saved-login-info").textContent = creds
+    ? "A login is saved for " + creds.userName + " in this browser (used for silent re-login when the session expires)."
+    : "No login is saved in this browser.";
+  var list = $("hidden-list");
+  list.innerHTML = "";
+  if (!S.layout.hidden.length) {
+    list.appendChild(el("p", "hint", "Nothing is hidden. 🎉"));
+    return;
+  }
+  S.layout.hidden.forEach(function (id) {
+    var d = deviceById(id);
+    var row = el("div", "hidden-item");
+    row.appendChild(el("span", "grow", d ? displayName(d) : id));
+    var btn = el("button", "btn small", "Unhide");
+    btn.addEventListener("click", function () {
+      S.layout.hidden = S.layout.hidden.filter(function (x) { return x !== id; });
+      saveLayout(); renderSettings();
+    });
+    row.appendChild(btn);
+    list.appendChild(row);
+  });
+}
+
+/* ---------------- Wiring / bootstrap ---------------- */
+function setEditing(on) {
+  document.body.classList.toggle("editing", on);
+  $("editbar").classList.toggle("hidden", !on);
+  $("btn-edit").textContent = on ? "✔ Done editing" : "✎ Edit";
+  renderAll();
+}
+function init() {
+  loadPrefs(); loadLayout();
+  fillProxySelect($("li-proxy-preset"));
+  fillProxySelect($("set-proxy-preset"));
+  bindProxyUI("li"); bindProxyUI("set");
+  syncProxyUI();
+  document.documentElement.setAttribute("data-theme", S.prefs.theme);
+  document.documentElement.style.setProperty("--accent", S.prefs.accent);
+  document.body.setAttribute("data-density", S.prefs.density);
+
+  $("inp-search").addEventListener("input", function (ev) { S.query = ev.target.value; renderAll(); });
+  $("login-form").addEventListener("submit", submitLogin);
+  $("btn-logout").addEventListener("click", doLogout);
+  $("btn-refresh").addEventListener("click", async function () {
+    var ok = await fetchDevices(true);
+    if (ok) renderAll();
+  });
+  $("chk-autorefresh").addEventListener("change", function (ev) {
+    S.prefs.autorefresh = ev.target.checked; savePrefs(); startAutorefresh();
+  });
+  function onInterval(v) {
+    S.prefs.interval = parseInt(v, 10) || 30; savePrefs(); applyPrefs(); startAutorefresh();
+  }
+  $("sel-interval").addEventListener("change", function (ev) { onInterval(ev.target.value); });
+  $("set-interval").addEventListener("change", function (ev) { onInterval(ev.target.value); });
+  $("btn-edit").addEventListener("click", function () { setEditing(!isEditing()); });
+  $("btn-doneedit").addEventListener("click", function () { setEditing(false); });
+  $("btn-addgroup").addEventListener("click", addGroup);
+  $("btn-settings").addEventListener("click", showSettings);
+  $("btn-back").addEventListener("click", function () { showApp(); renderAll(); });
+  $("set-theme").addEventListener("change", function (ev) { S.prefs.theme = ev.target.value; savePrefs(); applyPrefs(); });
+  $("set-density").addEventListener("change", function (ev) { S.prefs.density = ev.target.value; savePrefs(); applyPrefs(); });
+  $("btn-forget").addEventListener("click", function () {
+    clearSavedLogin(); renderSettings(); toast("Saved login forgotten");
+  });
+
+  /* Restore session: saved token → saved credentials → login form. */
+  var savedSession = slcGet("session", null);
+  if (savedSession && savedSession.accessToken) {
+    S.session = savedSession;
+    if (Date.now() < (savedSession.expiresAt || 0) - 60000) { enterApp(); return; }
+    ensureSession(true).then(function (ok) { if (ok) enterApp(); else showLogin("Your session expired — please log in again."); });
+    return;
+  }
+  var creds = loadCreds();
+  if (creds) {
+    doAuth(creds).then(function (r) { if (r.ok) enterApp(); else showLogin(); });
+    return;
+  }
+  showLogin();
+}
+if (typeof document !== "undefined" && document.getElementById) {
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+}
+</script>
+</body>
+</html>
