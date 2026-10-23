@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.2.0">
+<meta name="version" content="1.2.1">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -248,6 +248,15 @@
   .cam-actions{display:flex; gap:8px; margin-top:13px}
   .cam-actions .btn{flex:1}
   .cam-actions a.btn{text-decoration:none; text-align:center}
+  /* Camera card sizes (v1.2.1, per-camera layout.camSizes): Normal is
+     one grid cell; Large spans 2 columns; Wide spans the whole row.
+     The 16:9 .cam-video inside follows the card's width. Guarded to
+     multi-column widths so a span never creates implicit columns on
+     a narrow (1-column) grid. */
+  @media (min-width:560px){
+    .card.cam-large{grid-column:span 2}
+    .card.cam-wide{grid-column:1/-1}
+  }
   /* In-tile live feed (gateway embed — see gatewayTileEmbed) */
   .cam-video{position:relative; margin-bottom:12px; border-radius:10px; overflow:hidden; background:#000; aspect-ratio:16/9}
   .cam-video img, .cam-video video{width:100%; height:100%; object-fit:cover; display:block; border:0}
@@ -290,6 +299,9 @@
   /* ============ Settings ============ */
   #view-settings main{max-width:760px}
   .panel{background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius); padding:20px 22px; box-shadow:var(--shadow); margin-bottom:16px}
+  /* Web-edition info note (Settings): a quiet accent edge, not a warning. */
+  .panel.web-note{border-left:3px solid var(--accent)}
+  .panel.web-note a.btn{text-decoration:none}
   .panel h3{margin:0 0 4px; font-size:15.5px}
   .panel .hint{font-size:12.5px; color:var(--text-dim); line-height:1.55; margin:4px 0 12px}
   .accent-row{display:flex; gap:9px; flex-wrap:wrap; margin-top:6px}
@@ -440,9 +452,20 @@
         </div>
       </div>
 
+      <div class="panel web-note">
+        <h3>ℹ️ Web edition</h3>
+        <p class="hint">You're using the web edition. Some features are only available in the
+        Windows app — including live camera video built into the tiles (no gateway needed),
+        Start-with-Windows and system-tray background running, and one-click
+        Download &amp; install updates.</p>
+        <div>
+          <a class="btn" href="https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases/latest" target="_blank" rel="noopener">Get the Windows app</a>
+        </div>
+      </div>
+
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.2.0</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.2.1</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -539,8 +562,11 @@
         <p><b>Customising.</b> Sections sort A–Z by name by default. Use ✎ Edit to drag devices into your
         own order inside a section (that order then sticks, and each section has a “Reset to name order”
         button), create groups (rooms), rename devices with an alias, or hide devices you never use.
-        Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top —
+        Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section —
         the device also stays in its group below. Scenes always live in their own Scenes section.
+        Sections appear in the order <b>Cameras → Pinned → Lighting → your groups → Ungrouped →
+        Scenes</b> by default; in Edit mode every section header has ↑ / ↓ buttons to move the
+        section itself up or down, and your arrangement is remembered too.
         Everything is remembered in this browser.</p>
         <p><b>Lighting &amp; group controls.</b> Lights organise themselves: any bulb or strip that
         isn't assigned to one of your groups lives in the built-in <b>Lighting</b> section, and
@@ -559,9 +585,15 @@
         builds the stream address for you: <code>rtsp://user:pass@IP:554/stream1</code> (high quality)
         or <code>/stream2</code> (standard) — or pick “Custom path” for other RTSP cameras. Camera
         cards sit alongside your devices and can be pinned, grouped and reordered just like them;
-        unassigned cameras live in the built-in <b>Cameras</b> section until you assign them to a
-        group of your own. Their passwords are stored in this browser with the same light
+        unassigned cameras live in the built-in <b>Cameras</b> section — the first section by
+        default — until you assign them to a group of your own. In Edit mode each camera card has a
+        <b>Size</b> choice: Normal (one grid cell), Large (two columns wide) or Wide (the full row),
+        and the video area follows the card's width. Their passwords are stored in this browser with the same light
         obfuscation as the saved login.</p>
+        <p><b>Web edition.</b> You're using the web edition. Some features are only available in the
+        Windows app — including live camera video built into the tiles (no gateway needed),
+        Start-with-Windows and system-tray background running, and one-click Download &amp; install
+        updates. There's a “Get the Windows app” link in Settings.</p>
         <p><b>Watching a stream.</b> Web browsers can't play <code>rtsp://</code> directly. Without a
         gateway, ▶ Watch hands the stream address to a player app installed on your device (such as
         VLC) — or use <b>Copy URL</b> and paste the address into VLC's “Open Network Stream”. For
@@ -859,7 +891,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.2.0";
+var APP_VERSION = "1.2.1";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1036,14 +1068,19 @@ function buildSections(devices, layout, editing) {
     var g = layout.assign[d.id];
     return !!(g && (layout.groups || []).some(function (x) { return x.id === g; }));
   }
+  /* Sections are constructed in the v1.2.1 DEFAULT order —
+     Cameras → Pinned → Lighting → user groups → Ungrouped → Scenes —
+     then reordered by the user's stored sectionSeq (see
+     orderSections): a stored order wins outright, and sections
+     missing from it slot in by this default order. */
+  var cameras = normal.filter(function (d) { return !assignedToRealGroup(d) && d.isCamera; });
+  sections.push({ key: "cameras", orderKey: "cameras", title: "Cameras", kind: "cameras", groupId: null, devices: orderSectionItems(cameras, so["cameras"], layout) });
   var pinned = normal.filter(function (d) { return pinSet[d.id]; });
   if (pinned.length) sections.push({ key: "pinned", orderKey: "pinned", title: "Pinned", kind: "pinned", groupId: null, devices: orderSectionItems(pinned, so["pinned"], layout) });
   /* Built-in automatic sections: an explicit group assignment wins;
      unassigned lights land in Lighting, unassigned cameras in Cameras. */
   var lighting = normal.filter(function (d) { return !assignedToRealGroup(d) && isLightCapable(d); });
   sections.push({ key: "lighting", orderKey: "lighting", title: "Lighting", kind: "lighting", groupId: null, devices: orderSectionItems(lighting, so["lighting"], layout) });
-  var cameras = normal.filter(function (d) { return !assignedToRealGroup(d) && d.isCamera; });
-  sections.push({ key: "cameras", orderKey: "cameras", title: "Cameras", kind: "cameras", groupId: null, devices: orderSectionItems(cameras, so["cameras"], layout) });
   (layout.groups || []).forEach(function (g) {
     var devs = normal.filter(function (d) { return layout.assign[d.id] === g.id; });
     sections.push({ key: g.id, orderKey: "group:" + g.id, title: g.name, kind: "group", groupId: g.id, devices: orderSectionItems(devs, so["group:" + g.id], layout) });
@@ -1053,9 +1090,94 @@ function buildSections(devices, layout, editing) {
   });
   sections.push({ key: "ungrouped", orderKey: "ungrouped", title: "Ungrouped", kind: "ungrouped", groupId: null, devices: orderSectionItems(ungrouped, so["ungrouped"], layout) });
   if (scenes.length) sections.push({ key: "scenes", orderKey: "scenes", title: "Scenes", kind: "scenes", groupId: null, devices: orderSectionItems(scenes, so["scenes"], layout) });
-  return sections.filter(function (s) {
+  var kept = sections.filter(function (s) {
     return s.devices.length > 0 || (editing && (s.kind === "group" || s.kind === "lighting" || s.kind === "cameras"));
   });
+  return orderSections(kept, layout.sectionSeq || []);
+}
+
+/* ---------------- Section ordering (v1.2.1) ----------------
+   layout.sectionSeq is the user's stored order of section keys
+   (built-ins as-is, user groups as "group:<id>"). effectiveSectionSeq
+   merges it with the rendered sections exactly like the Windows
+   edition: stored keys for sections that exist come first in stored
+   order; any rendered section missing from the stored list is
+   inserted after the nearest already-placed section that precedes
+   it in the DEFAULT order (Cameras → Pinned → Lighting → groups →
+   Ungrouped → Scenes), or at the front when it has none. */
+
+/* Default order rank: built-ins by fixed slot; groups share a slot
+   (stable sort keeps their relative order by group list order). */
+function sectionDefaultRank(orderKey) {
+  if (orderKey === "cameras") return 0;
+  if (orderKey === "pinned") return 1;
+  if (orderKey === "lighting") return 2;
+  if (orderKey.indexOf("group:") === 0) return 3;
+  if (orderKey === "ungrouped") return 4;
+  if (orderKey === "scenes") return 5;
+  return 6;
+}
+
+function effectiveSectionSeq(orderKeys, storedSeq) {
+  var present = {};
+  orderKeys.forEach(function (k) { present[k] = true; });
+  var seen = {}, eff = [];
+  (storedSeq || []).forEach(function (k) {
+    if (present[k] && !seen[k]) { seen[k] = true; eff.push(k); }
+  });
+  // Default order of the rendered list: stable sort by rank.
+  var defSeq = orderKeys.map(function (k, i) { return [k, i]; })
+    .sort(function (a, b) { return sectionDefaultRank(a[0]) - sectionDefaultRank(b[0]) || a[1] - b[1]; })
+    .map(function (p) { return p[0]; });
+  defSeq.forEach(function (k) {
+    if (eff.indexOf(k) !== -1) return;
+    var di = defSeq.indexOf(k), insertAt = 0;
+    for (var j = di - 1; j >= 0; j--) {
+      var p = eff.indexOf(defSeq[j]);
+      if (p !== -1) { insertAt = p + 1; break; }
+    }
+    eff.splice(insertAt, 0, k);
+  });
+  return eff;
+}
+
+function orderSections(sections, storedSeq) {
+  var eff = effectiveSectionSeq(sections.map(function (s) { return s.orderKey; }), storedSeq);
+  return sections.slice().sort(function (a, b) {
+    return eff.indexOf(a.orderKey) - eff.indexOf(b.orderKey);
+  });
+}
+
+/* The stored sequence after moving `orderKey` one step (dir −1/+1)
+   within the RENDERED order; keys for sections that aren't rendered
+   right now ride along at the end so they're never forgotten. */
+function movedSectionSeq(storedSeq, sections, orderKey, dir) {
+  var eff = effectiveSectionSeq(sections.map(function (s) { return s.orderKey; }), storedSeq);
+  var i = eff.indexOf(orderKey);
+  if (i === -1) return eff;
+  var j = i + dir;
+  if (j < 0 || j >= eff.length) return eff.concat(storedOnlyKeys(storedSeq, eff));
+  var t = eff[i]; eff[i] = eff[j]; eff[j] = t;
+  return eff.concat(storedOnlyKeys(storedSeq, eff));
+}
+function storedOnlyKeys(storedSeq, eff) {
+  var inEff = {};
+  eff.forEach(function (k) { inEff[k] = true; });
+  var out = [], seen = {};
+  (storedSeq || []).forEach(function (k) {
+    if (!inEff[k] && !seen[k]) { seen[k] = true; out.push(k); }
+  });
+  return out;
+}
+
+/* Move a section one step and persist the new order. Uses the full
+   (unfiltered) section list so hidden-by-search sections keep their
+   relative places. */
+function moveSection(orderKey, dir) {
+  var sections = buildSections(allItems(), S.layout, true);
+  S.layout.sectionSeq = movedSectionSeq(S.layout.sectionSeq || [], sections, orderKey, dir);
+  saveLayout();
+  renderAll();
 }
 
 /* ---------------- Group controls (broadcast, not binding) --------------
@@ -1211,7 +1333,11 @@ var SLC_API = {
   groupAverage: groupAverage, groupPlan: groupPlan,
   APP_VERSION: APP_VERSION, parseVersionParts: parseVersionParts,
   isNewerVersion: isNewerVersion, pickReleaseAssets: pickReleaseAssets,
-  filterDevices: filterDevices
+  filterDevices: filterDevices,
+  newCameraId: newCameraId, repairCameraIds: repairCameraIds,
+  camSizeOf: camSizeOf, effectiveSectionSeq: effectiveSectionSeq,
+  orderSections: orderSections, movedSectionSeq: movedSectionSeq,
+  sectionDefaultRank: sectionDefaultRank, defaultLayout: defaultLayout
 };
 if (typeof module !== "undefined" && module.exports) module.exports = SLC_API;
 
@@ -1242,7 +1368,7 @@ function defaultPrefs() {
   };
 }
 function defaultLayout() {
-  return { groups: [], assign: {}, alias: {}, hidden: [], pins: [], sectionOrder: {}, collapsed: {} };
+  return { groups: [], assign: {}, alias: {}, hidden: [], pins: [], sectionOrder: {}, collapsed: {}, sectionSeq: [], camSizes: {} };
 }
 /* Normalise a stored layout (pure). Migrates the old Favorites list into
    Pins; the old global device order is retired — name order is the default
@@ -1256,6 +1382,13 @@ function migrateLayout(raw) {
   if (!L.sectionOrder || typeof L.sectionOrder !== "object" || Array.isArray(L.sectionOrder)) L.sectionOrder = {};
   if (!Array.isArray(L.groups)) L.groups = [];
   if (!Array.isArray(L.hidden)) L.hidden = [];
+  /* v1.2.1: stored section order + per-camera card sizes. */
+  if (!Array.isArray(L.sectionSeq)) L.sectionSeq = [];
+  L.sectionSeq = L.sectionSeq.filter(function (k) { return typeof k === "string" && k; });
+  if (!L.camSizes || typeof L.camSizes !== "object" || Array.isArray(L.camSizes)) L.camSizes = {};
+  Object.keys(L.camSizes).forEach(function (k) {
+    if (L.camSizes[k] !== "large" && L.camSizes[k] !== "wide") delete L.camSizes[k];
+  });
   delete L.favs;
   delete L.order;
   return L;
@@ -1264,8 +1397,42 @@ function loadPrefs() { S.prefs = Object.assign(defaultPrefs(), slcGet("prefs", {
 function savePrefs() { slcSet("prefs", S.prefs); }
 function loadLayout() { S.layout = migrateLayout(slcGet("layout", {})); }
 function saveLayout() { slcSet("layout", S.layout); }
-function loadCameras() { S.cameras = slcGet("cameras", []); if (!Array.isArray(S.cameras)) S.cameras = []; }
+function loadCameras() {
+  S.cameras = slcGet("cameras", []);
+  if (!Array.isArray(S.cameras)) S.cameras = [];
+  /* v1.2.1: repair any duplicated/blank camera ids left by older
+     builds (bare millisecond timestamps could collide) — see
+     repairCameraIds; persist the repair so it happens once. */
+  if (repairCameraIds(S.cameras)) saveCameras();
+}
 function saveCameras() { slcSet("cameras", S.cameras); }
+/* Camera ids (v1.2.1): unique generated ids — time (base36) + a
+   per-page counter + a random suffix — so two cameras created in
+   the same millisecond, or with identical names, never share one.
+   repairCameraIds is pure over the records array: the FIRST camera
+   with a given id keeps it (its layout entries — pins/assign/order,
+   keyed by the camera id itself — stay attached to it) and later
+   duplicates or blank ids get fresh ids. Returns whether anything
+   changed. Same semantics as the Windows edition. */
+var camIdCounter = 0;
+function newCameraId() {
+  camIdCounter += 1;
+  return "cam:" + Date.now().toString(36) + "-" + camIdCounter.toString(36) + "-" + Math.floor(Math.random() * 16777215).toString(36);
+}
+function repairCameraIds(cameras) {
+  var seen = {}, changed = false;
+  (cameras || []).forEach(function (c) {
+    if (!c.id || seen[c.id]) { c.id = newCameraId(); changed = true; }
+    seen[c.id] = true;
+  });
+  return changed;
+}
+/* Per-camera card size (v1.2.1), stored in layout.camSizes keyed by
+   camera id: "large" | "wide"; absent = Normal. */
+function camSizeOf(layout, id) {
+  var v = layout && layout.camSizes ? layout.camSizes[id] : null;
+  return (v === "large" || v === "wide") ? v : "normal";
+}
 function proxyCfg() { return { preset: S.prefs.proxyPreset, custom: S.prefs.proxyCustom }; }
 
 function $(id) { return document.getElementById(id); }
@@ -1390,6 +1557,14 @@ function syncLayoutWithDevices() {
   Object.keys(S.layout.sectionOrder).forEach(function (k) {
     S.layout.sectionOrder[k] = S.layout.sectionOrder[k].filter(keep);
     if (!S.layout.sectionOrder[k].length) delete S.layout.sectionOrder[k];
+  });
+  /* v1.2.1: prune camera sizes for gone cameras, and stored section
+     keys for groups that no longer exist (built-in keys always stay). */
+  Object.keys(S.layout.camSizes || {}).forEach(function (id) { if (!keep(id)) delete S.layout.camSizes[id]; });
+  var groupIds = {};
+  (S.layout.groups || []).forEach(function (g) { groupIds[g.id] = true; });
+  S.layout.sectionSeq = (S.layout.sectionSeq || []).filter(function (k) {
+    return k.indexOf("group:") !== 0 || groupIds[k.slice(6)];
   });
   saveLayout();
 }
@@ -1633,10 +1808,10 @@ function renderAll() {
     dash.appendChild(el("div", "empty-note", "No devices to show. Press ↻ Refresh, or unhide devices in Settings."));
     return;
   }
-  sections.forEach(function (sec) { dash.appendChild(renderSection(sec)); });
+  sections.forEach(function (sec, i) { dash.appendChild(renderSection(sec, i, sections.length)); });
 }
 
-function renderSection(sec) {
+function renderSection(sec, idx, total) {
   var wrap = el("div", "section");
   wrap.dataset.sectionKey = sec.key;
   var head = el("div", "section-head" + (S.layout.collapsed[sec.key] ? " collapsed" : ""));
@@ -1644,6 +1819,17 @@ function renderSection(sec) {
   head.appendChild(el("h2", null, sec.title));
   head.appendChild(el("span", "count", String(sec.devices.length)));
   head.appendChild(el("span", "spacer"));
+  if (isEditing()) {
+    var mvUp = el("button", "btn small", "↑");
+    mvUp.title = "Move section up";
+    mvUp.disabled = (idx === 0);
+    mvUp.addEventListener("click", function (ev) { ev.stopPropagation(); moveSection(sec.orderKey, -1); });
+    var mvDn = el("button", "btn small", "↓");
+    mvDn.title = "Move section down";
+    mvDn.disabled = (idx === total - 1);
+    mvDn.addEventListener("click", function (ev) { ev.stopPropagation(); moveSection(sec.orderKey, 1); });
+    head.appendChild(mvUp); head.appendChild(mvDn);
+  }
   if (isEditing() && (S.layout.sectionOrder[sec.orderKey] || []).length) {
     var rst = el("button", "btn small", "↺ Reset to name order");
     rst.addEventListener("click", function (ev) { ev.stopPropagation(); resetSectionOrder(sec); });
@@ -1785,7 +1971,14 @@ function bindSlider(s, fmt, onCommit) {
 }
 
 function renderCard(d, sec) {
-  var card = el("div", "card" + (d.state && d.online ? " on" : "") + (!d.online ? " offline" : ""));
+  /* v1.2.1: camera card size class (span in the CSS grid). */
+  var sizeCls = "";
+  if (d.isCamera) {
+    var sz = camSizeOf(S.layout, d.id);
+    if (sz === "large") sizeCls = " cam-large";
+    else if (sz === "wide") sizeCls = " cam-wide";
+  }
+  var card = el("div", "card" + (d.state && d.online ? " on" : "") + (!d.online ? " offline" : "") + sizeCls);
   card.dataset.devid = d.id;
   if (isEditing()) {
     card.draggable = true;
@@ -2055,6 +2248,22 @@ function cameraEditTools(d, sec) {
   down.addEventListener("click", function () { moveWithinSection(d.id, sec, 1); });
   r3.appendChild(up); r3.appendChild(down);
   box.appendChild(r3);
+  /* v1.2.1: card size — Normal (1 cell) / Large (2 columns) /
+     Wide (full row), persisted per camera in layout.camSizes. */
+  var r4 = el("div", "row");
+  r4.appendChild(el("span", "drag-handle", "Size"));
+  var sizeSel = el("select");
+  [["normal", "Normal"], ["large", "Large"], ["wide", "Wide"]].forEach(function (pair) {
+    var o = el("option", null, pair[1]); o.value = pair[0]; sizeSel.appendChild(o);
+  });
+  sizeSel.value = camSizeOf(S.layout, d.id);
+  sizeSel.addEventListener("change", function () {
+    if (sizeSel.value === "normal") delete S.layout.camSizes[d.id];
+    else S.layout.camSizes[d.id] = sizeSel.value;
+    saveLayout(); renderAll();
+  });
+  r4.appendChild(sizeSel);
+  box.appendChild(r4);
   return box;
 }
 
@@ -2064,6 +2273,7 @@ function deleteCamera(id) {
   S.layout.hidden = S.layout.hidden.filter(function (x) { return x !== id; });
   delete S.layout.assign[id];
   delete S.layout.alias[id];
+  delete S.layout.camSizes[id];
   Object.keys(S.layout.sectionOrder).forEach(function (k) {
     S.layout.sectionOrder[k] = S.layout.sectionOrder[k].filter(function (x) { return x !== id; });
     if (!S.layout.sectionOrder[k].length) delete S.layout.sectionOrder[k];
@@ -2234,7 +2444,7 @@ function openCameraDialog(existing) {
         return;
       }
       var rec = {
-        id: cam ? cam.id : ("cam:" + Date.now().toString(36)),
+        id: cam ? cam.id : newCameraId(),
         name: name,
         user: userI.value.trim(),
         pass: obfuscate(passI.value),
@@ -2245,7 +2455,15 @@ function openCameraDialog(existing) {
       };
       if (cam) {
         var i = S.cameras.indexOf(cam);
-        if (i >= 0) S.cameras[i] = rec; else S.cameras.push(rec);
+        if (i < 0) i = S.cameras.findIndex(function (c) { return c.id === cam.id; });
+        if (i < 0) {
+          /* v1.2.1: never silently duplicate an edit target that
+             vanished — say so and keep the dialog open. */
+          err.textContent = "That camera no longer exists — close this dialog and try again.";
+          err.classList.remove("hidden");
+          return;
+        }
+        S.cameras[i] = rec;
       } else {
         S.cameras.push(rec);
       }
