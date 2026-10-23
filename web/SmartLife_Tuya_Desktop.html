@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.2.1">
+<meta name="version" content="1.2.2">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -465,7 +465,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.2.1</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.2.2</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -807,6 +807,22 @@ function buildControlBody(accessToken, devId, action, value) {
 }
 
 /* ---------------- Device model parsing (pure) ---------------- */
+/* A fresh payload value only counts as a READING when it is
+   present and — for the ranged light fields — not the 0
+   placeholder some Tuya payloads ship while the real value is
+   still unknown (v1.2.2: the vanishing brightness slider and the
+   all-lights-at-2700K snap came from treating placeholders as
+   readings). Capability flags stay presence-based: a light HAS
+   a brightness slider because the field exists, whatever the
+   current value is. */
+function freshValueCounts(key, v) {
+  if (v === null || v === undefined) return false;
+  if (key === "brightness" || key === "color_temp") {
+    var n = Number(v);
+    return isFinite(n) && n > 0;
+  }
+  return true;
+}
 function parseDevice(raw) {
   raw = raw || {};
   var data = raw.data || {};
@@ -836,8 +852,8 @@ function parseDevice(raw) {
     hasBrightness: hasBrightness,
     hasTemp: hasTemp,
     hasColor: hasColor,
-    brightnessPct: hasBrightness ? brightnessToPct(data.brightness) : null,
-    tempSlider: hasTemp ? tempReportedToSlider(data.color_temp) : null,
+    brightnessPct: (hasBrightness && freshValueCounts("brightness", data.brightness)) ? brightnessToPct(data.brightness) : null,
+    tempSlider: (hasTemp && freshValueCounts("color_temp", data.color_temp)) ? tempReportedToSlider(data.color_temp) : null,
     hue: ("hue" in data) ? data.hue : null,
     saturation: ("saturation" in data) ? normSaturation(data.saturation) : null,
     colorMode: data.color_mode || null,
@@ -863,8 +879,12 @@ function parseDiscovery(json) {
   var code = json.header && json.header.code;
   return { ok: false, error: code ? ("API error: " + code) : "Unexpected response" };
 }
-/* Keep previously-known data fields when a fresh discovery omits them
-   (same merge the reference dashboard performs). */
+/* Keep previously-known data fields when a fresh discovery omits
+   them — or reports them as a placeholder (JSON null, brightness /
+   colour temp 0): either way the fresh value is not a reading, so
+   the last-known value stands (v1.2.2; previously ANY present key
+   counted, placeholders included, and one thin payload wiped the
+   known state and the sliders rendered from it). */
 function mergeDeviceData(fresh, previous) {
   if (!previous) return fresh;
   var prevById = {};
@@ -874,7 +894,9 @@ function mergeDeviceData(fresh, previous) {
     if (!p || !p.data || !d.data) return d;
     var merged = Object.assign({}, d);
     merged.data = Object.assign({}, d.data);
-    Object.keys(p.data).forEach(function (k) { if (!(k in merged.data)) merged.data[k] = p.data[k]; });
+    Object.keys(p.data).forEach(function (k) {
+      if (!(k in merged.data) || !freshValueCounts(k, merged.data[k])) merged.data[k] = p.data[k];
+    });
     return merged;
   });
 }
@@ -891,7 +913,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.2.1";
+var APP_VERSION = "1.2.2";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1889,19 +1911,23 @@ function renderGroupControls(sec) {
   sw.addEventListener("click", function () { runGroupAction(sec, "toggle"); });
   master.appendChild(sw);
   box.appendChild(master);
-  // brightness — average of capable members, broadcast on release
-  var bMembers = devs.filter(function (d) { return d.hasBrightness && d.brightnessPct !== null; });
+  // brightness — shown when any member is CAPABLE (v1.2.2: never
+  // gated on current values); the value averages members that have
+  // a reading, falling back to a neutral 100%
+  var bMembers = devs.filter(function (d) { return d.hasBrightness; });
   if (bMembers.length) {
-    var avgB = groupAverage(bMembers, function (d) { return d.brightnessPct; });
+    var bVals = bMembers.filter(function (d) { return d.brightnessPct !== null && d.brightnessPct > 0; });
+    var avgB = bVals.length ? groupAverage(bVals, function (d) { return d.brightnessPct; }) : 100;
     var bs = sliderRow("Brightness", 11, 100, Math.max(11, Math.round(avgB)), function (v) { return Math.round(v) + "%"; });
     bs.wrap.classList.add("gc-slider");
     bindSlider(bs, function (v) { return Math.round(v) + "%"; }, function (v) { runGroupAction(sec, "brightness", v); });
     box.appendChild(bs.wrap);
   }
-  // colour temperature — same pattern
-  var tMembers = devs.filter(function (d) { return d.hasTemp && d.tempSlider !== null; });
+  // colour temperature — same pattern (neutral 5500 ≈ 4600K)
+  var tMembers = devs.filter(function (d) { return d.hasTemp; });
   if (tMembers.length) {
-    var avgT = groupAverage(tMembers, function (d) { return d.tempSlider; });
+    var tVals = tMembers.filter(function (d) { return d.tempSlider !== null; });
+    var avgT = tVals.length ? groupAverage(tVals, function (d) { return d.tempSlider; }) : 5500;
     var ts = sliderRow("Colour temperature", 1000, 10000, Math.round(avgT / 50) * 50, function (v) { return tempSliderToKelvin(v) + "K"; });
     ts.input.step = 50;
     ts.wrap.classList.add("gc-slider");
@@ -2044,14 +2070,20 @@ function renderCard(d, sec) {
   card.appendChild(top);
 
   if (d.online && !d.isScene) {
-    if (d.hasBrightness && d.brightnessPct !== null) {
-      var bs = sliderRow("Brightness", 11, 100, Math.max(11, d.brightnessPct), function (v) { return Math.round(v) + "%"; });
+    if (d.hasBrightness) {
+      // Capability-gated (v1.2.2): a missing/placeholder reading
+      // renders at a neutral 100%, never removes the control.
+      var bVal = (d.brightnessPct !== null && d.brightnessPct > 0) ? d.brightnessPct : 100;
+      var bs = sliderRow("Brightness", 11, 100, Math.max(11, bVal), function (v) { return Math.round(v) + "%"; });
       if (!d.online) bs.input.disabled = true;
       bindSlider(bs, function (v) { return Math.round(v) + "%"; }, function (v) { doBrightness(d, v); });
       card.appendChild(bs.wrap);
     }
-    if (d.hasTemp && d.tempSlider !== null) {
-      var ts = sliderRow("Colour temperature", 1000, 10000, d.tempSlider, function (v) { return tempSliderToKelvin(v) + "K"; });
+    if (d.hasTemp) {
+      // Neutral slider 5500 ≈ 4600K when no reading is known —
+      // never the 2700K floor a placeholder used to snap to.
+      var tVal = (d.tempSlider !== null) ? d.tempSlider : 5500;
+      var ts = sliderRow("Colour temperature", 1000, 10000, tVal, function (v) { return tempSliderToKelvin(v) + "K"; });
       ts.input.step = 50;
       bindSlider(ts, function (v) { return tempSliderToKelvin(v) + "K"; }, function (v) { doTemp(d, v); });
       card.appendChild(ts.wrap);
