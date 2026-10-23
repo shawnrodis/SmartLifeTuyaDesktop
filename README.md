@@ -21,7 +21,7 @@ customisable interface they always deserved.
 
 ## Download (Windows)
 
-Grab `SmartLifeTuyaDesktop-Setup-v1.2.0.exe` from
+Grab `SmartLifeTuyaDesktop-Setup-v1.2.1.exe` from
 [Releases](https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases) and
 run it — per-user install to `%LOCALAPPDATA%\SmartLifeTuyaDesktop`, with
 Start Menu shortcuts and an uninstaller. No administrator rights required.
@@ -44,7 +44,10 @@ instructions below.)
   Edit mode you can drag cards to reorder them inside a section (or use
   ↑/↓; that order sticks, and each section has a "Reset to name order"
   button), create groups, rename devices with an alias, and hide devices
-  you never use.
+  you never use. Sections appear **Cameras → Pinned → Lighting → your
+  groups → Ungrouped → Scenes** by default, and in Edit mode every
+  section header has ↑/↓ buttons to move the section itself — your
+  arrangement is remembered.
 - **Automatic Lighting & Cameras sections** — unassigned bulbs and
   strips gather in a built-in **Lighting** section, and RTSP cameras in
   a built-in **Cameras** section; assigning anything to your own group
@@ -55,14 +58,24 @@ instructions below.)
 - **RTSP cameras with live in-tile video** — add Tapo (or any RTSP)
   cameras in Edit mode; cards sit alongside devices with pinning,
   grouping and ordering, and the picture plays right inside the tile.
-  ▶ Watch opens a big player. See [Camera video](#camera-video).
+  ▶ Watch opens a big player. Camera cards are resizable in Edit mode —
+  **Normal** (one cell), **Large** (two columns) or **Wide** (the full
+  row) — and the Windows tile's stream resolution follows the size.
+  See [Camera video](#camera-video).
 - **No rate-limit nagging** — when Tuya rate-limits, the apps never show
   a warning: they quietly keep the last known states, retry commands a
   moment later, and stretch the refresh interval until things settle.
   Genuine errors (a device that's actually offline) are still reported.
 - **Pinned shortcuts** — pin any device with 📌 and a full working copy
-  appears in the Pinned section at the top; the device also stays in its
+  appears in the Pinned section; the device also stays in its
   group below. Scenes always get their own Scenes section.
+- **Start with Windows & system tray (Windows app)** — Settings →
+  Startup & background can launch the app with Windows (per-user, no
+  admin) as a normal window, minimized to the tray, or maximized, and
+  can keep it running in the system tray when the window is closed —
+  left-click the tray icon to reopen it, right-click → Quit to exit.
+  (Windows-only: the web edition's Settings says which features are
+  Windows-app-only and links here.)
 - **Make it yours** — Dark / Light / **Black** (true-black) themes, 7
   accent colours, comfortable / compact card density, search box.
   Everything is remembered locally.
@@ -74,6 +87,31 @@ instructions below.)
   over HTTPS. "Keep me logged in" stores them only on your device
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
+
+## What's new in 1.2.1
+
+- **Fixed: camera Edit/Delete buttons that didn't respond in Edit mode**
+  (Windows app). A press on a card immediately started a drag, which
+  hid the card mid-click — so the release never landed on its buttons.
+  Drags now start only after ~8px of pointer travel, and clicks always
+  land. Camera ids are also unique-generated now (they were bare
+  timestamps) with automatic repair of any duplicates from older
+  versions, and edit/delete report honestly instead of failing
+  silently.
+- **Resizable camera cards** — Normal / Large / Wide per camera (Edit
+  mode), in both editions; the Windows tile stream resolution follows
+  the size.
+- **Sections can be reordered** — ↑/↓ on every section header in Edit
+  mode, persisted; and the default order is now **Cameras first**:
+  Cameras → Pinned → Lighting → groups → Ungrouped → Scenes.
+- **Startup & tray (Windows app)** — Start-with-Windows with a
+  Normal / Minimized / Maximized launch choice, and an optional
+  keep-running-in-the-tray mode with a tray icon (Open / Quit).
+- **Painted play/pause icon** on camera tiles (the ⏸ glyph rendered
+  as a blob through the fallback font) — now two drawn bars / a
+  triangle in a tidy chip.
+- **Web edition note** — Settings (and Help) now say plainly which
+  features are Windows-app-only, with a "Get the Windows app" link.
 
 ## Camera video
 

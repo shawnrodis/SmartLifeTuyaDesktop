@@ -72,9 +72,15 @@ column max width: 760px.
 
 - Header order: brand · "Updated …" · search · Autorefresh · interval ·
   Refresh · Edit · Settings · Log out.
-- Sections, in order: **Pinned** (only if any pins) → **Lighting** →
-  **Cameras** → user groups (in creation order) → **Ungrouped** →
-  **Scenes** (only if any scenes).
+- Sections, in DEFAULT order (v1.2.1): **Cameras** → **Pinned** (only
+  if any pins) → **Lighting** → user groups (in creation order) →
+  **Ungrouped** → **Scenes** (only if any scenes). Every section —
+  built-ins included — can be moved in Edit mode (↑/↓ on the section
+  header); the arrangement is stored as an ordered list of section
+  keys (`sectionSeq`: built-ins as-is, groups as `group:<id>`). A
+  stored order wins outright; sections missing from it (a new group,
+  a newly-appearing built-in) slot in by the default order around the
+  stored ones.
 - **Automatic sections.** Lighting and Cameras are built-in (not
   renamable/deletable). An explicit group assignment always wins; an
   unassigned light-capable device (brightness / colour-temp / colour)
@@ -89,7 +95,11 @@ column max width: 760px.
 - **Reordering:** in Edit mode, cards are dragged by their body within a
   section (ghost follows the pointer, an insertion gap shows the drop
   point; dropping on another section moves the card there). ↑/↓ buttons
-  remain as a secondary method. Both editions behave the same.
+  remain as a secondary method. Both editions behave the same. In the
+  Windows edition a press becomes a drag only after ~8px of pointer
+  travel (a "pending drag"), so ordinary clicks on card controls —
+  Edit/Delete included — always land; the web's HTML5 drag has the
+  same click-safe behaviour natively.
 - **Grid:** uniform columns (`minmax(238px, 1fr)`, gap 14; compact
   198/10) and every card stretches to its row's tallest height. The web
   gets this from CSS grid; egui renders explicit rows — each row's
@@ -98,6 +108,16 @@ column max width: 760px.
   fills the cell, content top-aligned. Card headers reserve a fixed
   trailing width for pin/toggle/hide so names truncate with an ellipsis
   and never overlap the controls.
+- **Camera card sizes (v1.2.1).** A per-camera size (stored in the
+  layout, keyed by camera id): **Normal** = one grid cell, **Large** =
+  2 columns, **Wide** = the full row; everything else is not
+  resizable. Set from the card's Edit-mode tools in both editions. Web:
+  CSS `grid-column` span classes (guarded to multi-column widths).
+  Windows: the row packer places spans greedily; a row's height
+  follows the tallest card it holds, and a spanning camera's video
+  area grows with its width (16:9). The Windows tile pump follows the
+  size: Normal decodes the SD tile stream at 480×270, Large the same
+  SD source at 960×540, Wide the card's selected quality at 960×540.
 - **Group controls.** The Lighting header — and any user-group header
   whose members include a light — shows a controls strip under the
   title: master toggle, brightness and colour-temperature sliders, and
@@ -125,7 +145,10 @@ column max width: 760px.
   MJPEG `<img>`, MediaMTX HLS `<video>`); without a gateway its tiles
   keep the plain header and Watch hands off as before. Windows Watch
   routing: gateway configured → gateway page in the browser; else the
-  in-app player; else (no ffmpeg found) the external player.
+  in-app player; else (no ffmpeg found) the external player. The
+  tile's pause/play overlay is a PAINTED icon — two rounded bars or a
+  triangle inside a small (~28px) translucent rounded chip — never a
+  font glyph (the ⏸ symbol-font rendering was a chunky blob).
 - **Rate limiting (v1.2.0).** Rate-limit responses
   (`FrequentlyInvoke`) are NEVER shown to the user — no toast, banner
   or status line, in either edition. Discovery falls back to the
@@ -145,6 +168,31 @@ column max width: 760px.
   collapsed Connection/proxy section, credentials fine print).
 - Settings panels, in order: Appearance · App updates · Connection ·
   Stream gateway & cameras · Saved login · Hidden devices · Help.
+  The Windows edition inserts **Startup & background** after App
+  updates (below); the web edition shows a quiet "Web edition" info
+  card above App updates (and a matching Help entry) noting that some
+  features are Windows-app-only, with a "Get the Windows app" link.
+- **Startup & tray (v1.2.1) — Windows only, a stated platform
+  difference** (the web edition has no equivalent; its Settings note
+  above says so). "Start with Windows" is an ON/OFF toggle (default
+  OFF = no autostart entry at all) writing the per-user Run key
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value
+  `SmartLifeTuyaDesktop` = the quoted current-exe path; on load the
+  toggle reflects the actual registry state (self-healing: an
+  existing entry wins and is rewritten canonically). When ON, "Launch
+  as" picks exactly one: **Normal window** (no flag), **Minimized
+  (to tray)** (`--minimized`), or **Maximized** (`--maximized`);
+  both flags also work for manual launches. "Keep running in the
+  system tray when the window is closed" is an independent toggle
+  (default OFF): with it ON, closing the window hides it instead of
+  quitting (refresh and camera pumps keep running), and the first
+  hide shows a one-time tray balloon explaining the app is still
+  running. The tray icon exists for a session whenever the app
+  started minimized or close-to-tray is on (including switched on at
+  runtime) and stays until Quit: left-click/double-click restores
+  the window; the right-click menu offers Open and Quit (Quit stops
+  the pumps, saves and truly exits, as does the updater's installer
+  hand-off). Logging out does not quit the app.
 - **Auto-update.** Both editions share one version number and check
   `api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest`
   on launch, at most once per 24h (attempt-based, stored locally:
