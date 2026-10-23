@@ -88,6 +88,43 @@ instructions below.)
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.2.3
+
+- **Fixed: the Lighting header's controls tangling (Windows app).**
+  The Brightness and Colour temperature label/slider pairs in a
+  section header no longer interleave or staircase, and the colour
+  swatches stay on their own line: each control group is now one
+  solid mini-panel, and whole groups wrap to the next line on
+  narrow windows — never their insides. (The web header already
+  laid its groups out this way.)
+- **Fixed: device names still truncating to "De…" / "Kit…"
+  (Windows app).** At the card widths the grid actually produces,
+  the pin + toggle + hide buttons simply leave too little room
+  for a full name on the same line — so on narrow cards they now
+  move to their own line under the name (the hide button does the
+  same on scene cards), and names like "Kitchen Light 1" render
+  in full at every window size. Proven by a new render test that
+  reads back the text the app actually draws, including after a
+  minimized (tiny-window) start followed by a resize. The web
+  edition's headers wrap the same way.
+- **Fixed: tray Open never working and Quit only working while
+  the window was open (Windows app).** Tray clicks were only
+  being read when the app drew a frame — and a hidden window
+  draws none, so the clicks sat unread forever. A dedicated tray
+  thread now receives them: Open restores the window directly
+  (even from the tray, even minimized), and Quit runs the real
+  exit — drop the icon, stop camera streams, save, close. A
+  second launch while hidden also brings the window back
+  reliably now.
+- **Fixed: RGB strip cards had no brightness slider (both
+  editions).** A colour-only strip can dim — it just does it
+  through its colour command — so it (and the Lighting header)
+  now gets a brightness slider that rides the colour's
+  brightness. Colour temperature stays hidden for strips: they
+  genuinely can't do it.
+- **Brightness now goes down to 1% (both editions).** The slider
+  floor was 11%; cards and group controls now reach 1%.
+
 ## What's new in 1.2.2
 
 - **Fixed: system tray (Windows app).** Launching the app while it was

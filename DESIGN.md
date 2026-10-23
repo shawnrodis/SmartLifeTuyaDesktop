@@ -115,6 +115,24 @@ column max width: 760px.
   ordinary-width cards. The budget is a pure function of the cell's
   real remaining width, so wider cells widen names 1:1. The web
   edition needs no equivalent: CSS ellipsis at true overflow.)
+  **Two-row headers (v1.2.3).** The reserves were never the whole
+  problem: at the card widths the column formula actually
+  produces (238–262px at ordinary windows/DPI), the total fixed
+  overhead — card padding + icon + controls — leaves ~52–76px
+  for the name while real names need ~80–106px, so NO single-row
+  budget fits them. When the single-row budget falls below 112px
+  (scenes: 144px), the header goes two-row: pin + toggle (a
+  scene's lone hide ✕; a camera's pin) move to their own
+  right-aligned row under the name, and the name reserves only
+  the hide button (14px). The decision is a pure function of the
+  measured remainder, so it is already encoded in the row-height
+  cache's content signature via the card width. A headless
+  render gate in the test suite drives the real dashboard and
+  asserts the drawn (post-elision) text — names whole at
+  1150–1920px widths, in Edit mode, and after a tiny-start
+  resize. The web edition mirrors the shape in CSS: `.card-top`
+  wraps and pin + switch travel as one `.head-controls` group
+  that wraps right-aligned under the name.
 - **Camera card sizes (v1.2.1).** A per-camera size (stored in the
   layout, keyed by camera id): **Normal** = one grid cell, **Large** =
   2 columns, **Wide** = the full row; everything else is not
@@ -137,7 +155,16 @@ column max width: 760px.
   apart, member states update optimistically, failures are summarised
   in one toast ("…: 4 of 5 updated — X didn't respond") and a refresh
   reconciles. Pinned, Ungrouped, Cameras and Scenes get no group
-  controls.
+  controls. **Strip layout (v1.2.3):** each control group is one
+  unbreakable mini-panel of uniform height (44px) — All toggle
+  (84px), each slider group (240px, label+value over its slider),
+  swatches + 🎨 (352px, one row) — and the strip flows whole
+  groups left→right, wrapping whole groups only; the custom-colour
+  picker opens BELOW the strip. (v1.2.2 allocated the slider
+  groups at height 0 inside a wrapped row, which let egui's
+  placer staircase and interleave the label/slider pairs. The
+  web strip was already atomic — its groups are single flex
+  items — so only its structure was verified, not changed.)
 - **Camera video (v1.2.0) — a stated platform difference.** Both
   editions show live video inside camera tiles (16:9 area replacing
   the icon header; name/host/quality row and Watch/Copy stay below),
@@ -256,6 +283,31 @@ column max width: 760px.
   phantom icon remains. v1.2.1 had none of this: each Start Menu
   launch while hidden spawned another process + icon, and the
   hidden original's tray events sat unread.
+- **Tray event thread (v1.2.3) — Windows.** The v1.2.2 frame-drain
+  model above still failed in the field ("Quit only works when
+  the Window is open and open never works at all"): the heartbeat
+  itself depends on repaints, and winit's `request_redraw` on an
+  invisible Windows window never produces a redraw — so while
+  hidden, no frame ran and the channels were never drained (Quit
+  "worked" only because it was mostly clicked while visible).
+  v1.2.3 therefore takes the frame loop out of the critical
+  path: a dedicated thread owns BOTH receivers (muda's menu
+  channel and tray-icon's icon channel — separate crossbeam
+  channels, verified against the vendored sources), maps events
+  through pure functions to actions on a shared queue, pokes the
+  stored egui context, AND acts directly in Win32 with the main
+  window's HWND (republished every frame): Show =
+  `ShowWindowAsync(SW_RESTORE)` + `SetForegroundWindow` (works
+  with zero frames); Quit = `ShowWindow(SW_SHOW)` purely to wake
+  the frame pipeline so the UI thread runs the real quit path
+  from the queue (a one-frame flash of the window on
+  Quit-from-tray is the accepted tradeoff). The UI thread drains
+  the queue per frame and applies the same unconditional
+  show/quit paths; no hidden-state flag gates any action. The
+  single-instance waiter routes through the same dispatch (its
+  flag + repaint poke had the same starvation). The 200 ms
+  hidden heartbeat remains as belt-and-braces. This is a
+  Windows-only platform behaviour; the web edition has no tray.
 - **Auto-update.** Both editions share one version number and check
   `api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest`
   on launch, at most once per 24h (attempt-based, stored locally:

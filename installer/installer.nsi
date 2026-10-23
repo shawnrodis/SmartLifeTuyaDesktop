@@ -4,7 +4,7 @@
 ; Add/Remove Programs entry.
 
 !define APP_NAME "SmartLife & Tuya Desktop"
-!define APP_VERSION "1.2.2"
+!define APP_VERSION "1.2.3"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/SmartLifeTuyaDesktop"
 
@@ -50,7 +50,7 @@ Section "SmartLife & Tuya Desktop" SecApp
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "URLInfoAbout" "${APP_URL}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "DisplayIcon" "$INSTDIR\SmartLifeTuyaDesktop.exe"
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "EstimatedSize" 104800
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "EstimatedSize" 104892
 
   ; Start Menu shortcuts (per-user).
   CreateDirectory "$SMPROGRAMS\SmartLife & Tuya Desktop"
