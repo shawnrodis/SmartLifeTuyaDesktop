@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="version" content="1.1.0">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -32,6 +33,18 @@
     --text:#17202e;
     --text-dim:#5d6879;
     --track:#dbe1ec;
+    --shadow:none;
+  }
+  [data-theme="black"]{
+    --bg:#000000;
+    --bg-grad:radial-gradient(1200px 600px at 80% -10%, rgba(99,102,241,.07), transparent 60%),
+               radial-gradient(900px 500px at -10% 110%, rgba(20,184,166,.05), transparent 55%);
+    --card:#0c0d11;
+    --card-border:#1f232e;
+    --text:#e7ebf2;
+    --text-dim:#8b94a7;
+    --text-faint:#5b6478;
+    --track:#22252e;
     --shadow:none;
   }
   *{box-sizing:border-box}
@@ -125,6 +138,26 @@
   .section-head.collapsed .chev{transform:rotate(-90deg)}
   .section-head .count{font-size:12px; color:var(--text-dim); background:var(--card); border:1px solid var(--card-border); padding:1px 8px; border-radius:20px}
   .section-head .spacer{flex:1}
+  /* Group controls strip (Lighting + user groups with lights): sits in
+     the header block under the title row, wraps on narrow screens. */
+  .group-controls{
+    display:flex; align-items:flex-start; gap:22px; flex-wrap:wrap;
+    margin:-4px 2px 14px; padding:12px 16px;
+    background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius);
+  }
+  .group-controls .gc-master{display:flex; align-items:center; gap:10px; padding-top:2px}
+  .group-controls .gc-master .gc-label{font-size:12.5px; font-weight:600; color:var(--text-dim)}
+  .group-controls .gc-slider{min-width:190px; flex:1 1 190px; max-width:300px}
+  .group-controls .ctl{margin-top:0}
+  .group-controls .swatches{margin-top:6px}
+  /* Update banner (dashboard, dismissible per version) */
+  #update-banner{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    width:min(1204px, calc(100% - 36px)); margin:16px auto 0; padding:12px 16px;
+    background:var(--accent-soft); border:1px solid var(--accent); border-radius:14px;
+    font-size:13.5px; font-weight:600;
+  }
+  #update-banner .spacer{flex:1}
   .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(238px,1fr)); gap:14px}
   body[data-density="compact"] .grid{grid-template-columns:repeat(auto-fill,minmax(198px,1fr)); gap:10px}
 
@@ -269,6 +302,7 @@
     font-size:13.5px; animation:toast-in .22s ease; max-width:88vw; text-align:center;
   }
   [data-theme="light"] .toast{background:#17202e; border-color:#17202e}
+  [data-theme="black"] .toast{background:#14161c; border-color:#262a35}
   .toast.err{background:#4c1120; border-color:#881337}
   @keyframes toast-in{from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none}}
   .spinner{
@@ -359,6 +393,12 @@
       <button class="btn small" id="btn-addcamera">＋ Add camera</button>
       <button class="btn small primary" id="btn-doneedit">Done</button>
     </div>
+    <div id="update-banner" class="hidden">
+      <span id="update-banner-text"></span>
+      <span class="spacer"></span>
+      <a class="btn small primary" id="update-banner-dl" href="#" download>Download the new version</a>
+      <button class="btn small" id="update-banner-dismiss">Dismiss</button>
+    </div>
     <main id="dash"></main>
   </div>
 
@@ -378,6 +418,7 @@
           <select id="set-theme">
             <option value="dark">Dark</option>
             <option value="light">Light</option>
+            <option value="black">Black</option>
           </select>
         </div>
         <div class="field">
@@ -391,6 +432,21 @@
             <option value="compact">Compact</option>
           </select>
         </div>
+      </div>
+
+      <div class="panel">
+        <h3>App updates</h3>
+        <p class="hint">You're running version <b id="upd-current">1.1.0</b>. This page checks
+        GitHub for updates at most once a day; you can also check now.</p>
+        <p class="hint" id="upd-status"></p>
+        <div>
+          <button class="btn" id="btn-check-update">Check for updates</button>
+          <a class="btn primary hidden" id="btn-download-update" href="#" download>Download the new version</a>
+        </div>
+        <p class="hint" style="margin-top:10px">A web page can't overwrite its own file: save the
+        downloaded HTML over your old copy and reload — your saved devices, groups and settings
+        stay in this browser. The online copy at <b>shawnrodis.github.io/SmartLifeTuyaDesktop</b>
+        is always the latest version.</p>
       </div>
 
       <div class="panel">
@@ -474,6 +530,15 @@
         Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top —
         the device also stays in its group below. Scenes always live in their own Scenes section.
         Everything is remembered in this browser.</p>
+        <p><b>Lighting &amp; group controls.</b> Lights organise themselves: any bulb or strip that
+        isn't assigned to one of your groups lives in the built-in <b>Lighting</b> section, and
+        cameras get their own built-in <b>Cameras</b> section the same way — assigning a device to
+        a group always wins over the automatic sections. The Lighting header (and the header of
+        any group containing a light) has group controls: a master switch (on if any member is
+        on; clicking turns the whole group on or off), brightness and colour-temperature sliders
+        showing the members' average, and colour swatches. Group controls <b>broadcast</b> — they
+        send the command to each member in turn, and changing a single light afterwards simply
+        overrides it for that light. Nothing about the group itself is stored.</p>
         <p><b>Cameras (RTSP).</b> Tapo cameras: in the Tapo app, open the camera → Settings →
         Advanced Settings → <b>Camera Account</b> and create a camera account, and make sure RTSP is
         enabled for the camera. The username and password you add here are that <b>camera account</b> —
@@ -482,7 +547,9 @@
         builds the stream address for you: <code>rtsp://user:pass@IP:554/stream1</code> (high quality)
         or <code>/stream2</code> (standard) — or pick “Custom path” for other RTSP cameras. Camera
         cards sit alongside your devices and can be pinned, grouped and reordered just like them;
-        their passwords are stored in this browser with the same light obfuscation as the saved login.</p>
+        unassigned cameras live in the built-in <b>Cameras</b> section until you assign them to a
+        group of your own. Their passwords are stored in this browser with the same light
+        obfuscation as the saved login.</p>
         <p><b>Watching a stream.</b> Web browsers can't play <code>rtsp://</code> directly. Without a
         gateway, ▶ Watch hands the stream address to a player app installed on your device (such as
         VLC) — or use <b>Copy URL</b> and paste the address into VLC's “Open Network Stream”. For
@@ -762,6 +829,46 @@ function mergeDeviceData(fresh, previous) {
    with the same scheme as the saved login. Browsers can't play rtsp://,
    so Watch either hands the URL to an external player or, when a stream
    gateway (go2rtc / MediaMTX) is configured in Settings, plays in-page. */
+/* ---------------- Auto-update (shared with the Windows edition) ----
+   Both editions share one version number and check the project's
+   GitHub "latest release" at most once per 24 h (attempt-based). */
+var APP_VERSION = "1.1.0";
+var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
+var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
+
+function parseVersionParts(s) {
+  return String(s || "").replace(/^v/, "").split(".").map(function (p) {
+    var n = parseInt(p, 10);
+    return isNaN(n) ? 0 : n;
+  });
+}
+/* Numeric X.Y.Z comparison (1.10.0 > 1.9.0). */
+function isNewerVersion(latest, current) {
+  var a = parseVersionParts(latest), b = parseVersionParts(current);
+  for (var i = 0; i < Math.max(a.length, b.length); i++) {
+    var x = a[i] || 0, y = b[i] || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+/* Extract what's needed from a GitHub "latest release" response. */
+function pickReleaseAssets(json) {
+  if (!json || !json.tag_name) return null;
+  var html = null, exe = null;
+  (json.assets || []).forEach(function (a) {
+    if (a.name === "SmartLife_Tuya_Desktop.html") html = a;
+    if (/^SmartLifeTuyaDesktop-Setup-.*\.exe$/.test(a.name || "")) exe = a;
+  });
+  if (!html) return null;
+  return {
+    version: String(json.tag_name).replace(/^v/, ""),
+    pageUrl: json.html_url || "",
+    htmlName: html.name,
+    htmlUrl: html.browser_download_url || "",
+    exeName: exe ? exe.name : null
+  };
+}
+
 var CAM_TEMPLATES = {
   tapo1: { label: "Tapo Stream 1 — High Quality", path: "/stream1" },
   tapo2: { label: "Tapo Stream 2 — Standard", path: "/stream2" },
@@ -860,6 +967,20 @@ function filterDevices(devices, layout, query) {
            (d.name || "").toLowerCase().indexOf(q) >= 0;
   });
 }
+/* A device is light-capable when it can do brightness, colour
+   temperature or colour (bulbs and RGB strips — cameras never are). */
+function isLightCapable(d) {
+  return !!(!d.isCamera && !d.isScene && (d.hasBrightness || d.hasTemp || d.hasColor));
+}
+/* The "no explicit group" label for an item: light-capable devices
+   live in the automatic Lighting section, cameras in the automatic
+   Cameras section, everything else in Ungrouped. */
+function autoSectionLabel(d) {
+  if (d.isCamera) return "Cameras (automatic)";
+  if (isLightCapable(d)) return "Lighting (automatic)";
+  return "Ungrouped";
+}
+
 function buildSections(devices, layout, editing) {
   var hidden = {};
   (layout.hidden || []).forEach(function (id) { hidden[id] = true; });
@@ -870,19 +991,82 @@ function buildSections(devices, layout, editing) {
   (layout.pins || []).forEach(function (id) { pinSet[id] = true; });
   var so = layout.sectionOrder || {};
   var sections = [];
+  function assignedToRealGroup(d) {
+    var g = layout.assign[d.id];
+    return !!(g && (layout.groups || []).some(function (x) { return x.id === g; }));
+  }
   var pinned = normal.filter(function (d) { return pinSet[d.id]; });
   if (pinned.length) sections.push({ key: "pinned", orderKey: "pinned", title: "Pinned", kind: "pinned", groupId: null, devices: orderSectionItems(pinned, so["pinned"], layout) });
+  /* Built-in automatic sections: an explicit group assignment wins;
+     unassigned lights land in Lighting, unassigned cameras in Cameras. */
+  var lighting = normal.filter(function (d) { return !assignedToRealGroup(d) && isLightCapable(d); });
+  sections.push({ key: "lighting", orderKey: "lighting", title: "Lighting", kind: "lighting", groupId: null, devices: orderSectionItems(lighting, so["lighting"], layout) });
+  var cameras = normal.filter(function (d) { return !assignedToRealGroup(d) && d.isCamera; });
+  sections.push({ key: "cameras", orderKey: "cameras", title: "Cameras", kind: "cameras", groupId: null, devices: orderSectionItems(cameras, so["cameras"], layout) });
   (layout.groups || []).forEach(function (g) {
     var devs = normal.filter(function (d) { return layout.assign[d.id] === g.id; });
     sections.push({ key: g.id, orderKey: "group:" + g.id, title: g.name, kind: "group", groupId: g.id, devices: orderSectionItems(devs, so["group:" + g.id], layout) });
   });
   var ungrouped = normal.filter(function (d) {
-    var g = layout.assign[d.id];
-    return !(g && (layout.groups || []).some(function (x) { return x.id === g; }));
+    return !assignedToRealGroup(d) && !isLightCapable(d) && !d.isCamera;
   });
   sections.push({ key: "ungrouped", orderKey: "ungrouped", title: "Ungrouped", kind: "ungrouped", groupId: null, devices: orderSectionItems(ungrouped, so["ungrouped"], layout) });
   if (scenes.length) sections.push({ key: "scenes", orderKey: "scenes", title: "Scenes", kind: "scenes", groupId: null, devices: orderSectionItems(scenes, so["scenes"], layout) });
-  return sections.filter(function (s) { return s.devices.length > 0 || (editing && s.kind === "group"); });
+  return sections.filter(function (s) {
+    return s.devices.length > 0 || (editing && (s.kind === "group" || s.kind === "lighting" || s.kind === "cameras"));
+  });
+}
+
+/* ---------------- Group controls (broadcast, not binding) --------------
+   A group action computes a plan of per-member Control commands and
+   sends them one by one. No group state is stored anywhere: the header
+   widgets simply reflect member states (any-on, averages). */
+
+function groupDeviceMembers(devices) {
+  return devices.filter(function (d) { return !d.isScene && !d.isCamera; });
+}
+function groupMasterOn(members) {
+  return groupDeviceMembers(members).some(function (d) { return !!d.state; });
+}
+function groupAverage(members, pick) {
+  var sum = 0, n = 0;
+  members.forEach(function (d) {
+    var v = pick(d);
+    if (v !== null && v !== undefined && !isNaN(v)) { sum += v; n++; }
+  });
+  return n ? sum / n : null;
+}
+/* The fan-out plan for one group action. kind: "toggle" | "brightness"
+   | "temp" | "color". value: target on/off is derived for "toggle";
+   brightness = percent; temp = slider value; color = hex string.
+   Offline members are skipped (their cards disable controls too). */
+function groupPlan(members, kind, value) {
+  var devs = groupDeviceMembers(members).filter(function (d) { return d.online !== false; });
+  var plan = [];
+  if (kind === "toggle") {
+    var target = groupMasterOn(members) ? 0 : 1;
+    devs.forEach(function (d) { plan.push({ id: d.id, action: "turnOnOff", value: target }); });
+  } else if (kind === "brightness") {
+    var pct = clamp(Math.round(value), 11, 100);
+    devs.filter(function (d) { return d.hasBrightness; })
+      .forEach(function (d) { plan.push({ id: d.id, action: "brightnessSet", value: pct }); });
+  } else if (kind === "temp") {
+    var tv = clamp(Math.round(value), 1000, 10000);
+    devs.filter(function (d) { return d.hasTemp; })
+      .forEach(function (d) { plan.push({ id: d.id, action: "colorTemperatureSet", value: tv }); });
+  } else if (kind === "color") {
+    var hsv = hexToHsv(value);
+    var hue = hsv.h, sat = Math.round(hsv.s * 100) / 100;
+    if (sat < 0.02) { hue = 0; sat = 0; }
+    devs.filter(function (d) { return d.hasColor; })
+      .forEach(function (d) {
+        plan.push({
+          id: d.id, action: "colorSet",
+          value: { hue: hue, saturation: sat, brightness: d.brightnessPct !== null && d.brightnessPct !== undefined ? d.brightnessPct : 100 }
+        });
+      });
+  }
+  return plan;
 }
 
 /* ---------------- API client (fetch injectable for tests) ---------------- */
@@ -980,6 +1164,11 @@ var SLC_API = {
   cameraStatusText: cameraStatusText, cameraToItem: cameraToItem,
   migrateLayout: migrateLayout, displayNameWith: displayNameWith,
   orderSectionItems: orderSectionItems, buildSections: buildSections,
+  isLightCapable: isLightCapable, autoSectionLabel: autoSectionLabel,
+  groupDeviceMembers: groupDeviceMembers, groupMasterOn: groupMasterOn,
+  groupAverage: groupAverage, groupPlan: groupPlan,
+  APP_VERSION: APP_VERSION, parseVersionParts: parseVersionParts,
+  isNewerVersion: isNewerVersion, pickReleaseAssets: pickReleaseAssets,
   filterDevices: filterDevices
 };
 if (typeof module !== "undefined" && module.exports) module.exports = SLC_API;
@@ -1160,7 +1349,7 @@ function togglePin(id) {
 }
 
 /* ---------------- Control ---------------- */
-async function sendControl(device, action, value, applyLocal) {
+async function sendControl(device, action, value, applyLocal, quiet) {
   await ensureSession(false);
   var backup = JSON.stringify(device.raw.data || {});
   if (applyLocal) { applyLocal(); renderAll(); }
@@ -1173,10 +1362,115 @@ async function sendControl(device, action, value, applyLocal) {
     var fresh = parseDevice(device.raw);
     Object.keys(fresh).forEach(function (k) { device[k] = fresh[k]; });
     renderAll();
-    toast("Command failed for " + displayName(device), true);
+    if (!quiet) toast("Command failed for " + displayName(device), true);
     return false;
   }
   return true;
+}
+
+/* Optimistic local state for one fanned-out group command — the same
+   mutations the per-card do* functions apply. */
+function applyOptimistic(device, action, value) {
+  var data = device.raw.data || (device.raw.data = {});
+  if (action === "turnOnOff") {
+    device.state = !!value; data.state = device.state;
+  } else if (action === "brightnessSet") {
+    device.brightnessPct = value; data.brightness = value * 10;
+    device.state = true; data.state = true;
+  } else if (action === "colorTemperatureSet") {
+    device.tempSlider = value; data.color_temp = tempSliderToReported(value);
+    device.state = true; data.state = true;
+    device.colorMode = "white"; data.color_mode = "white";
+  } else if (action === "colorSet") {
+    device.hue = value.hue; device.saturation = value.saturation;
+    device.state = true; data.state = true;
+    device.colorMode = "colour"; data.color_mode = "colour";
+    data.hue = value.hue; data.saturation = value.saturation;
+  }
+}
+function sleepMs(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+/* Broadcast one group action to the section's members, sequentially
+   with a short delay (Tuya rate-limits bursts), then reconcile with a
+   refresh. A summary toast names any member that didn't respond. */
+async function runGroupAction(sec, kind, value) {
+  var full = fullSectionByKey(sec.key);
+  var members = full ? full.devices : sec.devices;
+  var plan = groupPlan(members, kind, value);
+  if (!plan.length) return;
+  var okCount = 0, failedNames = [];
+  for (var i = 0; i < plan.length; i++) {
+    var t = plan[i];
+    var dev = itemById(t.id);
+    if (!dev) continue;
+    var good = await sendControl(dev, t.action, t.value, (function (dv, a, v) {
+      return function () { applyOptimistic(dv, a, v); };
+    })(dev, t.action, t.value), true);
+    if (good) okCount++; else failedNames.push(displayName(dev));
+    if (i < plan.length - 1) await sleepMs(200);
+  }
+  if (failedNames.length) {
+    toast(sec.title + ": " + okCount + " of " + plan.length + " updated — " + failedNames.join(", ") + " didn't respond", true);
+  }
+  fetchDevices(true);
+}
+
+/* ---------------- Auto-update runtime ---------------- */
+function loadUpdateStore() { return slcGet("update", { lastCheck: 0, dismissed: "" }); }
+function saveUpdateStore(u) { slcSet("update", u); }
+
+function renderUpdateUi() {
+  var st = loadUpdateStore();
+  var info = S.updateInfo || null;
+  var newer = !!(info && isNewerVersion(info.version, APP_VERSION));
+  var banner = $("update-banner");
+  if (banner) {
+    if (newer && st.dismissed !== info.version) {
+      banner.classList.remove("hidden");
+      $("update-banner-text").textContent =
+        "Version " + info.version + " is available — you're on " + APP_VERSION + ".";
+      $("update-banner-dl").href = info.htmlUrl;
+    } else {
+      banner.classList.add("hidden");
+    }
+  }
+  var status = $("upd-status");
+  if (status) {
+    if (S.updateChecking) status.textContent = "Checking for updates…";
+    else if (S.updateError) status.textContent = S.updateError;
+    else if (newer) status.textContent = "Version " + info.version + " is available.";
+    else if (info) status.textContent = "You're up to date — " + info.version + " is the latest version.";
+    else status.textContent = "";
+  }
+  var dl = $("btn-download-update");
+  if (dl) {
+    if (newer) { dl.classList.remove("hidden"); dl.href = info.htmlUrl; }
+    else dl.classList.add("hidden");
+  }
+}
+
+async function checkForUpdate(manual) {
+  var st = loadUpdateStore();
+  st.lastCheck = Date.now();               /* attempt-based throttle */
+  saveUpdateStore(st);
+  S.updateChecking = true;
+  if (manual) S.updateError = null;
+  renderUpdateUi();
+  try {
+    var res = await fetch(RELEASES_API, { headers: { "Accept": "application/vnd.github+json" } });
+    var info = pickReleaseAssets(await res.json());
+    if (!info) throw new Error("unexpected response");
+    S.updateInfo = info;
+    S.updateError = null;
+    if (manual && !isNewerVersion(info.version, APP_VERSION)) {
+      toast("You're on the latest version");
+    }
+  } catch (e) {
+    /* Auto-checks fail silently; manual checks say so in the panel. */
+    if (manual) S.updateError = "Update check failed — check your connection and try again.";
+  }
+  S.updateChecking = false;
+  renderUpdateUi();
 }
 function doToggle(device) {
   var newVal = device.state ? 0 : 1;
@@ -1228,6 +1522,13 @@ function sectionsModel() {
 }
 function sectionByKey(key) {
   var secs = sectionsModel();
+  for (var i = 0; i < secs.length; i++) if (secs[i].key === key) return secs[i];
+  return null;
+}
+/* The section's full membership (ignoring the search filter) — group
+   controls always act on the whole section, not the filtered view. */
+function fullSectionByKey(key) {
+  var secs = buildSections(allItems(), S.layout, isEditing());
   for (var i = 0; i < secs.length; i++) if (secs[i].key === key) return secs[i];
   return null;
 }
@@ -1290,6 +1591,8 @@ function renderSection(sec) {
     saveLayout(); renderAll();
   });
   wrap.appendChild(head);
+  var gc = renderGroupControls(sec);
+  if (gc) wrap.appendChild(gc);
   if (!S.layout.collapsed[sec.key]) {
     var grid = el("div", "grid");
     grid.dataset.sectionKey = sec.key;
@@ -1304,6 +1607,86 @@ function renderSection(sec) {
     wrap.appendChild(grid);
   }
   return wrap;
+}
+
+/* Group-wide controls for the Lighting section and for user groups
+   containing at least one light: master toggle (any-on semantics),
+   average brightness / colour-temperature sliders, colour swatches +
+   picker. Everything broadcasts; nothing is stored. Pinned, Ungrouped,
+   Cameras and Scenes never get these. */
+function renderGroupControls(sec) {
+  if (sec.kind !== "lighting" && sec.kind !== "group") return null;
+  var full = fullSectionByKey(sec.key);
+  var members = full ? full.devices : sec.devices;
+  var devs = groupDeviceMembers(members);
+  var lights = devs.filter(function (d) { return isLightCapable(d); });
+  if (!lights.length) return null;
+  var box = el("div", "group-controls");
+  // master toggle — ON if any member is on; clicking turns all off then
+  var master = el("div", "gc-master");
+  master.appendChild(el("span", "gc-label", "All"));
+  var anyOn = groupMasterOn(members);
+  var sw = el("button", "switch");
+  sw.setAttribute("role", "switch");
+  sw.setAttribute("aria-checked", anyOn ? "true" : "false");
+  sw.setAttribute("aria-label", "Toggle all in " + sec.title);
+  sw.addEventListener("click", function () { runGroupAction(sec, "toggle"); });
+  master.appendChild(sw);
+  box.appendChild(master);
+  // brightness — average of capable members, broadcast on release
+  var bMembers = devs.filter(function (d) { return d.hasBrightness && d.brightnessPct !== null; });
+  if (bMembers.length) {
+    var avgB = groupAverage(bMembers, function (d) { return d.brightnessPct; });
+    var bs = sliderRow("Brightness", 11, 100, Math.max(11, Math.round(avgB)), function (v) { return Math.round(v) + "%"; });
+    bs.wrap.classList.add("gc-slider");
+    bindSlider(bs, function (v) { return Math.round(v) + "%"; }, function (v) { runGroupAction(sec, "brightness", v); });
+    box.appendChild(bs.wrap);
+  }
+  // colour temperature — same pattern
+  var tMembers = devs.filter(function (d) { return d.hasTemp && d.tempSlider !== null; });
+  if (tMembers.length) {
+    var avgT = groupAverage(tMembers, function (d) { return d.tempSlider; });
+    var ts = sliderRow("Colour temperature", 1000, 10000, Math.round(avgT / 50) * 50, function (v) { return tempSliderToKelvin(v) + "K"; });
+    ts.input.step = 50;
+    ts.wrap.classList.add("gc-slider");
+    bindSlider(ts, function (v) { return tempSliderToKelvin(v) + "K"; }, function (v) { runGroupAction(sec, "temp", v); });
+    box.appendChild(ts.wrap);
+  }
+  // colour — swatches + picker, broadcast to colour-capable members
+  var cMembers = devs.filter(function (d) { return d.hasColor; });
+  if (cMembers.length) {
+    var swWrap = el("div", null);
+    var swRow = el("div", "swatches");
+    SWATCHES.forEach(function (swd) {
+      var b = el("button", "swatch");
+      b.style.background = swd.hex; b.title = swd.name;
+      b.addEventListener("click", function () { runGroupAction(sec, "color", swd.hex); });
+      swRow.appendChild(b);
+    });
+    var gkey = "grp:" + sec.key;
+    var more = el("button", "swatch", "🎨");
+    more.title = "More colours…";
+    more.style.background = "conic-gradient(#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)";
+    more.addEventListener("click", function () {
+      S.openColorFor = (S.openColorFor === gkey) ? null : gkey;
+      renderAll();
+    });
+    swRow.appendChild(more);
+    swWrap.appendChild(swRow);
+    if (S.openColorFor === gkey) {
+      var panel = el("div", "color-panel");
+      var row = el("div", "row");
+      var picker = el("input", "picker");
+      picker.type = "color"; picker.value = "#ffffff";
+      var apply = el("button", "btn small primary", "Apply colour");
+      apply.addEventListener("click", function () { runGroupAction(sec, "color", picker.value); });
+      row.appendChild(picker); row.appendChild(apply);
+      panel.appendChild(row);
+      swWrap.appendChild(panel);
+    }
+    box.appendChild(swWrap);
+  }
+  return box;
 }
 
 function sliderRow(labelText, min, max, value, fmt) {
@@ -1467,7 +1850,7 @@ function editTools(d, sec) {
   if (!d.isScene) {
     var r2 = el("div", "row");
     var sel = el("select");
-    var optU = el("option", null, "Ungrouped"); optU.value = ""; sel.appendChild(optU);
+    var optU = el("option", null, autoSectionLabel(d)); optU.value = ""; sel.appendChild(optU);
     S.layout.groups.forEach(function (g) {
       var o = el("option", null, g.name); o.value = g.id; sel.appendChild(o);
     });
@@ -1550,7 +1933,7 @@ function cameraEditTools(d, sec) {
   box.appendChild(r1);
   var r2 = el("div", "row");
   var sel = el("select");
-  var optU = el("option", null, "Ungrouped"); optU.value = ""; sel.appendChild(optU);
+  var optU = el("option", null, autoSectionLabel(d)); optU.value = ""; sel.appendChild(optU);
   S.layout.groups.forEach(function (g) {
     var o = el("option", null, g.name); o.value = g.id; sel.appendChild(o);
   });
@@ -1767,7 +2150,7 @@ function openCameraDialog(existing) {
         S.cameras.push(rec);
       }
       saveCameras(); closeModal(); renderAll();
-      toast(cam ? "Camera saved" : "Camera added — it's in Ungrouped (pin it with 📌)");
+      toast(cam ? "Camera saved" : "Camera added — it's in the Cameras section (pin it with 📌)");
     });
     actions.appendChild(cancel); actions.appendChild(save);
     modal.appendChild(actions);
@@ -1791,7 +2174,7 @@ function dropDevice(dragId, beforeId, targetSection) {
   if (dragDev.isScene !== (targetSection.kind === "scenes")) { renderAll(); return; }
   if (!dragDev.isScene) {
     if (targetSection.kind === "group") S.layout.assign[dragId] = targetSection.groupId;
-    else if (targetSection.kind === "ungrouped") delete S.layout.assign[dragId];
+    else if (targetSection.kind === "ungrouped" || targetSection.kind === "lighting" || targetSection.kind === "cameras") delete S.layout.assign[dragId];
     else if (targetSection.kind === "pinned" && S.layout.pins.indexOf(dragId) < 0) S.layout.pins.push(dragId);
   }
   if (beforeId && beforeId !== dragId) {
@@ -2037,6 +2420,21 @@ function init() {
   $("btn-settings").addEventListener("click", showSettings);
   $("btn-back").addEventListener("click", function () { showApp(); renderAll(); });
   $("set-theme").addEventListener("change", function (ev) { S.prefs.theme = ev.target.value; savePrefs(); applyPrefs(); });
+  /* App updates: version stamp, manual check, banner dismissal, and
+     the throttled silent launch check. */
+  $("upd-current").textContent = APP_VERSION;
+  $("btn-check-update").addEventListener("click", function () { checkForUpdate(true); });
+  $("update-banner-dismiss").addEventListener("click", function () {
+    if (S.updateInfo) {
+      var st = loadUpdateStore();
+      st.dismissed = S.updateInfo.version;
+      saveUpdateStore(st);
+    }
+    renderUpdateUi();
+  });
+  renderUpdateUi();
+  var updSt = loadUpdateStore();
+  if (Date.now() - (updSt.lastCheck || 0) >= UPDATE_PERIOD_MS) checkForUpdate(false);
   $("set-density").addEventListener("change", function (ev) { S.prefs.density = ev.target.value; savePrefs(); applyPrefs(); });
   $("btn-forget").addEventListener("click", function () {
     clearSavedLogin(); renderSettings(); toast("Saved login forgotten");
