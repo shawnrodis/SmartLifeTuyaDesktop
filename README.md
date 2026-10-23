@@ -7,11 +7,12 @@
 A clean, modern dashboard for your **Smart Life / Tuya** devices — lights,
 plugs, switches and scenes — in two editions that look and behave the same:
 
-- **Windows app** (this repo's Rust + egui program): a small native `.exe`,
-  no installer required to try it, no admin rights needed.
+- **Windows app** (this repo's Rust + egui program): a small native app
+  with a per-user installer — no admin rights needed.
 - **Web app** (`web/SmartLife_Tuya_Desktop.html`): a single self-contained
   HTML file — open it in any modern browser, from disk or any static host.
-  No build step, no dependencies.
+  No build step, no dependencies. Also live at
+  [shawnrodis.github.io/SmartLifeTuyaDesktop](https://shawnrodis.github.io/SmartLifeTuyaDesktop).
 
 Both sign in to Tuya's cloud with the same account you use in the Smart Life
 (or Tuya Smart) app and control devices through Tuya's own API — the same
@@ -20,11 +21,14 @@ customisable interface they always deserved.
 
 ## Download (Windows)
 
-Grab `SmartLifeTuyaDesktop-Setup-vX.Y.Z.exe` from
+Grab `SmartLifeTuyaDesktop-Setup-v1.1.0.exe` from
 [Releases](https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases) and
 run it — per-user install to `%LOCALAPPDATA%\SmartLifeTuyaDesktop`, with
 Start Menu shortcuts and an uninstaller. No administrator rights required.
-(Building from source is optional; instructions below.)
+The web edition is the `SmartLife_Tuya_Desktop.html` asset on the same
+release. Both editions share one version number and check for updates
+themselves (Settings → App updates). (Building from source is optional;
+instructions below.)
 
 ## Features
 
@@ -35,14 +39,31 @@ Start Menu shortcuts and an uninstaller. No administrator rights required.
   lights and strips, one-tap scene running. Commands are optimistic and
   roll back with an error toast if Tuya rejects them.
 - **Your order, your rooms** — sections sort A–Z by name by default; in
-  Edit mode you can reorder devices inside a section (that order sticks,
-  and each section has a "Reset to name order" button), create groups,
-  rename devices with an alias, and hide devices you never use.
+  Edit mode you can drag cards to reorder them inside a section (or use
+  ↑/↓; that order sticks, and each section has a "Reset to name order"
+  button), create groups, rename devices with an alias, and hide devices
+  you never use.
+- **Automatic Lighting & Cameras sections** — unassigned bulbs and
+  strips gather in a built-in **Lighting** section, and RTSP cameras in
+  a built-in **Cameras** section; assigning anything to your own group
+  always wins.
+- **Group controls** — the Lighting header (and any group containing a
+  light) gets a master switch, average brightness / colour-temperature
+  sliders and colour swatches that broadcast to every member.
+- **RTSP cameras** — add Tapo (or any RTSP) cameras in Edit mode; cards
+  sit alongside devices with pinning, grouping and ordering. Watch hands
+  the stream to VLC, or plays in-app via an optional go2rtc / MediaMTX
+  gateway (Settings → Stream gateway & cameras).
 - **Pinned shortcuts** — pin any device with 📌 and a full working copy
   appears in the Pinned section at the top; the device also stays in its
   group below. Scenes always get their own Scenes section.
-- **Make it yours** — dark/light theme, 7 accent colours, comfortable /
-  compact card density, search box. Everything is remembered locally.
+- **Make it yours** — Dark / Light / **Black** (true-black) themes, 7
+  accent colours, comfortable / compact card density, search box.
+  Everything is remembered locally.
+- **Self-updating** — both editions check GitHub once a day for a newer
+  release; the Windows app downloads and launches the new installer
+  itself, the web edition offers the new file (and the hosted copy is
+  always current).
 - **Private by design** — your credentials go only to Tuya's own servers
   over HTTPS. "Keep me logged in" stores them only on your device
   (web: this browser's local storage; Windows: a JSON config in your user
@@ -97,7 +118,8 @@ SmartLifeTuyaDesktop/
 ├── assets/
 │   ├── SmartLifeTuyaDesktop.ico      # exe icon
 │   ├── SmartLifeTuyaDesktop.manifest # asInvoker manifest
-│   └── icon.png                      # runtime / README icon
+│   ├── icon.png                      # runtime / README icon
+│   └── fonts/                        # embedded glyph fallbacks (egui)
 ├── web/
 │   └── SmartLife_Tuya_Desktop.html   # the web edition (single file)
 ├── installer/
