@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="version" content="1.1.0">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -32,6 +33,18 @@
     --text:#17202e;
     --text-dim:#5d6879;
     --track:#dbe1ec;
+    --shadow:none;
+  }
+  [data-theme="black"]{
+    --bg:#000000;
+    --bg-grad:radial-gradient(1200px 600px at 80% -10%, rgba(99,102,241,.07), transparent 60%),
+               radial-gradient(900px 500px at -10% 110%, rgba(20,184,166,.05), transparent 55%);
+    --card:#0c0d11;
+    --card-border:#1f232e;
+    --text:#e7ebf2;
+    --text-dim:#8b94a7;
+    --text-faint:#5b6478;
+    --track:#22252e;
     --shadow:none;
   }
   *{box-sizing:border-box}
@@ -125,6 +138,26 @@
   .section-head.collapsed .chev{transform:rotate(-90deg)}
   .section-head .count{font-size:12px; color:var(--text-dim); background:var(--card); border:1px solid var(--card-border); padding:1px 8px; border-radius:20px}
   .section-head .spacer{flex:1}
+  /* Group controls strip (Lighting + user groups with lights): sits in
+     the header block under the title row, wraps on narrow screens. */
+  .group-controls{
+    display:flex; align-items:flex-start; gap:22px; flex-wrap:wrap;
+    margin:-4px 2px 14px; padding:12px 16px;
+    background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius);
+  }
+  .group-controls .gc-master{display:flex; align-items:center; gap:10px; padding-top:2px}
+  .group-controls .gc-master .gc-label{font-size:12.5px; font-weight:600; color:var(--text-dim)}
+  .group-controls .gc-slider{min-width:190px; flex:1 1 190px; max-width:300px}
+  .group-controls .ctl{margin-top:0}
+  .group-controls .swatches{margin-top:6px}
+  /* Update banner (dashboard, dismissible per version) */
+  #update-banner{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    width:min(1204px, calc(100% - 36px)); margin:16px auto 0; padding:12px 16px;
+    background:var(--accent-soft); border:1px solid var(--accent); border-radius:14px;
+    font-size:13.5px; font-weight:600;
+  }
+  #update-banner .spacer{flex:1}
   .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(238px,1fr)); gap:14px}
   body[data-density="compact"] .grid{grid-template-columns:repeat(auto-fill,minmax(198px,1fr)); gap:10px}
 
@@ -210,6 +243,32 @@
     width:52px; height:38px; border:1px solid var(--card-border); border-radius:11px; padding:2px; background:var(--card); cursor:pointer;
   }
   .scene-btn{width:100%; margin-top:13px; padding:10px; font-size:14px}
+
+  /* camera cards + dialogs */
+  .cam-actions{display:flex; gap:8px; margin-top:13px}
+  .cam-actions .btn{flex:1}
+  .seg{display:flex; gap:6px; margin-top:12px}
+  .seg .btn{flex:1}
+  .seg .btn.active{background:var(--accent); border-color:var(--accent); color:#fff}
+  #modal-root:empty{display:none}
+  .modal-scrim{
+    position:fixed; inset:0; z-index:90; background:rgba(3,6,12,.62);
+    display:flex; align-items:center; justify-content:center; padding:18px;
+  }
+  .modal{
+    background:var(--card); border:1px solid var(--card-border); border-radius:22px;
+    padding:24px 26px; width:100%; max-width:520px; max-height:92vh; overflow:auto;
+  }
+  .modal h3{margin:0 0 3px; font-size:17px}
+  .modal .sub{color:var(--text-dim); font-size:13px; line-height:1.55; margin-bottom:14px}
+  .modal video, .modal iframe.player{
+    width:100%; aspect-ratio:16/9; background:#000; border:1px solid var(--card-border);
+    border-radius:12px; display:block;
+  }
+  .modal .actions{display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; align-items:center}
+  .modal .actions .spacer{flex:1}
+  .modal .actions a.btn{text-decoration:none}
+
   .empty-note{color:var(--text-dim); font-size:14px; padding:26px 4px; text-align:center}
 
   /* edit mode extras */
@@ -243,6 +302,7 @@
     font-size:13.5px; animation:toast-in .22s ease; max-width:88vw; text-align:center;
   }
   [data-theme="light"] .toast{background:#17202e; border-color:#17202e}
+  [data-theme="black"] .toast{background:#14161c; border-color:#262a35}
   .toast.err{background:#4c1120; border-color:#881337}
   @keyframes toast-in{from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none}}
   .spinner{
@@ -330,7 +390,14 @@
     <div id="editbar" class="hidden">
       <span>✎ <b>Edit mode</b> — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.</span>
       <button class="btn small" id="btn-addgroup">＋ New group</button>
+      <button class="btn small" id="btn-addcamera">＋ Add camera</button>
       <button class="btn small primary" id="btn-doneedit">Done</button>
+    </div>
+    <div id="update-banner" class="hidden">
+      <span id="update-banner-text"></span>
+      <span class="spacer"></span>
+      <a class="btn small primary" id="update-banner-dl" href="#" download>Download the new version</a>
+      <button class="btn small" id="update-banner-dismiss">Dismiss</button>
     </div>
     <main id="dash"></main>
   </div>
@@ -351,6 +418,7 @@
           <select id="set-theme">
             <option value="dark">Dark</option>
             <option value="light">Light</option>
+            <option value="black">Black</option>
           </select>
         </div>
         <div class="field">
@@ -364,6 +432,21 @@
             <option value="compact">Compact</option>
           </select>
         </div>
+      </div>
+
+      <div class="panel">
+        <h3>App updates</h3>
+        <p class="hint">You're running version <b id="upd-current">1.1.0</b>. This page checks
+        GitHub for updates at most once a day; you can also check now.</p>
+        <p class="hint" id="upd-status"></p>
+        <div>
+          <button class="btn" id="btn-check-update">Check for updates</button>
+          <a class="btn primary hidden" id="btn-download-update" href="#" download>Download the new version</a>
+        </div>
+        <p class="hint" style="margin-top:10px">A web page can't overwrite its own file: save the
+        downloaded HTML over your old copy and reload — your saved devices, groups and settings
+        stay in this browser. The online copy at <b>shawnrodis.github.io/SmartLifeTuyaDesktop</b>
+        is always the latest version.</p>
       </div>
 
       <div class="panel">
@@ -392,6 +475,27 @@
       </div>
 
       <div class="panel">
+        <h3>Stream gateway &amp; cameras</h3>
+        <p class="hint">Cameras you add (✎ Edit → ＋ Add camera) stream over RTSP, which browsers
+        can't play directly. Point ▶ Watch at a small stream gateway on your network —
+        <b>go2rtc</b> or <b>MediaMTX</b> — and the stream plays right in this page. The gateway needs a
+        stream with the <b>same name</b> as the camera here, fed from the same RTSP address
+        (the card's Copy URL button gives you the exact address). Leave the address empty to hand
+        streams to an external player app (such as VLC) instead.</p>
+        <div class="field">
+          <label for="set-gw-url">Stream gateway address (optional)</label>
+          <input type="text" id="set-gw-url" placeholder="http://192.168.1.10:1984 (go2rtc) · http://192.168.1.10:8889 (MediaMTX)">
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="set-gw-type">Gateway type</label>
+          <select id="set-gw-type">
+            <option value="go2rtc">go2rtc</option>
+            <option value="mediamtx">MediaMTX (HLS)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="panel">
         <h3>Saved login</h3>
         <p class="hint" id="saved-login-info">No login is saved in this browser.</p>
         <button class="btn danger" id="btn-forget">Forget saved login</button>
@@ -399,7 +503,7 @@
 
       <div class="panel">
         <h3>Hidden devices</h3>
-        <p class="hint">Devices you hid with the ✕ on their card. They stay hidden until you bring them back here.</p>
+        <p class="hint">Devices and cameras you hid with the ✕ on their card. They stay hidden until you bring them back here.</p>
         <div id="hidden-list"></div>
       </div>
 
@@ -426,12 +530,40 @@
         Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top —
         the device also stays in its group below. Scenes always live in their own Scenes section.
         Everything is remembered in this browser.</p>
+        <p><b>Lighting &amp; group controls.</b> Lights organise themselves: any bulb or strip that
+        isn't assigned to one of your groups lives in the built-in <b>Lighting</b> section, and
+        cameras get their own built-in <b>Cameras</b> section the same way — assigning a device to
+        a group always wins over the automatic sections. The Lighting header (and the header of
+        any group containing a light) has group controls: a master switch (on if any member is
+        on; clicking turns the whole group on or off), brightness and colour-temperature sliders
+        showing the members' average, and colour swatches. Group controls <b>broadcast</b> — they
+        send the command to each member in turn, and changing a single light afterwards simply
+        overrides it for that light. Nothing about the group itself is stored.</p>
+        <p><b>Cameras (RTSP).</b> Tapo cameras: in the Tapo app, open the camera → Settings →
+        Advanced Settings → <b>Camera Account</b> and create a camera account, and make sure RTSP is
+        enabled for the camera. The username and password you add here are that <b>camera account</b> —
+        not your TP-Link cloud account. Then use ✎ Edit → <b>＋ Add camera</b> and enter the camera's
+        IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app
+        builds the stream address for you: <code>rtsp://user:pass@IP:554/stream1</code> (high quality)
+        or <code>/stream2</code> (standard) — or pick “Custom path” for other RTSP cameras. Camera
+        cards sit alongside your devices and can be pinned, grouped and reordered just like them;
+        unassigned cameras live in the built-in <b>Cameras</b> section until you assign them to a
+        group of your own. Their passwords are stored in this browser with the same light
+        obfuscation as the saved login.</p>
+        <p><b>Watching a stream.</b> Web browsers can't play <code>rtsp://</code> directly. Without a
+        gateway, ▶ Watch hands the stream address to a player app installed on your device (such as
+        VLC) — or use <b>Copy URL</b> and paste the address into VLC's “Open Network Stream”. For
+        in-browser playback, run a small stream gateway such as <b>go2rtc</b> or <b>MediaMTX</b> on
+        your network, give it a stream with the <b>same name</b> as the camera here (fed from the
+        same RTSP address — Copy URL has it), and enter the gateway's address in
+        Settings → Stream gateway &amp; cameras. ▶ Watch then plays right in this page.</p>
         <p><b>Limits.</b> Tuya rate-limits the device-list call; if you refresh very often the app may
         briefly show the last known states. Autorefresh every 30s or slower is comfortable.</p>
       </div>
     </main>
   </div>
 
+  <div id="modal-root"></div>
   <div id="toast-wrap"></div>
 
 <script>
@@ -478,7 +610,7 @@ var SWATCHES = [
 ];
 var TYPE_ICONS = {
   light: "💡", strip: "🌈", switch: "🔌", scene: "🎬", cover: "🪟",
-  climate: "🌡️", fan: "🌀", lock: "🔒", sensor: "📡", default: "🔘"
+  climate: "🌡️", fan: "🌀", lock: "🔒", sensor: "📡", camera: "📷", default: "🔘"
 };
 
 /* ---------------- Storage helpers ---------------- */
@@ -689,6 +821,118 @@ function mergeDeviceData(fresh, previous) {
   });
 }
 
+/* ---------------- Camera model (pure) ----------------
+   Cameras are local RTSP streams (e.g. Tapo) that the user adds by hand.
+   They are NOT Tuya devices — but on the dashboard they are peers of
+   devices: same sections, name sort / custom order, pinning, groups and
+   hiding. The camera password is stored obfuscated (slc "cameras" key)
+   with the same scheme as the saved login. Browsers can't play rtsp://,
+   so Watch either hands the URL to an external player or, when a stream
+   gateway (go2rtc / MediaMTX) is configured in Settings, plays in-page. */
+/* ---------------- Auto-update (shared with the Windows edition) ----
+   Both editions share one version number and check the project's
+   GitHub "latest release" at most once per 24 h (attempt-based). */
+var APP_VERSION = "1.1.0";
+var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
+var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
+
+function parseVersionParts(s) {
+  return String(s || "").replace(/^v/, "").split(".").map(function (p) {
+    var n = parseInt(p, 10);
+    return isNaN(n) ? 0 : n;
+  });
+}
+/* Numeric X.Y.Z comparison (1.10.0 > 1.9.0). */
+function isNewerVersion(latest, current) {
+  var a = parseVersionParts(latest), b = parseVersionParts(current);
+  for (var i = 0; i < Math.max(a.length, b.length); i++) {
+    var x = a[i] || 0, y = b[i] || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+/* Extract what's needed from a GitHub "latest release" response. */
+function pickReleaseAssets(json) {
+  if (!json || !json.tag_name) return null;
+  var html = null, exe = null;
+  (json.assets || []).forEach(function (a) {
+    if (a.name === "SmartLife_Tuya_Desktop.html") html = a;
+    if (/^SmartLifeTuyaDesktop-Setup-.*\.exe$/.test(a.name || "")) exe = a;
+  });
+  if (!html) return null;
+  return {
+    version: String(json.tag_name).replace(/^v/, ""),
+    pageUrl: json.html_url || "",
+    htmlName: html.name,
+    htmlUrl: html.browser_download_url || "",
+    exeName: exe ? exe.name : null
+  };
+}
+
+var CAM_TEMPLATES = {
+  tapo1: { label: "Tapo Stream 1 — High Quality", path: "/stream1" },
+  tapo2: { label: "Tapo Stream 2 — Standard", path: "/stream2" },
+  custom: { label: "Custom path" }
+};
+function cameraPath(cam) {
+  if (cam.template === "custom") {
+    var p = (cam.path || "").trim();
+    if (!p) return "/";
+    return p.charAt(0) === "/" ? p : "/" + p;
+  }
+  return cam.template === "tapo2" ? "/stream2" : "/stream1";
+}
+/* Build the RTSP URL from the template the user supplied:
+   rtsp://user:pass@host:port/path — credentials percent-encoded so
+   passwords containing @ : / # etc. survive. The stored password is
+   obfuscated; it is deobfuscated here. */
+function buildRtspUrl(cam) {
+  var port = parseInt(cam.port, 10) || 554;
+  var creds = encodeURIComponent(cam.user || "") + ":" + encodeURIComponent(deobfuscate(cam.pass || ""));
+  return "rtsp://" + creds + "@" + (cam.host || "").trim() + ":" + port + cameraPath(cam);
+}
+/* In-app playback URL for a configured stream gateway, or null.
+   The gateway stream must be named exactly like the camera here.
+   go2rtc: {gw}/stream.html?src={name} · MediaMTX: {gw}/{name}/index.m3u8 */
+function gatewayWatchUrl(cam, prefs) {
+  var gw = (prefs.gatewayUrl || "").trim().replace(/\/+$/, "");
+  if (!gw) return null;
+  var name = encodeURIComponent(cam.name || cam.id);
+  if (prefs.gatewayType === "mediamtx") return gw + "/" + name + "/index.m3u8";
+  return gw + "/stream.html?src=" + name;
+}
+function cameraStatusText(cam) {
+  var port = parseInt(cam.port, 10) || 554;
+  var q = cam.template === "custom" ? cameraPath(cam)
+    : (cam.template === "tapo2" ? "Stream 2 · Standard" : "Stream 1 · High");
+  return (cam.host || "") + ":" + port + " · " + q;
+}
+/* Adapt a stored camera record to the card/section item shape devices use. */
+function cameraToItem(cam) {
+  return {
+    id: cam.id, name: cam.name || cam.id, devType: "camera", kind: "camera",
+    iconKind: "camera", isScene: false, isCamera: true, online: true,
+    state: false, hasBrightness: false, hasTemp: false, hasColor: false,
+    brightnessPct: null, tempSlider: null, hue: null, saturation: null,
+    colorMode: null, cam: cam, raw: {}
+  };
+}
+/* The dashboard's item list: Tuya devices + the user's cameras. */
+function allItems() {
+  return S.devices.concat((S.cameras || []).map(cameraToItem));
+}
+function cameraById(id) {
+  var cams = S.cameras || [];
+  for (var i = 0; i < cams.length; i++) if (cams[i].id === id) return cams[i];
+  return null;
+}
+function itemById(id) {
+  var d = deviceById(id);
+  if (d) return d;
+  var cam = cameraById(id);
+  return cam ? cameraToItem(cam) : null;
+}
+
 /* ---------------- Layout / section model (pure) ----------------
    Ordering rule (identical in the Windows edition): within every section,
    devices render A–Z by display name (alias if set) UNLESS a custom order
@@ -723,6 +967,20 @@ function filterDevices(devices, layout, query) {
            (d.name || "").toLowerCase().indexOf(q) >= 0;
   });
 }
+/* A device is light-capable when it can do brightness, colour
+   temperature or colour (bulbs and RGB strips — cameras never are). */
+function isLightCapable(d) {
+  return !!(!d.isCamera && !d.isScene && (d.hasBrightness || d.hasTemp || d.hasColor));
+}
+/* The "no explicit group" label for an item: light-capable devices
+   live in the automatic Lighting section, cameras in the automatic
+   Cameras section, everything else in Ungrouped. */
+function autoSectionLabel(d) {
+  if (d.isCamera) return "Cameras (automatic)";
+  if (isLightCapable(d)) return "Lighting (automatic)";
+  return "Ungrouped";
+}
+
 function buildSections(devices, layout, editing) {
   var hidden = {};
   (layout.hidden || []).forEach(function (id) { hidden[id] = true; });
@@ -733,19 +991,82 @@ function buildSections(devices, layout, editing) {
   (layout.pins || []).forEach(function (id) { pinSet[id] = true; });
   var so = layout.sectionOrder || {};
   var sections = [];
+  function assignedToRealGroup(d) {
+    var g = layout.assign[d.id];
+    return !!(g && (layout.groups || []).some(function (x) { return x.id === g; }));
+  }
   var pinned = normal.filter(function (d) { return pinSet[d.id]; });
   if (pinned.length) sections.push({ key: "pinned", orderKey: "pinned", title: "Pinned", kind: "pinned", groupId: null, devices: orderSectionItems(pinned, so["pinned"], layout) });
+  /* Built-in automatic sections: an explicit group assignment wins;
+     unassigned lights land in Lighting, unassigned cameras in Cameras. */
+  var lighting = normal.filter(function (d) { return !assignedToRealGroup(d) && isLightCapable(d); });
+  sections.push({ key: "lighting", orderKey: "lighting", title: "Lighting", kind: "lighting", groupId: null, devices: orderSectionItems(lighting, so["lighting"], layout) });
+  var cameras = normal.filter(function (d) { return !assignedToRealGroup(d) && d.isCamera; });
+  sections.push({ key: "cameras", orderKey: "cameras", title: "Cameras", kind: "cameras", groupId: null, devices: orderSectionItems(cameras, so["cameras"], layout) });
   (layout.groups || []).forEach(function (g) {
     var devs = normal.filter(function (d) { return layout.assign[d.id] === g.id; });
     sections.push({ key: g.id, orderKey: "group:" + g.id, title: g.name, kind: "group", groupId: g.id, devices: orderSectionItems(devs, so["group:" + g.id], layout) });
   });
   var ungrouped = normal.filter(function (d) {
-    var g = layout.assign[d.id];
-    return !(g && (layout.groups || []).some(function (x) { return x.id === g; }));
+    return !assignedToRealGroup(d) && !isLightCapable(d) && !d.isCamera;
   });
   sections.push({ key: "ungrouped", orderKey: "ungrouped", title: "Ungrouped", kind: "ungrouped", groupId: null, devices: orderSectionItems(ungrouped, so["ungrouped"], layout) });
   if (scenes.length) sections.push({ key: "scenes", orderKey: "scenes", title: "Scenes", kind: "scenes", groupId: null, devices: orderSectionItems(scenes, so["scenes"], layout) });
-  return sections.filter(function (s) { return s.devices.length > 0 || (editing && s.kind === "group"); });
+  return sections.filter(function (s) {
+    return s.devices.length > 0 || (editing && (s.kind === "group" || s.kind === "lighting" || s.kind === "cameras"));
+  });
+}
+
+/* ---------------- Group controls (broadcast, not binding) --------------
+   A group action computes a plan of per-member Control commands and
+   sends them one by one. No group state is stored anywhere: the header
+   widgets simply reflect member states (any-on, averages). */
+
+function groupDeviceMembers(devices) {
+  return devices.filter(function (d) { return !d.isScene && !d.isCamera; });
+}
+function groupMasterOn(members) {
+  return groupDeviceMembers(members).some(function (d) { return !!d.state; });
+}
+function groupAverage(members, pick) {
+  var sum = 0, n = 0;
+  members.forEach(function (d) {
+    var v = pick(d);
+    if (v !== null && v !== undefined && !isNaN(v)) { sum += v; n++; }
+  });
+  return n ? sum / n : null;
+}
+/* The fan-out plan for one group action. kind: "toggle" | "brightness"
+   | "temp" | "color". value: target on/off is derived for "toggle";
+   brightness = percent; temp = slider value; color = hex string.
+   Offline members are skipped (their cards disable controls too). */
+function groupPlan(members, kind, value) {
+  var devs = groupDeviceMembers(members).filter(function (d) { return d.online !== false; });
+  var plan = [];
+  if (kind === "toggle") {
+    var target = groupMasterOn(members) ? 0 : 1;
+    devs.forEach(function (d) { plan.push({ id: d.id, action: "turnOnOff", value: target }); });
+  } else if (kind === "brightness") {
+    var pct = clamp(Math.round(value), 11, 100);
+    devs.filter(function (d) { return d.hasBrightness; })
+      .forEach(function (d) { plan.push({ id: d.id, action: "brightnessSet", value: pct }); });
+  } else if (kind === "temp") {
+    var tv = clamp(Math.round(value), 1000, 10000);
+    devs.filter(function (d) { return d.hasTemp; })
+      .forEach(function (d) { plan.push({ id: d.id, action: "colorTemperatureSet", value: tv }); });
+  } else if (kind === "color") {
+    var hsv = hexToHsv(value);
+    var hue = hsv.h, sat = Math.round(hsv.s * 100) / 100;
+    if (sat < 0.02) { hue = 0; sat = 0; }
+    devs.filter(function (d) { return d.hasColor; })
+      .forEach(function (d) {
+        plan.push({
+          id: d.id, action: "colorSet",
+          value: { hue: hue, saturation: sat, brightness: d.brightnessPct !== null && d.brightnessPct !== undefined ? d.brightnessPct : 100 }
+        });
+      });
+  }
+  return plan;
 }
 
 /* ---------------- API client (fetch injectable for tests) ---------------- */
@@ -838,8 +1159,16 @@ var SLC_API = {
   parseDiscovery: parseDiscovery, mergeDeviceData: mergeDeviceData,
   apiAuth: apiAuth, apiRefresh: apiRefresh, apiDiscovery: apiDiscovery, apiControl: apiControl,
   obfuscate: obfuscate, deobfuscate: deobfuscate,
+  CAM_TEMPLATES: CAM_TEMPLATES, cameraPath: cameraPath,
+  buildRtspUrl: buildRtspUrl, gatewayWatchUrl: gatewayWatchUrl,
+  cameraStatusText: cameraStatusText, cameraToItem: cameraToItem,
   migrateLayout: migrateLayout, displayNameWith: displayNameWith,
   orderSectionItems: orderSectionItems, buildSections: buildSections,
+  isLightCapable: isLightCapable, autoSectionLabel: autoSectionLabel,
+  groupDeviceMembers: groupDeviceMembers, groupMasterOn: groupMasterOn,
+  groupAverage: groupAverage, groupPlan: groupPlan,
+  APP_VERSION: APP_VERSION, parseVersionParts: parseVersionParts,
+  isNewerVersion: isNewerVersion, pickReleaseAssets: pickReleaseAssets,
   filterDevices: filterDevices
 };
 if (typeof module !== "undefined" && module.exports) module.exports = SLC_API;
@@ -850,6 +1179,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = SLC_API;
 var S = {
   session: null,          /* {accessToken, refreshToken, expiresAt, region} */
   devices: [],            /* parsed device models */
+  cameras: [],            /* user's RTSP camera records (slc "cameras") */
   rawDevices: null,       /* last raw discovery payload devices */
   timer: null,
   interacting: false,
@@ -864,7 +1194,8 @@ function defaultPrefs() {
   return {
     theme: "dark", accent: "#6366f1", density: "comfortable",
     autorefresh: true, interval: 30,
-    proxyPreset: "auto", proxyCustom: ""
+    proxyPreset: "auto", proxyCustom: "",
+    gatewayUrl: "", gatewayType: "go2rtc"
   };
 }
 function defaultLayout() {
@@ -890,6 +1221,8 @@ function loadPrefs() { S.prefs = Object.assign(defaultPrefs(), slcGet("prefs", {
 function savePrefs() { slcSet("prefs", S.prefs); }
 function loadLayout() { S.layout = migrateLayout(slcGet("layout", {})); }
 function saveLayout() { slcSet("layout", S.layout); }
+function loadCameras() { S.cameras = slcGet("cameras", []); if (!Array.isArray(S.cameras)) S.cameras = []; }
+function saveCameras() { slcSet("cameras", S.cameras); }
 function proxyCfg() { return { preset: S.prefs.proxyPreset, custom: S.prefs.proxyCustom }; }
 
 function $(id) { return document.getElementById(id); }
@@ -990,6 +1323,7 @@ async function fetchDevices(isRefresh) {
 function syncLayoutWithDevices() {
   var idSet = {};
   S.devices.forEach(function (d) { idSet[d.id] = true; });
+  (S.cameras || []).forEach(function (c) { idSet[c.id] = true; });
   var keep = function (id) { return !!idSet[id]; };
   S.layout.pins = S.layout.pins.filter(keep);
   S.layout.hidden = S.layout.hidden.filter(keep);
@@ -1007,7 +1341,7 @@ function deviceById(id) {
 }
 function displayName(d) { return displayNameWith(S.layout, d); }
 function togglePin(id) {
-  var d = deviceById(id);
+  var d = itemById(id);
   if (d && d.isScene) return;   /* scenes can't be pinned */
   var i = S.layout.pins.indexOf(id);
   if (i >= 0) S.layout.pins.splice(i, 1); else S.layout.pins.push(id);
@@ -1015,7 +1349,7 @@ function togglePin(id) {
 }
 
 /* ---------------- Control ---------------- */
-async function sendControl(device, action, value, applyLocal) {
+async function sendControl(device, action, value, applyLocal, quiet) {
   await ensureSession(false);
   var backup = JSON.stringify(device.raw.data || {});
   if (applyLocal) { applyLocal(); renderAll(); }
@@ -1028,10 +1362,115 @@ async function sendControl(device, action, value, applyLocal) {
     var fresh = parseDevice(device.raw);
     Object.keys(fresh).forEach(function (k) { device[k] = fresh[k]; });
     renderAll();
-    toast("Command failed for " + displayName(device), true);
+    if (!quiet) toast("Command failed for " + displayName(device), true);
     return false;
   }
   return true;
+}
+
+/* Optimistic local state for one fanned-out group command — the same
+   mutations the per-card do* functions apply. */
+function applyOptimistic(device, action, value) {
+  var data = device.raw.data || (device.raw.data = {});
+  if (action === "turnOnOff") {
+    device.state = !!value; data.state = device.state;
+  } else if (action === "brightnessSet") {
+    device.brightnessPct = value; data.brightness = value * 10;
+    device.state = true; data.state = true;
+  } else if (action === "colorTemperatureSet") {
+    device.tempSlider = value; data.color_temp = tempSliderToReported(value);
+    device.state = true; data.state = true;
+    device.colorMode = "white"; data.color_mode = "white";
+  } else if (action === "colorSet") {
+    device.hue = value.hue; device.saturation = value.saturation;
+    device.state = true; data.state = true;
+    device.colorMode = "colour"; data.color_mode = "colour";
+    data.hue = value.hue; data.saturation = value.saturation;
+  }
+}
+function sleepMs(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+/* Broadcast one group action to the section's members, sequentially
+   with a short delay (Tuya rate-limits bursts), then reconcile with a
+   refresh. A summary toast names any member that didn't respond. */
+async function runGroupAction(sec, kind, value) {
+  var full = fullSectionByKey(sec.key);
+  var members = full ? full.devices : sec.devices;
+  var plan = groupPlan(members, kind, value);
+  if (!plan.length) return;
+  var okCount = 0, failedNames = [];
+  for (var i = 0; i < plan.length; i++) {
+    var t = plan[i];
+    var dev = itemById(t.id);
+    if (!dev) continue;
+    var good = await sendControl(dev, t.action, t.value, (function (dv, a, v) {
+      return function () { applyOptimistic(dv, a, v); };
+    })(dev, t.action, t.value), true);
+    if (good) okCount++; else failedNames.push(displayName(dev));
+    if (i < plan.length - 1) await sleepMs(200);
+  }
+  if (failedNames.length) {
+    toast(sec.title + ": " + okCount + " of " + plan.length + " updated — " + failedNames.join(", ") + " didn't respond", true);
+  }
+  fetchDevices(true);
+}
+
+/* ---------------- Auto-update runtime ---------------- */
+function loadUpdateStore() { return slcGet("update", { lastCheck: 0, dismissed: "" }); }
+function saveUpdateStore(u) { slcSet("update", u); }
+
+function renderUpdateUi() {
+  var st = loadUpdateStore();
+  var info = S.updateInfo || null;
+  var newer = !!(info && isNewerVersion(info.version, APP_VERSION));
+  var banner = $("update-banner");
+  if (banner) {
+    if (newer && st.dismissed !== info.version) {
+      banner.classList.remove("hidden");
+      $("update-banner-text").textContent =
+        "Version " + info.version + " is available — you're on " + APP_VERSION + ".";
+      $("update-banner-dl").href = info.htmlUrl;
+    } else {
+      banner.classList.add("hidden");
+    }
+  }
+  var status = $("upd-status");
+  if (status) {
+    if (S.updateChecking) status.textContent = "Checking for updates…";
+    else if (S.updateError) status.textContent = S.updateError;
+    else if (newer) status.textContent = "Version " + info.version + " is available.";
+    else if (info) status.textContent = "You're up to date — " + info.version + " is the latest version.";
+    else status.textContent = "";
+  }
+  var dl = $("btn-download-update");
+  if (dl) {
+    if (newer) { dl.classList.remove("hidden"); dl.href = info.htmlUrl; }
+    else dl.classList.add("hidden");
+  }
+}
+
+async function checkForUpdate(manual) {
+  var st = loadUpdateStore();
+  st.lastCheck = Date.now();               /* attempt-based throttle */
+  saveUpdateStore(st);
+  S.updateChecking = true;
+  if (manual) S.updateError = null;
+  renderUpdateUi();
+  try {
+    var res = await fetch(RELEASES_API, { headers: { "Accept": "application/vnd.github+json" } });
+    var info = pickReleaseAssets(await res.json());
+    if (!info) throw new Error("unexpected response");
+    S.updateInfo = info;
+    S.updateError = null;
+    if (manual && !isNewerVersion(info.version, APP_VERSION)) {
+      toast("You're on the latest version");
+    }
+  } catch (e) {
+    /* Auto-checks fail silently; manual checks say so in the panel. */
+    if (manual) S.updateError = "Update check failed — check your connection and try again.";
+  }
+  S.updateChecking = false;
+  renderUpdateUi();
 }
 function doToggle(device) {
   var newVal = device.state ? 0 : 1;
@@ -1079,10 +1518,17 @@ function doColor(device, hex) {
 function isEditing() { return document.body.classList.contains("editing"); }
 
 function sectionsModel() {
-  return buildSections(filterDevices(S.devices, S.layout, S.query), S.layout, isEditing());
+  return buildSections(filterDevices(allItems(), S.layout, S.query), S.layout, isEditing());
 }
 function sectionByKey(key) {
   var secs = sectionsModel();
+  for (var i = 0; i < secs.length; i++) if (secs[i].key === key) return secs[i];
+  return null;
+}
+/* The section's full membership (ignoring the search filter) — group
+   controls always act on the whole section, not the filtered view. */
+function fullSectionByKey(key) {
+  var secs = buildSections(allItems(), S.layout, isEditing());
   for (var i = 0; i < secs.length; i++) if (secs[i].key === key) return secs[i];
   return null;
 }
@@ -1098,6 +1544,7 @@ function resetSectionOrder(sec) {
 }
 
 function statusText(d) {
+  if (d.isCamera) return cameraStatusText(d.cam);
   if (!d.online) return "Offline";
   var parts = [];
   if (d.isScene) return "Scene — tap Start to run";
@@ -1144,6 +1591,8 @@ function renderSection(sec) {
     saveLayout(); renderAll();
   });
   wrap.appendChild(head);
+  var gc = renderGroupControls(sec);
+  if (gc) wrap.appendChild(gc);
   if (!S.layout.collapsed[sec.key]) {
     var grid = el("div", "grid");
     grid.dataset.sectionKey = sec.key;
@@ -1158,6 +1607,86 @@ function renderSection(sec) {
     wrap.appendChild(grid);
   }
   return wrap;
+}
+
+/* Group-wide controls for the Lighting section and for user groups
+   containing at least one light: master toggle (any-on semantics),
+   average brightness / colour-temperature sliders, colour swatches +
+   picker. Everything broadcasts; nothing is stored. Pinned, Ungrouped,
+   Cameras and Scenes never get these. */
+function renderGroupControls(sec) {
+  if (sec.kind !== "lighting" && sec.kind !== "group") return null;
+  var full = fullSectionByKey(sec.key);
+  var members = full ? full.devices : sec.devices;
+  var devs = groupDeviceMembers(members);
+  var lights = devs.filter(function (d) { return isLightCapable(d); });
+  if (!lights.length) return null;
+  var box = el("div", "group-controls");
+  // master toggle — ON if any member is on; clicking turns all off then
+  var master = el("div", "gc-master");
+  master.appendChild(el("span", "gc-label", "All"));
+  var anyOn = groupMasterOn(members);
+  var sw = el("button", "switch");
+  sw.setAttribute("role", "switch");
+  sw.setAttribute("aria-checked", anyOn ? "true" : "false");
+  sw.setAttribute("aria-label", "Toggle all in " + sec.title);
+  sw.addEventListener("click", function () { runGroupAction(sec, "toggle"); });
+  master.appendChild(sw);
+  box.appendChild(master);
+  // brightness — average of capable members, broadcast on release
+  var bMembers = devs.filter(function (d) { return d.hasBrightness && d.brightnessPct !== null; });
+  if (bMembers.length) {
+    var avgB = groupAverage(bMembers, function (d) { return d.brightnessPct; });
+    var bs = sliderRow("Brightness", 11, 100, Math.max(11, Math.round(avgB)), function (v) { return Math.round(v) + "%"; });
+    bs.wrap.classList.add("gc-slider");
+    bindSlider(bs, function (v) { return Math.round(v) + "%"; }, function (v) { runGroupAction(sec, "brightness", v); });
+    box.appendChild(bs.wrap);
+  }
+  // colour temperature — same pattern
+  var tMembers = devs.filter(function (d) { return d.hasTemp && d.tempSlider !== null; });
+  if (tMembers.length) {
+    var avgT = groupAverage(tMembers, function (d) { return d.tempSlider; });
+    var ts = sliderRow("Colour temperature", 1000, 10000, Math.round(avgT / 50) * 50, function (v) { return tempSliderToKelvin(v) + "K"; });
+    ts.input.step = 50;
+    ts.wrap.classList.add("gc-slider");
+    bindSlider(ts, function (v) { return tempSliderToKelvin(v) + "K"; }, function (v) { runGroupAction(sec, "temp", v); });
+    box.appendChild(ts.wrap);
+  }
+  // colour — swatches + picker, broadcast to colour-capable members
+  var cMembers = devs.filter(function (d) { return d.hasColor; });
+  if (cMembers.length) {
+    var swWrap = el("div", null);
+    var swRow = el("div", "swatches");
+    SWATCHES.forEach(function (swd) {
+      var b = el("button", "swatch");
+      b.style.background = swd.hex; b.title = swd.name;
+      b.addEventListener("click", function () { runGroupAction(sec, "color", swd.hex); });
+      swRow.appendChild(b);
+    });
+    var gkey = "grp:" + sec.key;
+    var more = el("button", "swatch", "🎨");
+    more.title = "More colours…";
+    more.style.background = "conic-gradient(#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)";
+    more.addEventListener("click", function () {
+      S.openColorFor = (S.openColorFor === gkey) ? null : gkey;
+      renderAll();
+    });
+    swRow.appendChild(more);
+    swWrap.appendChild(swRow);
+    if (S.openColorFor === gkey) {
+      var panel = el("div", "color-panel");
+      var row = el("div", "row");
+      var picker = el("input", "picker");
+      picker.type = "color"; picker.value = "#ffffff";
+      var apply = el("button", "btn small primary", "Apply colour");
+      apply.addEventListener("click", function () { runGroupAction(sec, "color", picker.value); });
+      row.appendChild(picker); row.appendChild(apply);
+      panel.appendChild(row);
+      swWrap.appendChild(panel);
+    }
+    box.appendChild(swWrap);
+  }
+  return box;
 }
 
 function sliderRow(labelText, min, max, value, fmt) {
@@ -1211,6 +1740,8 @@ function renderCard(d, sec) {
     toast(displayName(d) + " hidden — bring it back from Settings");
   });
   card.appendChild(hideBtn);
+
+  if (d.isCamera) { fillCameraCard(card, d, sec); return card; }
 
   var top = el("div", "card-top");
   if (isEditing()) top.appendChild(el("span", "drag-handle", "⠿"));
@@ -1319,7 +1850,7 @@ function editTools(d, sec) {
   if (!d.isScene) {
     var r2 = el("div", "row");
     var sel = el("select");
-    var optU = el("option", null, "Ungrouped"); optU.value = ""; sel.appendChild(optU);
+    var optU = el("option", null, autoSectionLabel(d)); optU.value = ""; sel.appendChild(optU);
     S.layout.groups.forEach(function (g) {
       var o = el("option", null, g.name); o.value = g.id; sel.appendChild(o);
     });
@@ -1344,6 +1875,288 @@ function editTools(d, sec) {
   box.appendChild(r3);
   return box;
 }
+/* ---------------- Camera cards ---------------- */
+function fillCameraCard(card, d, sec) {
+  var cam = d.cam;
+  var top = el("div", "card-top");
+  if (isEditing()) top.appendChild(el("span", "drag-handle", "⠿"));
+  top.appendChild(el("div", "dev-icon", "📷"));
+  var meta = el("div", "dev-meta");
+  var nameRow = el("div", "dev-name");
+  nameRow.appendChild(document.createTextNode(displayName(d)));
+  meta.appendChild(nameRow);
+  var st = el("div", "dev-status");
+  st.appendChild(el("span", "dot"));
+  st.appendChild(document.createTextNode(statusText(d)));
+  meta.appendChild(st);
+  top.appendChild(meta);
+  var isPinned = S.layout.pins.indexOf(d.id) >= 0;
+  var pinBtn = el("button", "pin-btn" + (isPinned ? " pinned" : ""), "📌");
+  pinBtn.title = isPinned ? "Unpin (remove shortcut from the top)" : "Pin a shortcut to the top";
+  pinBtn.setAttribute("aria-label", pinBtn.title);
+  pinBtn.addEventListener("click", function () { togglePin(d.id); });
+  top.appendChild(pinBtn);
+  card.appendChild(top);
+
+  if (cam.template !== "custom") {
+    var seg = el("div", "seg");
+    [["tapo1", "Stream 1 · HD"], ["tapo2", "Stream 2 · SD"]].forEach(function (opt) {
+      var b = el("button", "btn small" + (cam.template === opt[0] ? " active" : ""), opt[1]);
+      b.title = opt[0] === "tapo1" ? "High quality (/stream1)" : "Standard quality (/stream2)";
+      b.addEventListener("click", function () {
+        cam.template = opt[0]; saveCameras(); renderAll();
+      });
+      seg.appendChild(b);
+    });
+    card.appendChild(seg);
+  }
+  var actions = el("div", "cam-actions");
+  var watch = el("button", "btn primary", "▶ Watch");
+  watch.addEventListener("click", function () { watchCamera(cam); });
+  var copy = el("button", "btn", "Copy URL");
+  copy.addEventListener("click", function () { copyStreamUrl(cam); });
+  actions.appendChild(watch); actions.appendChild(copy);
+  card.appendChild(actions);
+  if (isEditing()) card.appendChild(cameraEditTools(d, sec));
+}
+
+function cameraEditTools(d, sec) {
+  var box = el("div", "edit-tools");
+  var r1 = el("div", "row");
+  var edit = el("button", "btn small", "✎ Edit camera");
+  edit.addEventListener("click", function () { openCameraDialog(d.cam); });
+  var del = el("button", "btn small danger", "🗑 Delete");
+  del.addEventListener("click", function () {
+    if (confirm("Delete camera “" + displayName(d) + "”?")) deleteCamera(d.id);
+  });
+  r1.appendChild(edit); r1.appendChild(del);
+  box.appendChild(r1);
+  var r2 = el("div", "row");
+  var sel = el("select");
+  var optU = el("option", null, autoSectionLabel(d)); optU.value = ""; sel.appendChild(optU);
+  S.layout.groups.forEach(function (g) {
+    var o = el("option", null, g.name); o.value = g.id; sel.appendChild(o);
+  });
+  sel.value = S.layout.assign[d.id] || "";
+  sel.addEventListener("change", function () {
+    if (sel.value) S.layout.assign[d.id] = sel.value; else delete S.layout.assign[d.id];
+    saveLayout(); renderAll();
+  });
+  r2.appendChild(sel);
+  var pinned = S.layout.pins.indexOf(d.id) >= 0;
+  var pinBtn = el("button", "btn small", pinned ? "📌 Unpin" : "📌 Pin");
+  pinBtn.addEventListener("click", function () { togglePin(d.id); });
+  r2.appendChild(pinBtn);
+  box.appendChild(r2);
+  var r3 = el("div", "row");
+  var up = el("button", "btn small", "↑ Move up");
+  up.addEventListener("click", function () { moveWithinSection(d.id, sec, -1); });
+  var down = el("button", "btn small", "↓ Move down");
+  down.addEventListener("click", function () { moveWithinSection(d.id, sec, 1); });
+  r3.appendChild(up); r3.appendChild(down);
+  box.appendChild(r3);
+  return box;
+}
+
+function deleteCamera(id) {
+  S.cameras = (S.cameras || []).filter(function (c) { return c.id !== id; });
+  S.layout.pins = S.layout.pins.filter(function (x) { return x !== id; });
+  S.layout.hidden = S.layout.hidden.filter(function (x) { return x !== id; });
+  delete S.layout.assign[id];
+  delete S.layout.alias[id];
+  Object.keys(S.layout.sectionOrder).forEach(function (k) {
+    S.layout.sectionOrder[k] = S.layout.sectionOrder[k].filter(function (x) { return x !== id; });
+    if (!S.layout.sectionOrder[k].length) delete S.layout.sectionOrder[k];
+  });
+  saveCameras(); saveLayout(); renderAll();
+  toast("Camera deleted");
+}
+
+/* ---------------- Clipboard + modal ---------------- */
+function copyText(text, okMsg) {
+  function done() { toast(okMsg); }
+  function fallback() {
+    var ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); done(); }
+    catch (e) { toast("Copy failed — the address is: " + text, true); }
+    ta.remove();
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else fallback();
+}
+function copyStreamUrl(cam) {
+  copyText(buildRtspUrl(cam), "Stream URL copied for " + (cam.name || "camera"));
+}
+
+function modalEsc(ev) { if (ev.key === "Escape") closeModal(); }
+function closeModal() {
+  $("modal-root").innerHTML = "";
+  document.removeEventListener("keydown", modalEsc);
+}
+function openModal(build) {
+  var root = $("modal-root");
+  root.innerHTML = "";
+  var scrim = el("div", "modal-scrim");
+  var modal = el("div", "modal");
+  scrim.addEventListener("click", function (ev) { if (ev.target === scrim) closeModal(); });
+  scrim.appendChild(modal);
+  root.appendChild(scrim);
+  document.addEventListener("keydown", modalEsc);
+  build(modal);
+  return modal;
+}
+
+/* ---------------- Watch ---------------- */
+function watchCamera(cam) {
+  var rtsp = buildRtspUrl(cam);
+  var gwUrl = gatewayWatchUrl(cam, S.prefs);
+  openModal(function (modal) {
+    modal.appendChild(el("h3", null, "▶ " + (cam.name || "Camera")));
+    modal.appendChild(el("p", "sub", cameraStatusText(cam) + " · " + (cam.user || "") + "@" + (cam.host || "")));
+    if (gwUrl) {
+      modal.appendChild(el("p", "sub",
+        "Playing via your stream gateway (" + (S.prefs.gatewayType === "mediamtx" ? "MediaMTX" : "go2rtc") +
+        "). If the picture stays black, check the gateway has a stream named exactly “" + (cam.name || "") + "”."));
+      if (S.prefs.gatewayType === "mediamtx") {
+        var v = document.createElement("video");
+        v.controls = true; v.autoplay = true; v.muted = true; v.playsInline = true;
+        v.src = gwUrl;
+        modal.appendChild(v);
+        var note = el("p", "sub", "HLS plays natively in Safari; in other browsers, open the gateway page or use an external player.");
+        note.style.margin = "10px 0 0";
+        modal.appendChild(note);
+      } else {
+        var f = document.createElement("iframe");
+        f.className = "player";
+        f.src = gwUrl;
+        f.setAttribute("allow", "autoplay; fullscreen; picture-in-picture");
+        modal.appendChild(f);
+      }
+    } else {
+      modal.appendChild(el("p", "sub",
+        "Browsers can't play rtsp:// streams directly, so this hands the stream to a player app " +
+        "installed on your device (such as VLC). If nothing opens, copy the address and paste it into " +
+        "VLC → Media → Open Network Stream. To watch right here instead, set up a stream gateway " +
+        "(go2rtc / MediaMTX) in Settings → Stream gateway & cameras."));
+      var fwrap = el("div", "field");
+      var urlIn = el("input"); urlIn.type = "text"; urlIn.readOnly = true; urlIn.value = rtsp;
+      urlIn.addEventListener("click", function () { urlIn.select(); });
+      fwrap.appendChild(urlIn);
+      modal.appendChild(fwrap);
+    }
+    var actions = el("div", "actions");
+    if (gwUrl) {
+      var openGw = el("a", "btn", "Open gateway page ↗");
+      openGw.href = gwUrl; openGw.target = "_blank"; openGw.rel = "noopener";
+      actions.appendChild(openGw);
+    } else {
+      var openA = el("a", "btn primary", "▶ Open in player app");
+      openA.href = rtsp;
+      actions.appendChild(openA);
+    }
+    var copy = el("button", "btn", "Copy RTSP URL");
+    copy.addEventListener("click", function () { copyText(rtsp, "Stream URL copied"); });
+    actions.appendChild(copy);
+    actions.appendChild(el("span", "spacer"));
+    var close = el("button", "btn", "Close");
+    close.addEventListener("click", closeModal);
+    actions.appendChild(close);
+    modal.appendChild(actions);
+  });
+}
+
+/* ---------------- Add / edit camera ---------------- */
+function openCameraDialog(existing) {
+  var cam = existing || null;
+  openModal(function (modal) {
+    modal.appendChild(el("h3", null, cam ? "Edit camera" : "Add camera"));
+    modal.appendChild(el("p", "sub",
+      "For Tapo cameras, the username and password are the Camera Account from the Tapo app " +
+      "(camera Settings → Advanced Settings → Camera Account, with RTSP enabled) — " +
+      "not your TP-Link cloud account."));
+    var err = el("div", "login-error hidden");
+    modal.appendChild(err);
+    function field(labelText, input) {
+      var f = el("div", "field");
+      f.appendChild(el("label", null, labelText));
+      f.appendChild(input);
+      modal.appendChild(f);
+      return input;
+    }
+    function textIn(val, ph) {
+      var i = el("input"); i.type = "text"; i.value = val || "";
+      if (ph) i.placeholder = ph;
+      return i;
+    }
+    var nameI = field("Camera name", textIn(cam ? cam.name : "", "e.g. Front Door"));
+    var userI = field("Username (camera account)", textIn(cam ? cam.user : ""));
+    var passI = el("input"); passI.type = "password";
+    passI.value = cam ? deobfuscate(cam.pass || "") : "";
+    field("Password (camera account)", passI);
+    var hostI = field("IP address / host", textIn(cam ? cam.host : "", "e.g. 192.168.1.50"));
+    var portI = field("Port", textIn(cam ? String(cam.port || 554) : "554"));
+    var tplSel = el("select");
+    Object.keys(CAM_TEMPLATES).forEach(function (k) {
+      var o = el("option", null, CAM_TEMPLATES[k].label); o.value = k; tplSel.appendChild(o);
+    });
+    tplSel.value = cam ? cam.template : "tapo1";
+    field("Template", tplSel);
+    var pathWrap = el("div", "field");
+    pathWrap.appendChild(el("label", null, "Stream path"));
+    var pathI = el("input"); pathI.type = "text";
+    pathI.value = cam ? (cam.path || "") : ""; pathI.placeholder = "/stream1";
+    pathWrap.appendChild(pathI);
+    modal.appendChild(pathWrap);
+    function syncTpl() { pathWrap.classList.toggle("hidden", tplSel.value !== "custom"); }
+    tplSel.addEventListener("change", syncTpl);
+    syncTpl();
+
+    var actions = el("div", "actions");
+    if (cam) {
+      var del = el("button", "btn danger", "🗑 Delete");
+      del.addEventListener("click", function () {
+        if (confirm("Delete camera “" + cam.name + "”?")) { closeModal(); deleteCamera(cam.id); }
+      });
+      actions.appendChild(del);
+    }
+    actions.appendChild(el("span", "spacer"));
+    var cancel = el("button", "btn", "Cancel");
+    cancel.addEventListener("click", closeModal);
+    var save = el("button", "btn primary", cam ? "Save changes" : "Add camera");
+    save.addEventListener("click", function () {
+      var name = nameI.value.trim(), host = hostI.value.trim();
+      if (!name || !host) {
+        err.textContent = "Give the camera a name and an IP address / host.";
+        err.classList.remove("hidden");
+        return;
+      }
+      var rec = {
+        id: cam ? cam.id : ("cam:" + Date.now().toString(36)),
+        name: name,
+        user: userI.value.trim(),
+        pass: obfuscate(passI.value),
+        host: host,
+        port: parseInt(portI.value, 10) || 554,
+        template: tplSel.value,
+        path: pathI.value.trim()
+      };
+      if (cam) {
+        var i = S.cameras.indexOf(cam);
+        if (i >= 0) S.cameras[i] = rec; else S.cameras.push(rec);
+      } else {
+        S.cameras.push(rec);
+      }
+      saveCameras(); closeModal(); renderAll();
+      toast(cam ? "Camera saved" : "Camera added — it's in the Cameras section (pin it with 📌)");
+    });
+    actions.appendChild(cancel); actions.appendChild(save);
+    modal.appendChild(actions);
+  });
+}
+
 function moveWithinSection(id, sec, dir) {
   if (!sec) return;
   var ids = sec.devices.map(function (d) { return d.id; });
@@ -1354,14 +2167,14 @@ function moveWithinSection(id, sec, dir) {
   renderAll();
 }
 function dropDevice(dragId, beforeId, targetSection) {
-  var dragDev = deviceById(dragId);
+  var dragDev = itemById(dragId);
   S.dragId = null;
   if (!dragDev || !targetSection) { renderAll(); return; }
   /* Scenes live only in the Scenes section; devices never enter it. */
   if (dragDev.isScene !== (targetSection.kind === "scenes")) { renderAll(); return; }
   if (!dragDev.isScene) {
     if (targetSection.kind === "group") S.layout.assign[dragId] = targetSection.groupId;
-    else if (targetSection.kind === "ungrouped") delete S.layout.assign[dragId];
+    else if (targetSection.kind === "ungrouped" || targetSection.kind === "lighting" || targetSection.kind === "cameras") delete S.layout.assign[dragId];
     else if (targetSection.kind === "pinned" && S.layout.pins.indexOf(dragId) < 0) S.layout.pins.push(dragId);
   }
   if (beforeId && beforeId !== dragId) {
@@ -1536,6 +2349,8 @@ function applyPrefs() {
 function renderSettings() {
   applyPrefs();
   syncProxyUI();
+  $("set-gw-url").value = S.prefs.gatewayUrl;
+  $("set-gw-type").value = S.prefs.gatewayType;
   var creds = loadCreds();
   $("saved-login-info").textContent = creds
     ? "A login is saved for " + creds.userName + " in this browser (used for silent re-login when the session expires)."
@@ -1547,7 +2362,7 @@ function renderSettings() {
     return;
   }
   S.layout.hidden.forEach(function (id) {
-    var d = deviceById(id);
+    var d = itemById(id);
     var row = el("div", "hidden-item");
     row.appendChild(el("span", "grow", d ? displayName(d) : id));
     var btn = el("button", "btn small", "Unhide");
@@ -1568,7 +2383,7 @@ function setEditing(on) {
   renderAll();
 }
 function init() {
-  loadPrefs(); loadLayout();
+  loadPrefs(); loadLayout(); loadCameras();
   fillProxySelect($("li-proxy-preset"));
   fillProxySelect($("set-proxy-preset"));
   bindProxyUI("li"); bindProxyUI("set");
@@ -1595,9 +2410,31 @@ function init() {
   $("btn-edit").addEventListener("click", function () { setEditing(!isEditing()); });
   $("btn-doneedit").addEventListener("click", function () { setEditing(false); });
   $("btn-addgroup").addEventListener("click", addGroup);
+  $("btn-addcamera").addEventListener("click", function () { openCameraDialog(null); });
+  $("set-gw-url").addEventListener("change", function (ev) {
+    S.prefs.gatewayUrl = ev.target.value.trim(); savePrefs();
+  });
+  $("set-gw-type").addEventListener("change", function (ev) {
+    S.prefs.gatewayType = ev.target.value; savePrefs();
+  });
   $("btn-settings").addEventListener("click", showSettings);
   $("btn-back").addEventListener("click", function () { showApp(); renderAll(); });
   $("set-theme").addEventListener("change", function (ev) { S.prefs.theme = ev.target.value; savePrefs(); applyPrefs(); });
+  /* App updates: version stamp, manual check, banner dismissal, and
+     the throttled silent launch check. */
+  $("upd-current").textContent = APP_VERSION;
+  $("btn-check-update").addEventListener("click", function () { checkForUpdate(true); });
+  $("update-banner-dismiss").addEventListener("click", function () {
+    if (S.updateInfo) {
+      var st = loadUpdateStore();
+      st.dismissed = S.updateInfo.version;
+      saveUpdateStore(st);
+    }
+    renderUpdateUi();
+  });
+  renderUpdateUi();
+  var updSt = loadUpdateStore();
+  if (Date.now() - (updSt.lastCheck || 0) >= UPDATE_PERIOD_MS) checkForUpdate(false);
   $("set-density").addEventListener("change", function (ev) { S.prefs.density = ev.target.value; savePrefs(); applyPrefs(); });
   $("btn-forget").addEventListener("click", function () {
     clearSavedLogin(); renderSettings(); toast("Saved login forgotten");
