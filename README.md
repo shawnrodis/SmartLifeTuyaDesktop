@@ -19,6 +19,18 @@ Both sign in to Tuya's cloud with the same account you use in the Smart Life
 approach as the classic Smart Life web dashboards, with the tidy,
 customisable interface they always deserved.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/battlestation.jpg" alt="SmartLife & Tuya Desktop running on a second monitor at a real desk setup" width="880">
+  <br><em>On duty at a real desk — the dashboard lives on the second monitor. (Camera feed and a few details blurred for privacy.)</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshot-dashboard.jpg" alt="The SmartLife & Tuya Desktop dashboard: Cameras, Lighting with group controls, and device cards" width="640">
+  <br><em>The dashboard itself — Cameras, the Lighting section with group-wide controls, and the device cards. (Camera feed blurred for privacy.)</em>
+</p>
+
 ## Download (Windows)
 
 Grab `SmartLifeTuyaDesktop-Setup-v1.2.1.exe` from
