@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,9 +56,22 @@ const LIGHT: Palette = Palette {
     faint: Color32::from_rgb(0x8b, 0x94, 0xa7),
     track: Color32::from_rgb(0xdb, 0xe1, 0xec),
 };
+/// "Black" theme — true-black background for OLED screens; near-black
+/// cards and subtle borders, same text/accent system as Dark.
+const BLACK: Palette = Palette {
+    bg: Color32::from_rgb(0x00, 0x00, 0x00),
+    card: Color32::from_rgb(0x0c, 0x0d, 0x11),
+    border: Color32::from_rgb(0x1f, 0x23, 0x2e),
+    text: Color32::from_rgb(0xe7, 0xeb, 0xf2),
+    dim: Color32::from_rgb(0x8b, 0x94, 0xa7),
+    faint: Color32::from_rgb(0x5b, 0x64, 0x78),
+    track: Color32::from_rgb(0x22, 0x25, 0x2e),
+};
 const DANGER: Color32 = Color32::from_rgb(0xf4, 0x3f, 0x5e);
 const OK_GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
 const TOAST_BG_DARK: Color32 = Color32::from_rgb(0x1e, 0x25, 0x34);
+const TOAST_BG_BLACK: Color32 = Color32::from_rgb(0x14, 0x16, 0x1c);
+const TOAST_BORDER_BLACK: Color32 = Color32::from_rgb(0x26, 0x2a, 0x35);
 const TOAST_BG_LIGHT: Color32 = Color32::from_rgb(0x17, 0x20, 0x2e);
 const TOAST_BORDER: Color32 = Color32::from_rgb(0x33, 0x3f, 0x58);
 const ERR_BG: Color32 = Color32::from_rgb(0x4c, 0x11, 0x20);
@@ -103,6 +117,7 @@ fn type_icon(kind: &str) -> &'static str {
         "fan" => "🌀",
         "lock" => "🔒",
         "sensor" => "📡",
+        "camera" => "📷",
         _ => "🔘",
     }
 }
@@ -145,6 +160,35 @@ struct Group {
     name: String,
 }
 
+/// A user-added RTSP camera (e.g. Tapo). Cameras are NOT Tuya devices,
+/// but on the dashboard they are peers of devices: same sections, name
+/// sort / custom order, pinning, groups and hiding.
+#[derive(Clone, Serialize, Deserialize)]
+struct Camera {
+    id: String,
+    name: String,
+    user: String,
+    /// Stored obfuscated (XOR + base64), exactly like the account password.
+    password: String,
+    host: String,
+    #[serde(default = "default_rtsp_port")]
+    port: u16,
+    /// "tapo1" | "tapo2" | "custom"
+    template: String,
+    #[serde(default)]
+    path: String,
+}
+
+fn default_rtsp_port() -> u16 {
+    554
+}
+
+const CAMERA_TEMPLATES: [(&str, &str); 3] = [
+    ("tapo1", "Tapo Stream 1 — High Quality"),
+    ("tapo2", "Tapo Stream 2 — Standard"),
+    ("custom", "Custom path"),
+];
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct LayoutCfg {
     #[serde(default)]
@@ -172,6 +216,23 @@ struct Prefs {
     interval: u64,
     proxy_preset: String,
     proxy_custom: String,
+    /// Stream gateway base URL for in-app camera playback ("" = none).
+    #[serde(default)]
+    gateway_url: String,
+    /// "go2rtc" | "mediamtx"
+    #[serde(default = "default_gateway_type")]
+    gateway_type: String,
+    /// External player command for ▶ Watch when no gateway is set.
+    #[serde(default = "default_player_cmd")]
+    player_cmd: String,
+}
+
+fn default_gateway_type() -> String {
+    "go2rtc".to_string()
+}
+
+fn default_player_cmd() -> String {
+    "vlc".to_string()
 }
 
 impl Default for Prefs {
@@ -184,6 +245,9 @@ impl Default for Prefs {
             interval: 30,
             proxy_preset: "auto".into(),
             proxy_custom: String::new(),
+            gateway_url: String::new(),
+            gateway_type: default_gateway_type(),
+            player_cmd: default_player_cmd(),
         }
     }
 }
@@ -199,7 +263,20 @@ struct Config {
     #[serde(default)]
     layout: LayoutCfg,
     #[serde(default)]
+    cameras: Vec<Camera>,
+    #[serde(default)]
+    update: UpdateCfg,
+    #[serde(default)]
     cache_devices: Option<Value>,
+}
+
+/// Auto-update bookkeeping (mirrors the web edition's slc_update).
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct UpdateCfg {
+    #[serde(default)]
+    last_check_ms: i64,
+    #[serde(default)]
+    dismissed: String,
 }
 
 fn config_path() -> PathBuf {
@@ -465,6 +542,125 @@ fn norm_saturation(s: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Cameras — RTSP URL building + playback hand-off (mirror the web edition)
+// ---------------------------------------------------------------------------
+
+/// Percent-encode one URL component with JavaScript `encodeURIComponent`
+/// semantics, so both editions build byte-identical stream URLs.
+fn pct_encode_component(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*'
+            | b'\'' | b'(' | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn camera_path(cam: &Camera) -> String {
+    if cam.template == "custom" {
+        let p = cam.path.trim();
+        if p.is_empty() {
+            return "/".to_string();
+        }
+        if p.starts_with('/') {
+            p.to_string()
+        } else {
+            format!("/{}", p)
+        }
+    } else if cam.template == "tapo2" {
+        "/stream2".to_string()
+    } else {
+        "/stream1".to_string()
+    }
+}
+
+/// rtsp://user:pass@host:port/path — credentials percent-encoded so
+/// passwords containing @ : / # etc. survive. The stored password is
+/// obfuscated; it is deobfuscated here.
+fn build_rtsp_url(cam: &Camera) -> String {
+    let port = if cam.port == 0 { 554 } else { cam.port };
+    format!(
+        "rtsp://{}:{}@{}:{}{}",
+        pct_encode_component(&cam.user),
+        pct_encode_component(&deobfuscate(&cam.password)),
+        cam.host.trim(),
+        port,
+        camera_path(cam)
+    )
+}
+
+/// In-browser watch URL for a configured stream gateway, or None.
+/// The gateway stream must be named exactly like the camera here.
+/// go2rtc: {gw}/stream.html?src={name} · MediaMTX: {gw}/{name}/index.m3u8
+fn gateway_watch_url(cam: &Camera, prefs: &Prefs) -> Option<String> {
+    let gw = prefs.gateway_url.trim().trim_end_matches('/');
+    if gw.is_empty() {
+        return None;
+    }
+    let name = pct_encode_component(&cam.name);
+    if prefs.gateway_type == "mediamtx" {
+        Some(format!("{}/{}/index.m3u8", gw, name))
+    } else {
+        Some(format!("{}/stream.html?src={}", gw, name))
+    }
+}
+
+fn camera_status_text(cam: &Camera) -> String {
+    let port = if cam.port == 0 { 554 } else { cam.port };
+    let q = if cam.template == "custom" {
+        camera_path(cam)
+    } else if cam.template == "tapo2" {
+        "Stream 2 · Standard".to_string()
+    } else {
+        "Stream 1 · High".to_string()
+    };
+    format!("{}:{} · {}", cam.host, port, q)
+}
+
+#[cfg(target_os = "windows")]
+fn open_command(url: &str) -> Command {
+    let mut c = Command::new("cmd");
+    c.args(["/C", "start", "", url]);
+    c
+}
+#[cfg(target_os = "macos")]
+fn open_command(url: &str) -> Command {
+    let mut c = Command::new("open");
+    c.arg(url);
+    c
+}
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn open_command(url: &str) -> Command {
+    let mut c = Command::new("xdg-open");
+    c.arg(url);
+    c
+}
+
+/// Open a URL in the default browser (gateway watch page / releases page).
+fn open_external(url: &str) -> Result<(), String> {
+    open_command(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{}", e))
+}
+
+/// Launch the configured external player with the stream URL.
+/// Returns the program name on success.
+fn launch_player(player_cmd: &str, url: &str) -> Result<String, String> {
+    let mut parts = player_cmd.split_whitespace();
+    let prog = parts.next().unwrap_or("vlc").to_string();
+    Command::new(&prog)
+        .args(parts)
+        .arg(url)
+        .spawn()
+        .map(|_| prog.clone())
+        .map_err(|e| format!("{}: {}", prog, e))
+}
+
+// ---------------------------------------------------------------------------
 // Device model (port of the web edition's parseDevice)
 // ---------------------------------------------------------------------------
 
@@ -620,22 +816,45 @@ struct Section {
     ids: Vec<String>,
 }
 
+/// One dashboard card's identity for the section model — a Tuya device
+/// or a user-added camera. Sections, ordering and search work on entries;
+/// rendering looks the full record up by id.
+#[derive(Clone)]
+struct CardEntry {
+    id: String,
+    name: String,
+    is_scene: bool,
+}
+
+fn device_entry(d: &Device) -> CardEntry {
+    CardEntry { id: d.id.clone(), name: d.name.clone(), is_scene: d.is_scene }
+}
+
+fn camera_entry(c: &Camera) -> CardEntry {
+    CardEntry { id: c.id.clone(), name: c.name.clone(), is_scene: false }
+}
+
+/// Display name of a device (alias wins) — used for card titles.
 fn display_name(layout: &LayoutCfg, d: &Device) -> String {
     layout.alias.get(&d.id).cloned().unwrap_or_else(|| d.name.clone())
 }
 
-fn compare_by_name(layout: &LayoutCfg, a: &Device, b: &Device) -> std::cmp::Ordering {
-    let na = display_name(layout, a).to_lowercase();
-    let nb = display_name(layout, b).to_lowercase();
+fn entry_display_name(layout: &LayoutCfg, e: &CardEntry) -> String {
+    layout.alias.get(&e.id).cloned().unwrap_or_else(|| e.name.clone())
+}
+
+fn compare_by_name(layout: &LayoutCfg, a: &CardEntry, b: &CardEntry) -> std::cmp::Ordering {
+    let na = entry_display_name(layout, a).to_lowercase();
+    let nb = entry_display_name(layout, b).to_lowercase();
     na.cmp(&nb).then_with(|| a.id.cmp(&b.id))
 }
 
 fn order_section_items(
-    items: &[&Device],
+    items: &[&CardEntry],
     custom_order: Option<&Vec<String>>,
     layout: &LayoutCfg,
 ) -> Vec<String> {
-    let by_id: HashMap<&str, &Device> = items.iter().map(|d| (d.id.as_str(), *d)).collect();
+    let by_id: HashMap<&str, &CardEntry> = items.iter().map(|d| (d.id.as_str(), *d)).collect();
     let mut used: HashSet<&str> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
     if let Some(order) = custom_order {
@@ -645,42 +864,42 @@ fn order_section_items(
             }
         }
     }
-    let mut rest: Vec<&Device> = items.iter().filter(|d| !used.contains(d.id.as_str())).cloned().collect();
+    let mut rest: Vec<&CardEntry> = items.iter().filter(|d| !used.contains(d.id.as_str())).cloned().collect();
     rest.sort_by(|a, b| compare_by_name(layout, a, b));
     out.extend(rest.iter().map(|d| d.id.clone()));
     out
 }
 
-fn filter_devices<'a>(devices: &'a [Device], layout: &LayoutCfg, query: &str) -> Vec<&'a Device> {
+fn filter_entries<'a>(entries: &'a [CardEntry], layout: &LayoutCfg, query: &str) -> Vec<&'a CardEntry> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
-        return devices.iter().collect();
+        return entries.iter().collect();
     }
-    devices
+    entries
         .iter()
         .filter(|d| {
-            display_name(layout, d).to_lowercase().contains(&q) || d.name.to_lowercase().contains(&q)
+            entry_display_name(layout, d).to_lowercase().contains(&q) || d.name.to_lowercase().contains(&q)
         })
         .collect()
 }
 
 fn build_sections(
-    devices: &[Device],
+    entries: &[CardEntry],
     layout: &LayoutCfg,
     editing: bool,
     query: &str,
 ) -> Vec<Section> {
-    let visible: Vec<&Device> = filter_devices(devices, layout, query)
+    let visible: Vec<&CardEntry> = filter_entries(entries, layout, query)
         .into_iter()
         .filter(|d| !layout.hidden.contains(&d.id))
         .collect();
-    let scenes: Vec<&Device> = visible.iter().filter(|d| d.is_scene).cloned().collect();
-    let normal: Vec<&Device> = visible.iter().filter(|d| !d.is_scene).cloned().collect();
+    let scenes: Vec<&CardEntry> = visible.iter().filter(|d| d.is_scene).cloned().collect();
+    let normal: Vec<&CardEntry> = visible.iter().filter(|d| !d.is_scene).cloned().collect();
     let pin_set: HashSet<&str> = layout.pins.iter().map(|s| s.as_str()).collect();
     let so = &layout.section_order;
     let mut sections: Vec<Section> = Vec::new();
 
-    let pinned: Vec<&Device> = normal.iter().filter(|d| pin_set.contains(d.id.as_str())).cloned().collect();
+    let pinned: Vec<&CardEntry> = normal.iter().filter(|d| pin_set.contains(d.id.as_str())).cloned().collect();
     if !pinned.is_empty() {
         sections.push(Section {
             key: "pinned".into(),
@@ -692,7 +911,7 @@ fn build_sections(
         });
     }
     for g in &layout.groups {
-        let devs: Vec<&Device> = normal
+        let devs: Vec<&CardEntry> = normal
             .iter()
             .filter(|d| layout.assign.get(&d.id) == Some(&g.id))
             .cloned()
@@ -708,7 +927,7 @@ fn build_sections(
         });
     }
     let group_ids: HashSet<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
-    let ungrouped: Vec<&Device> = normal
+    let ungrouped: Vec<&CardEntry> = normal
         .iter()
         .filter(|d| match layout.assign.get(&d.id) {
             Some(g) => !group_ids.contains(g.as_str()),
@@ -750,6 +969,82 @@ enum NetResult {
     DiscFrequent { session: Session },
     DiscErr(String),
     ControlDone { id: String, ok: bool, backup: String, announce: bool },
+    UpdateChecked { manual: bool, result: Result<ReleaseInfo, String> },
+    UpdateProgress { got: u64, total: u64 },
+    UpdateDownloaded { result: Result<std::path::PathBuf, String> },
+}
+
+// ---------------------------------------------------------------------------
+// Auto-update (workstream C) — both editions check the project's GitHub
+// "latest release" at most once per 24 h (attempt-based) and compare
+// versions numerically. This edition can go further than the web page:
+// it downloads the Setup .exe, verifies its name, runs it, and exits so
+// the per-user installer can replace the running app.
+// ---------------------------------------------------------------------------
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASES_API: &str =
+    "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
+const RELEASES_PAGE: &str =
+    "https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
+const UPDATE_PERIOD_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn expected_installer_name(version: &str) -> String {
+    format!("SmartLifeTuyaDesktop-Setup-v{}.exe", version)
+}
+
+fn parse_version(s: &str) -> Vec<u64> {
+    s.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
+}
+
+/// True when `latest` is a strictly newer X.Y.Z than `current`
+/// (numeric: 1.10.0 > 1.9.0).
+fn version_newer(latest: &str, current: &str) -> bool {
+    let a = parse_version(latest);
+    let b = parse_version(current);
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+#[derive(Clone)]
+struct ReleaseInfo {
+    version: String,
+    page_url: String,
+    exe_name: String,
+    exe_url: String,
+    exe_size: u64,
+}
+
+/// Pull the installer asset out of a GitHub "latest release" response.
+fn parse_release(v: &Value) -> Option<ReleaseInfo> {
+    let tag = v.get("tag_name")?.as_str()?;
+    let version = tag.trim_start_matches('v').to_string();
+    let page_url = v.get("html_url")?.as_str()?.to_string();
+    let assets = v.get("assets")?.as_array()?;
+    let exe = assets.iter().find(|a| {
+        a.get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| n.starts_with("SmartLifeTuyaDesktop-Setup-") && n.ends_with(".exe"))
+            .unwrap_or(false)
+    })?;
+    Some(ReleaseInfo {
+        version,
+        page_url,
+        exe_name: exe.get("name")?.as_str()?.to_string(),
+        exe_url: exe.get("browser_download_url")?.as_str()?.to_string(),
+        exe_size: exe.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+    })
 }
 
 fn http_client() -> reqwest::blocking::Client {
@@ -1103,10 +1398,91 @@ struct App {
     new_group: Option<String>,
     toasts: Vec<Toast>,
     applied_style: Option<(String, String, String)>,
+    // cameras
+    cam_form: Option<CameraForm>,
+    // auto-update
+    update_checking: bool,
+    update_info: Option<ReleaseInfo>,
+    update_error: Option<String>,
+    update_dl: Option<(u64, u64)>,
+    update_launch: Option<std::path::PathBuf>,
+    // dashboard grid (workstream B): measured row heights per signature
+    row_heights: HashMap<String, f32>,
+    // drag & drop (workstream D): cell geometry + sections from the last
+    // rendered frame, and the in-flight drag
+    cell_rects: Vec<(String, Option<String>, egui::Rect)>,
+    section_rects: Vec<(String, egui::Rect)>,
+    sections_cache: Vec<Section>,
+    drag: Option<DragState>,
+}
+
+/// State of the Add/Edit camera dialog (Rust edition of the web modal).
+struct CameraForm {
+    id: Option<String>,
+    name: String,
+    user: String,
+    pass: String,
+    host: String,
+    port: String,
+    template: String,
+    path: String,
+    error: Option<String>,
+}
+
+/// An in-flight card drag (Edit mode). The dragged card is hidden from
+/// every section's display list; `target` is (section key, insertion
+/// index into that section's list with the dragged card removed).
+/// Glyph coverage (workstream E): egui's bundled fonts (Ubuntu Light +
+/// a Noto Emoji subset) leave many symbols as tofu boxes — ⚙, ←/↑/↓,
+/// ✕, ↺, ⠿, ★… The app therefore embeds three open-licensed outline
+/// fonts as fallbacks (assets/fonts/): DejaVu Sans (arrows, geometric
+/// shapes, braille grips), Noto Sans Symbols and Noto Sans Symbols 2
+/// (⚙ and the newer pictographs egui's emoji subset misses). Every
+/// non-ASCII glyph used by the UI was audited against the union of
+/// these cmaps with fontTools; the only uncovered one — the fullwidth
+/// plus U+FF0B — was swapped for a plain "+".
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "dejavu".to_string(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/DejaVuSans.ttf")),
+    );
+    fonts.font_data.insert(
+        "noto-symbols".to_string(),
+        egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoSansSymbols-Regular.ttf"
+        )),
+    );
+    fonts.font_data.insert(
+        "noto-symbols2".to_string(),
+        egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoSansSymbols2-Regular.ttf"
+        )),
+    );
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(fam).or_default();
+        for name in ["dejavu", "noto-symbols", "noto-symbols2"] {
+            list.push(name.to_string());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// An in-flight card drag (Edit mode): the dragged card's id, the
+/// section it started in, its size and the pointer's grab offset, and
+/// the current insertion target.
+struct DragState {
+    id: String,
+    is_scene: bool,
+    from_section: String,
+    size: egui::Vec2,
+    grab_offset: egui::Vec2,
+    target: Option<(String, usize)>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_fonts(&cc.egui_ctx);
         let cfg = load_config();
         let (tx, rx) = channel::<NetResult>();
         let mut app = App {
@@ -1136,6 +1512,17 @@ impl App {
             group_buf: HashMap::new(),
             new_group: None,
             toasts: Vec::new(),
+            cam_form: None,
+            update_checking: false,
+            update_info: None,
+            update_error: None,
+            update_dl: None,
+            update_launch: None,
+            row_heights: HashMap::new(),
+            cell_rects: Vec::new(),
+            section_rects: Vec::new(),
+            sections_cache: Vec::new(),
+            drag: None,
             applied_style: None,
             view: View::Login,
             cfg: Config::default(),
@@ -1151,6 +1538,11 @@ impl App {
         let saved_session = cfg.session.clone();
         app.cfg = cfg;
         app.apply_style(&cc.egui_ctx);
+        // Silent auto-update check, throttled to once per 24 h
+        // (attempt-based, like the web edition).
+        if now_ms() - app.cfg.update.last_check_ms >= UPDATE_PERIOD_MS {
+            app.spawn_update_check(false);
+        }
         // Restore: fresh saved session → dashboard; else saved creds → silent login.
         if let Some(s) = saved_session {
             if now_ms() < s.expires_at_ms - 60_000 {
@@ -1172,10 +1564,10 @@ impl App {
     }
 
     fn pal(&self) -> Palette {
-        if self.cfg.prefs.theme == "light" {
-            LIGHT
-        } else {
-            DARK
+        match self.cfg.prefs.theme.as_str() {
+            "light" => LIGHT,
+            "black" => BLACK,
+            _ => DARK,
         }
     }
     fn accent(&self) -> Color32 {
@@ -1326,6 +1718,87 @@ impl App {
         });
     }
 
+    // ---------------- auto-update ----------------
+
+    fn spawn_update_check(&mut self, manual: bool) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        if manual {
+            self.update_error = None;
+        }
+        // Attempt-based throttle: record the attempt before the call.
+        self.cfg.update.last_check_ms = now_ms();
+        self.save();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result: Result<ReleaseInfo, String> = (|| {
+                let resp = http_client()
+                    .get(RELEASES_API)
+                    .header(
+                        "User-Agent",
+                        concat!("SmartLifeTuyaDesktop/", env!("CARGO_PKG_VERSION")),
+                    )
+                    .header("Accept", "application/vnd.github+json")
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                let v: Value = resp.json().map_err(|e| e.to_string())?;
+                parse_release(&v).ok_or_else(|| "Unexpected response from GitHub".to_string())
+            })();
+            let _ = tx.send(NetResult::UpdateChecked { manual, result });
+        });
+    }
+
+    fn spawn_update_download(&mut self) {
+        let Some(info) = self.update_info.clone() else { return };
+        if self.update_dl.is_some() {
+            return;
+        }
+        // Verify BEFORE downloading that the asset is exactly the
+        // installer this release is supposed to ship.
+        if info.exe_name != expected_installer_name(&info.version) {
+            self.update_error = Some(format!(
+                "Unexpected installer name “{}” — refusing to download it. Use the releases page instead.",
+                info.exe_name
+            ));
+            return;
+        }
+        self.update_error = None;
+        self.update_dl = Some((0, info.exe_size));
+        let tx = self.tx.clone();
+        let url = info.exe_url.clone();
+        let name = info.exe_name.clone();
+        std::thread::spawn(move || {
+            let result: Result<std::path::PathBuf, String> = (|| {
+                let mut resp = http_client()
+                    .get(&url)
+                    .header(
+                        "User-Agent",
+                        concat!("SmartLifeTuyaDesktop/", env!("CARGO_PKG_VERSION")),
+                    )
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                let total = resp.content_length().unwrap_or(0);
+                let path = std::env::temp_dir().join(&name);
+                let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                let mut got: u64 = 0;
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = std::io::Read::read(&mut resp, &mut buf).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| e.to_string())?;
+                    got += n as u64;
+                    let _ = tx.send(NetResult::UpdateProgress { got, total });
+                }
+                Ok(path)
+            })();
+            let _ = tx.send(NetResult::UpdateDownloaded { result });
+        });
+    }
+
     // ---------------- device state ----------------
 
     fn set_devices(&mut self, raw: Vec<Value>, persist: bool) {
@@ -1344,7 +1817,8 @@ impl App {
     }
 
     fn prune_layout(&mut self) {
-        let ids: HashSet<&str> = self.devices.iter().map(|d| d.id.as_str()).collect();
+        let mut ids: HashSet<&str> = self.devices.iter().map(|d| d.id.as_str()).collect();
+        ids.extend(self.cfg.cameras.iter().map(|c| c.id.as_str()));
         let lay = &mut self.cfg.layout;
         lay.pins.retain(|id| ids.contains(id.as_str()));
         lay.hidden.retain(|id| ids.contains(id.as_str()));
@@ -1358,6 +1832,240 @@ impl App {
 
     fn device_index(&self, id: &str) -> Option<usize> {
         self.devices.iter().position(|d| d.id == id)
+    }
+
+    fn camera_index(&self, id: &str) -> Option<usize> {
+        self.cfg.cameras.iter().position(|c| format!("cam:{}", c.id) == id)
+    }
+
+    /// Devices + cameras as one peer list for the section model.
+    fn all_entries(&self) -> Vec<CardEntry> {
+        let mut v: Vec<CardEntry> = self.devices.iter().map(device_entry).collect();
+        v.extend(self.cfg.cameras.iter().map(camera_entry));
+        v
+    }
+
+    fn open_camera_form(&mut self, edit_id: Option<&str>) {
+        if let Some(eid) = edit_id {
+            if let Some(ci) = self.camera_index(eid) {
+                let c = &self.cfg.cameras[ci];
+                self.cam_form = Some(CameraForm {
+                    id: Some(eid.to_string()),
+                    name: c.name.clone(),
+                    user: c.user.clone(),
+                    pass: deobfuscate(&c.password),
+                    host: c.host.clone(),
+                    port: c.port.to_string(),
+                    template: c.template.clone(),
+                    path: c.path.clone(),
+                    error: None,
+                });
+                return;
+            }
+        }
+        self.cam_form = Some(CameraForm {
+            id: None,
+            name: String::new(),
+            user: String::new(),
+            pass: String::new(),
+            host: String::new(),
+            port: "554".to_string(),
+            template: "tapo1".to_string(),
+            path: String::new(),
+            error: None,
+        });
+    }
+
+    fn delete_camera(&mut self, item_id: &str) {
+        if let Some(ci) = self.camera_index(item_id) {
+            self.cfg.cameras.remove(ci);
+        }
+        let lay = &mut self.cfg.layout;
+        lay.pins.retain(|x| x != item_id);
+        lay.hidden.retain(|x| x != item_id);
+        lay.assign.remove(item_id);
+        lay.alias.remove(item_id);
+        for list in lay.section_order.values_mut() {
+            list.retain(|x| x != item_id);
+        }
+        lay.section_order.retain(|_, list| !list.is_empty());
+        self.save();
+        self.toast("Camera deleted", false);
+    }
+
+    /// Watch a camera: gateway watch page in the default browser when a
+    /// stream gateway is configured, else the external player command.
+    fn watch_camera(&mut self, item_id: &str) {
+        let Some(ci) = self.camera_index(item_id) else { return };
+        let cam = self.cfg.cameras[ci].clone();
+        if let Some(url) = gateway_watch_url(&cam, &self.cfg.prefs) {
+            open_external(&url);
+            self.toast("Stream opened in your browser", false);
+            return;
+        }
+        let url = build_rtsp_url(&cam);
+        match launch_player(&self.cfg.prefs.player_cmd, &url) {
+            Ok(prog) => self.toast(&format!("Opening stream in {}…", prog), false),
+            Err(e) => self.toast(
+                &format!(
+                    "Could not start the player ({}). Check the player command in Settings, or copy the stream URL into VLC.",
+                    e
+                ),
+                true,
+            ),
+        }
+    }
+
+    // ---------------- drag & drop (Edit mode) ----------------
+
+    /// Section display list while dragging: the dragged card is removed
+    /// everywhere and a gap (None) sits at the current insertion point
+    /// of the target section, so the other cards reflow around it.
+    fn display_ids(&self, sec: &Section) -> Vec<Option<String>> {
+        let mut ids: Vec<Option<String>> = sec.ids.iter().map(|i| Some(i.clone())).collect();
+        if let Some(drag) = &self.drag {
+            ids.retain(|i| i.as_deref() != Some(drag.id.as_str()));
+            if let Some((tkey, tidx)) = &drag.target {
+                if *tkey == sec.key {
+                    let at = (*tidx).min(ids.len());
+                    ids.insert(at, None);
+                }
+            }
+        }
+        ids
+    }
+
+    /// Insertion target for a pointer position, from last frame's
+    /// geometry. Compatible sections only: scenes never mix with
+    /// devices/cameras.
+    fn drag_target_at(
+        &self,
+        pos: egui::Pos2,
+        drag_id: &str,
+        is_scene: bool,
+    ) -> Option<(String, usize)> {
+        let mut chosen: Option<String> = None;
+        let mut chosen_dy = f32::INFINITY;
+        for (key, rect) in &self.section_rects {
+            let Some(sec) = self.sections_cache.iter().find(|s| &s.key == key) else {
+                continue;
+            };
+            if (sec.kind == SectionKind::Scenes) != is_scene {
+                continue;
+            }
+            let expanded = rect.expand(6.0);
+            let dy = if expanded.contains(pos) {
+                0.0
+            } else if pos.y < expanded.top() {
+                expanded.top() - pos.y
+            } else if pos.y > expanded.bottom() {
+                pos.y - expanded.bottom()
+            } else {
+                0.0
+            };
+            let inside_x = pos.x >= expanded.left() && pos.x <= expanded.right();
+            let score = if expanded.contains(pos) {
+                -1.0
+            } else if inside_x && dy < 48.0 {
+                dy
+            } else {
+                f32::INFINITY
+            };
+            if score < chosen_dy {
+                chosen_dy = score;
+                chosen = Some(key.clone());
+            }
+        }
+        let key = chosen?;
+        // Count item cells (excluding the dragged card and the gap)
+        // whose centre is "before" the pointer in reading order.
+        let mut idx = 0usize;
+        for (skey, cid, rect) in &self.cell_rects {
+            if *skey != key {
+                continue;
+            }
+            let Some(cid) = cid else { continue };
+            if cid == drag_id {
+                continue;
+            }
+            let c = rect.center();
+            let before = if pos.y > c.y + rect.height() / 2.0 {
+                true
+            } else if pos.y < c.y - rect.height() / 2.0 {
+                false
+            } else {
+                pos.x > c.x
+            };
+            if before {
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        Some((key, idx))
+    }
+
+    fn update_drag(&mut self, ctx: &egui::Context) {
+        let (pos, released, escaped) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()),
+                i.pointer.any_released(),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if escaped {
+            self.drag = None;
+            return;
+        }
+        if let (Some(d), Some(p)) = (self.drag.as_ref(), pos) {
+            let (id, is_scene) = (d.id.clone(), d.is_scene);
+            let t = self.drag_target_at(p, &id, is_scene);
+            if let Some(d) = self.drag.as_mut() {
+                d.target = t;
+            }
+        }
+        if released {
+            self.commit_drag();
+        }
+    }
+
+    fn commit_drag(&mut self) {
+        let Some(drag) = self.drag.take() else { return };
+        let Some((tkey, tidx)) = drag.target.clone() else { return };
+        let Some(tsec) = self.sections_cache.iter().find(|s| s.key == tkey).cloned() else {
+            return;
+        };
+        if (tsec.kind == SectionKind::Scenes) != drag.is_scene {
+            return;
+        }
+        if !drag.is_scene {
+            match &tsec.kind {
+                SectionKind::Pinned => {
+                    if !self.cfg.layout.pins.contains(&drag.id) {
+                        self.cfg.layout.pins.push(drag.id.clone());
+                    }
+                }
+                SectionKind::Group => {
+                    if let Some(gid) = &tsec.group_id {
+                        self.cfg.layout.assign.insert(drag.id.clone(), gid.clone());
+                    }
+                }
+                SectionKind::Ungrouped => {
+                    self.cfg.layout.assign.remove(&drag.id);
+                }
+                SectionKind::Scenes => {}
+            }
+        }
+        let mut list: Vec<String> = tsec
+            .ids
+            .iter()
+            .filter(|i| **i != drag.id)
+            .cloned()
+            .collect();
+        let at = tidx.min(list.len());
+        list.insert(at, drag.id.clone());
+        self.cfg.layout.section_order.insert(tsec.order_key.clone(), list);
+        self.save();
     }
 
     fn display(&self, d: &Device) -> String {
@@ -1547,6 +2255,58 @@ impl App {
                             .unwrap_or_else(|| id.clone());
                         self.restore_backup(&id, &backup);
                         self.toast(format!("Command failed for {}", name), true);
+                    }
+                }
+                NetResult::UpdateChecked { manual, result } => {
+                    self.update_checking = false;
+                    match result {
+                        Ok(info) => {
+                            let newer = version_newer(&info.version, APP_VERSION);
+                            self.update_info = Some(info);
+                            if manual && !newer {
+                                self.toast("You're on the latest version", false);
+                            }
+                        }
+                        Err(e) => {
+                            // Auto-checks fail silently; manual checks say so.
+                            if manual {
+                                self.update_error = Some(format!("Update check failed: {}", e));
+                            }
+                        }
+                    }
+                }
+                NetResult::UpdateProgress { got, total } => {
+                    self.update_dl = Some((got, total));
+                }
+                NetResult::UpdateDownloaded { result } => {
+                    self.update_dl = None;
+                    match result {
+                        Ok(path) => {
+                            // Final verification before anything runs it:
+                            // the file name must be exactly this release's
+                            // expected installer name.
+                            let expected = self
+                                .update_info
+                                .as_ref()
+                                .map(|i| expected_installer_name(&i.version))
+                                .unwrap_or_default();
+                            let actual = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !expected.is_empty() && actual == expected {
+                                self.update_launch = Some(path);
+                            } else {
+                                self.update_error = Some(
+                                    "The downloaded file's name doesn't match the expected installer, so it was not run. Use the releases page instead."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            self.update_error = Some(format!("Download failed: {}", e));
+                        }
                     }
                 }
             }
@@ -1825,7 +2585,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("✎ Edit mode — drag-free reordering with ↑/↓, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.")
+                            RichText::new("✎ Edit mode — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.")
                                 .size(13.0)
                                 .color(pal.dim),
                         );
@@ -1833,7 +2593,10 @@ impl App {
                             if ui.add(Button::new("Done").fill(self.accent()).stroke(Stroke::new(1.0, self.accent()))).clicked() {
                                 self.set_editing(false);
                             }
-                            if ui.add(Button::new("＋ New group")).clicked() {
+                            if ui.add(Button::new("+ Add camera")).clicked() {
+                                self.open_camera_form(None);
+                            }
+                            if ui.add(Button::new("+ New group")).clicked() {
                                 self.new_group = Some(String::new());
                             }
                         });
@@ -1862,12 +2625,92 @@ impl App {
 
     fn view_dashboard(&mut self, ui: &mut Ui) {
         let pal = self.pal();
-        let sections = build_sections(&self.devices, &self.cfg.layout, self.editing, &self.query);
+        let entries = self.all_entries();
+        let sections = build_sections(&entries, &self.cfg.layout, self.editing, &self.query);
+        self.sections_cache = sections.clone();
+        // Geometry maps are rebuilt by section_view below; update_drag
+        // has already consumed last frame's rects in this update pass.
+        self.cell_rects.clear();
+        self.section_rects.clear();
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(6.0);
-                if self.devices.is_empty() {
+                // ---- update banner (dismissible per version) ----
+                if let Some(info) = self.update_info.clone() {
+                    if version_newer(&info.version, APP_VERSION)
+                        && self.cfg.update.dismissed != info.version
+                    {
+                        let mut act: Option<&str> = None;
+                        Frame::none()
+                            .fill(self.accent_soft())
+                            .stroke(Stroke::new(1.0, self.accent()))
+                            .rounding(Rounding::same(14.0))
+                            .inner_margin(Margin::symmetric(16.0, 12.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if let Some((got, total)) = self.update_dl {
+                                        let pct = if total > 0 { got * 100 / total } else { 0 };
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Downloading version {}… {}%",
+                                                info.version, pct
+                                            ))
+                                            .size(13.5)
+                                            .strong(),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Version {} is available — you're on {}.",
+                                                info.version, APP_VERSION
+                                            ))
+                                            .size(13.5)
+                                            .strong(),
+                                        );
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.add(Button::new("Dismiss")).clicked() {
+                                            act = Some("dismiss");
+                                        }
+                                        if self.update_dl.is_none()
+                                            && ui
+                                                .add(
+                                                    Button::new(
+                                                        RichText::new("Download & install")
+                                                            .color(Color32::WHITE),
+                                                    )
+                                                    .fill(self.accent()),
+                                                )
+                                                .clicked()
+                                        {
+                                            act = Some("download");
+                                        }
+                                    });
+                                });
+                                if let Some(err) = &self.update_error {
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(err.clone()).size(12.5).color(DANGER));
+                                    if ui.add(Button::new("Open releases page")).clicked() {
+                                        act = Some("releases");
+                                    }
+                                }
+                            });
+                        match act {
+                            Some("dismiss") => {
+                                self.cfg.update.dismissed = info.version.clone();
+                                self.save();
+                            }
+                            Some("download") => self.spawn_update_download(),
+                            Some("releases") => {
+                                let _ = open_external(&info.page_url);
+                            }
+                            _ => {}
+                        }
+                        ui.add_space(12.0);
+                    }
+                }
+                if self.devices.is_empty() && self.cfg.cameras.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -1895,6 +2738,8 @@ impl App {
 
     fn section_view(&mut self, ui: &mut Ui, sec: &Section, avail: f32) {
         let pal = self.pal();
+        let sec_top = ui.cursor().top();
+        let sec_left = ui.cursor().left();
         let collapsed = self.cfg.layout.collapsed.get(&sec.key).copied().unwrap_or(false);
         // ---- header ----
         ui.horizontal(|ui| {
@@ -1958,28 +2803,207 @@ impl App {
             ui.add_space(10.0);
             return;
         }
-        // ---- grid ----
+        // ---- grid: true rows, like the web edition's CSS grid ----
+        // Uniform columns; every card in a row fills a cell of
+        // card width × the row's tallest card height (content
+        // top-aligned, frame = the whole cell). egui has no stretching
+        // grid, so each row renders on its own: cells are allocated at
+        // the row's measured height (cached from the previous frame
+        // under a content signature), cards enforce that height, and a
+        // changed measurement is picked up a frame later.
         let compact = self.compact();
         let (min_w, gap) = if compact { (198.0, 10.0) } else { (238.0, 14.0) };
         let cols = (((avail + gap) / (min_w + gap)).floor() as usize).max(1);
         let card_w = (avail - (cols as f32 - 1.0) * gap) / cols as f32;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(gap, gap);
-            for id in &sec.ids {
-                let id = id.clone();
-                ui.allocate_ui_with_layout(
-                    vec2(card_w, 0.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        self.device_card(ui, &id, sec, card_w);
-                    },
-                );
+        let display = self.display_ids(sec);
+        if display.is_empty() {
+            if self.editing {
+                ui.label(RichText::new("No items").color(pal.dim));
             }
-            if self.editing && sec.ids.is_empty() {
-                ui.label(RichText::new("Drop devices here").color(pal.dim));
+            ui.add_space(14.0);
+            self.section_rects
+                .push((sec.key.clone(), egui::Rect::from_min_max(
+                    egui::pos2(sec_left, sec_top),
+                    egui::pos2(sec_left + avail, ui.cursor().top()),
+                )));
+            return;
+        }
+        let rows = display.len().div_ceil(cols);
+        for (row_idx, chunk) in display.chunks(cols).enumerate() {
+            let sig = self.row_signature(sec, row_idx, chunk, card_w);
+            let row_h = self.row_heights.get(&sig).copied().unwrap_or(0.0);
+            let mut actual_h = 0.0f32;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for item in chunk {
+                    let item_owned = item.clone();
+                    let alloc = ui.allocate_ui_with_layout(
+                        vec2(card_w, row_h),
+                        Layout::top_down(Align::Min),
+                        |ui| match &item_owned {
+                            Some(id) => {
+                                let id = id.clone();
+                                // Drag source (Edit mode): a drag sense
+                                // over the whole cell, registered BEFORE
+                                // the card's own widgets so buttons,
+                                // sliders and fields keep priority in
+                                // their own areas — like the web edition,
+                                // where you drag a card by its body.
+                                if self.editing && self.drag.is_none() {
+                                    let cell_rect = ui.max_rect();
+                                    let resp = ui.interact(
+                                        cell_rect,
+                                        egui::Id::new(("card-drag", &id)),
+                                        Sense::drag(),
+                                    );
+                                    if resp.drag_started() {
+                                        if let Some(p) = resp.interact_pointer_pos() {
+                                            let start_idx = sec
+                                                .ids
+                                                .iter()
+                                                .position(|x| x == &id)
+                                                .unwrap_or(0);
+                                            self.drag = Some(DragState {
+                                                id: id.clone(),
+                                                is_scene: sec.kind == SectionKind::Scenes,
+                                                from_section: sec.key.clone(),
+                                                size: cell_rect.size(),
+                                                grab_offset: p - cell_rect.min,
+                                                target: Some((sec.key.clone(), start_idx)),
+                                            });
+                                        }
+                                    }
+                                }
+                                if self.camera_index(&id).is_some() {
+                                    self.camera_card(ui, &id, sec, card_w, row_h);
+                                } else {
+                                    self.device_card(ui, &id, sec, card_w, row_h);
+                                }
+                            }
+                            None => {
+                                // Insertion gap while dragging: the
+                                // other cards reflow around it.
+                                let r = ui.max_rect().shrink(1.0);
+                                let p = ui.painter();
+                                p.rect_filled(r, Rounding::same(R_CARD), self.accent_soft());
+                                p.rect_stroke(r, Rounding::same(R_CARD), Stroke::new(1.5, self.accent()));
+                            }
+                        },
+                    );
+                    actual_h = actual_h.max(alloc.response.rect.height());
+                    self.cell_rects
+                        .push((sec.key.clone(), item_owned, alloc.response.rect));
+                }
+            });
+            if row_h == 0.0 || actual_h > row_h + 0.5 {
+                self.row_heights.insert(sig, actual_h);
+                ui.ctx().request_repaint();
             }
-        });
+            if row_idx + 1 < rows {
+                ui.add_space(gap);
+            }
+        }
         ui.add_space(14.0);
+        self.section_rects
+            .push((sec.key.clone(), egui::Rect::from_min_max(
+                egui::pos2(sec_left, sec_top),
+                egui::pos2(sec_left + avail, ui.cursor().top()),
+            )));
+    }
+
+    /// Height-relevant shape of one card: anything that changes how
+    /// tall the card renders (controls present, online, colour picker
+    /// open). Part of the row-height cache signature.
+    fn card_shape(&self, id: &str) -> String {
+        if let Some(ci) = self.camera_index(id) {
+            format!("cam:{}", self.cfg.cameras[ci].template)
+        } else if let Some(di) = self.device_index(id) {
+            let d = &self.devices[di];
+            format!(
+                "dev:{}:{}:{}:{}:{}:{}",
+                d.online,
+                d.brightness_pct.is_some(),
+                d.temp_slider.is_some(),
+                d.has_color,
+                d.is_scene,
+                self.open_color_for.as_deref() == Some(id)
+            )
+        } else {
+            "?".to_string()
+        }
+    }
+
+    fn row_signature(
+        &self,
+        sec: &Section,
+        row_idx: usize,
+        chunk: &[Option<String>],
+        card_w: f32,
+    ) -> String {
+        let mut s = format!(
+            "{}|{}|{}|{}|{}",
+            sec.order_key,
+            row_idx,
+            self.editing,
+            self.compact(),
+            card_w as i32
+        );
+        for item in chunk {
+            s.push('|');
+            s.push_str(
+                &item
+                    .as_ref()
+                    .map(|id| self.card_shape(id))
+                    .unwrap_or_else(|| "gap".to_string()),
+            );
+        }
+        s
+    }
+
+    /// The floating ghost card that follows the pointer during a drag.
+    fn drag_ghost(&self, ctx: &egui::Context) {
+        let Some(drag) = &self.drag else { return };
+        let Some(pos) = ctx.input(|i| {
+            i.pointer.hover_pos().or_else(|| i.pointer.interact_pos())
+        }) else {
+            return;
+        };
+        let (icon, name) = if let Some(ci) = self.camera_index(&drag.id) {
+            ("📷", self.cfg.cameras[ci].name.clone())
+        } else if let Some(di) = self.device_index(&drag.id) {
+            let d = self.devices[di].clone();
+            (type_icon(&d.icon_kind), self.display(&d))
+        } else {
+            return;
+        };
+        let pal = self.pal();
+        let top_left = pos - drag.grab_offset;
+        egui::Area::new(egui::Id::new("drag-ghost"))
+            .fixed_pos(top_left)
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(
+                        pal.card.r(),
+                        pal.card.g(),
+                        pal.card.b(),
+                        238,
+                    ))
+                    .stroke(Stroke::new(1.5, self.accent()))
+                    .rounding(Rounding::same(R_CARD))
+                    .inner_margin(Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_width((drag.size.x - 28.0).max(80.0));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icon).size(20.0));
+                            ui.add(
+                                egui::Label::new(RichText::new(name).size(15.0).strong())
+                                    .truncate(true),
+                            );
+                        });
+                    });
+            });
     }
 
     fn move_in_section(&mut self, sec: &Section, id: &str, dir: i32) {
@@ -1996,7 +3020,7 @@ impl App {
 }
 
 impl App {
-    fn device_card(&mut self, ui: &mut Ui, id: &str, sec: &Section, card_w: f32) {
+    fn device_card(&mut self, ui: &mut Ui, id: &str, sec: &Section, card_w: f32, fill_h: f32) {
         let Some(idx) = self.device_index(id) else { return };
         let dev = self.devices[idx].clone();
         let pal = self.pal();
@@ -2016,6 +3040,10 @@ impl App {
             .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_top, bottom: pad_bot })
             .show(ui, |ui| {
                 ui.set_width((card_w - 2.0 * pad_x).max(80.0));
+                if fill_h > 0.0 {
+                    // Stretch the frame to the row's full cell height.
+                    ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
+                }
                 // ---------- top row ----------
                 ui.horizontal(|ui| {
                     if self.editing {
@@ -2038,26 +3066,44 @@ impl App {
                                 },
                             );
                         });
-                    // name + status
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(self.display(&dev)).size(15.0).strong());
-                            if !dev.online {
-                                Frame::none()
-                                    .fill(Color32::from_rgb(0x64, 0x74, 0x8b))
-                                    .rounding(Rounding::same(6.0))
-                                    .inner_margin(Margin::symmetric(6.0, 2.0))
-                                    .show(ui, |ui| {
-                                        ui.label(RichText::new("OFFLINE").size(10.5).color(Color32::WHITE).strong());
-                                    });
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let dot_color = if dev.state && dev.online { OK_GREEN } else { pal.dim };
-                            ui.label(RichText::new("●").size(9.0).color(dot_color));
-                            ui.label(RichText::new(status_text(&dev)).size(12.5).color(pal.dim));
-                        });
-                    });
+                    // name + status — a fixed-width block so the name
+                    // truncates with an ellipsis instead of ever
+                    // reaching the pin / toggle / hide controls.
+                    let trailing_w = if dev.is_scene { 28.0 } else { 116.0 };
+                    let name_w = (ui.available_width() - trailing_w - 8.0).max(40.0);
+                    ui.allocate_ui_with_layout(
+                        vec2(name_w, icon_size),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(self.display(&dev)).size(15.0).strong(),
+                                    )
+                                    .truncate(true),
+                                );
+                                if !dev.online {
+                                    Frame::none()
+                                        .fill(Color32::from_rgb(0x64, 0x74, 0x8b))
+                                        .rounding(Rounding::same(6.0))
+                                        .inner_margin(Margin::symmetric(6.0, 2.0))
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new("OFFLINE").size(10.5).color(Color32::WHITE).strong());
+                                        });
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let dot_color = if dev.state && dev.online { OK_GREEN } else { pal.dim };
+                                ui.label(RichText::new("●").size(9.0).color(dot_color));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(status_text(&dev)).size(12.5).color(pal.dim),
+                                    )
+                                    .truncate(true),
+                                );
+                            });
+                        },
+                    );
                     // trailing controls: pin, switch, hide (added right-to-left)
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                         let hide = ui
@@ -2218,9 +3264,10 @@ impl App {
                                 None => "Ungrouped".to_string(),
                             };
                             let mut chosen: Option<Option<String>> = None;
+                            let combo_w = (ui.available_width() - 92.0).max(84.0);
                             ComboBox::from_id_source(("grp", &dev.id))
                                 .selected_text(cur_label)
-                                .width(130.0)
+                                .width(combo_w)
                                 .show_ui(ui, |ui| {
                                     if ui.selectable_label(cur_assign.is_none(), "Ungrouped").clicked() {
                                         chosen = Some(None);
@@ -2257,6 +3304,216 @@ impl App {
                         }
                         if ui.add(Button::new("↓ Move down").small()).clicked() {
                             self.move_in_section(sec, &dev.id, 1);
+                        }
+                    });
+                }
+            });
+    }
+
+    /// An RTSP camera card — a peer of the device card: same frame,
+    /// grid cell, pinning, grouping and edit tools. Quality toggle for
+    /// the Tapo templates, Watch + Copy URL actions.
+    fn camera_card(&mut self, ui: &mut Ui, id: &str, sec: &Section, card_w: f32, fill_h: f32) {
+        let Some(ci) = self.camera_index(id) else { return };
+        let cam = self.cfg.cameras[ci].clone();
+        let pal = self.pal();
+        let accent = self.accent();
+        let compact = self.compact();
+        let (pad_x, pad_top, pad_bot, radius) = if compact {
+            (13.0, 11.0, 10.0, R_CARD_COMPACT)
+        } else {
+            (16.0, 15.0, 14.0, R_CARD)
+        };
+        let pinned = self.cfg.layout.pins.contains(&id.to_string());
+        Frame::none()
+            .fill(pal.card)
+            .stroke(Stroke::new(1.0, pal.border))
+            .rounding(Rounding::same(radius))
+            .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_top, bottom: pad_bot })
+            .show(ui, |ui| {
+                ui.set_width((card_w - 2.0 * pad_x).max(80.0));
+                if fill_h > 0.0 {
+                    ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
+                }
+                // ---------- top row ----------
+                ui.horizontal(|ui| {
+                    if self.editing {
+                        ui.label(RichText::new("⠿").color(pal.dim).size(16.0));
+                    }
+                    let icon_size = if compact { 36.0 } else { 42.0 };
+                    Frame::none()
+                        .fill(pal.track)
+                        .rounding(Rounding::same(if compact { 11.0 } else { 13.0 }))
+                        .show(ui, |ui| {
+                            ui.allocate_ui_with_layout(
+                                vec2(icon_size, icon_size),
+                                Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("📷").size(if compact { 18.0 } else { 21.0 }),
+                                    );
+                                },
+                            );
+                        });
+                    let name_w = (ui.available_width() - 60.0 - 8.0).max(40.0);
+                    ui.allocate_ui_with_layout(
+                        vec2(name_w, icon_size),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(cam.name.clone()).size(15.0).strong())
+                                    .truncate(true),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(camera_status_text(&cam)).size(12.5).color(pal.dim),
+                                )
+                                .truncate(true),
+                            );
+                        },
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                        let hide = ui
+                            .add(Button::new(RichText::new("✕").color(pal.dim).size(13.0)).frame(false))
+                            .on_hover_text("Hide this camera");
+                        if hide.clicked() {
+                            self.cfg.layout.hidden.push(id.to_string());
+                            self.save();
+                            self.toast(
+                                format!("{} hidden — bring it back from Settings", cam.name),
+                                false,
+                            );
+                        }
+                        let pin = ui
+                            .add(
+                                Button::new(
+                                    RichText::new("📌")
+                                        .size(15.0)
+                                        .color(if pinned { pal.text } else { pal.faint }),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text(if pinned {
+                                "Unpin (remove shortcut from the top)"
+                            } else {
+                                "Pin a shortcut to the top"
+                            });
+                        if pin.clicked() {
+                            self.toggle_pin(id);
+                        }
+                    });
+                });
+                // ---------- quality (Tapo templates) ----------
+                if cam.template == "tapo1" || cam.template == "tapo2" {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        for (tpl, label) in [("tapo1", "Stream 1 · HD"), ("tapo2", "Stream 2 · SD")] {
+                            let active = cam.template == tpl;
+                            let btn = if active {
+                                Button::new(RichText::new(label).color(Color32::WHITE)).fill(accent)
+                            } else {
+                                Button::new(label)
+                            };
+                            if ui.add(btn).clicked() && !active {
+                                if let Some(ci2) = self.camera_index(id) {
+                                    self.cfg.cameras[ci2].template = tpl.to_string();
+                                    self.save();
+                                }
+                            }
+                        }
+                    });
+                }
+                // ---------- actions ----------
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let watch = Button::new(
+                        RichText::new("▶ Watch").size(14.0).color(Color32::WHITE),
+                    )
+                    .fill(accent);
+                    if ui.add(watch).clicked() {
+                        self.watch_camera(id);
+                    }
+                    if ui.add(Button::new("Copy URL")).clicked() {
+                        ui.ctx().copy_text(build_rtsp_url(&cam));
+                        self.toast("Stream URL copied", false);
+                    }
+                });
+                // ---------- edit tools ----------
+                if self.editing {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(Button::new("✎ Edit").small()).clicked() {
+                            self.open_camera_form(Some(id));
+                        }
+                        if ui
+                            .add(Button::new(RichText::new("🗑 Delete").color(DANGER)).small())
+                            .clicked()
+                        {
+                            self.delete_camera(id);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let cur_assign = self.cfg.layout.assign.get(id).cloned();
+                        let cur_label = match &cur_assign {
+                            Some(gid) => self
+                                .cfg
+                                .layout
+                                .groups
+                                .iter()
+                                .find(|g| &g.id == gid)
+                                .map(|g| g.name.clone())
+                                .unwrap_or_else(|| "Ungrouped".to_string()),
+                            None => "Ungrouped".to_string(),
+                        };
+                        let mut chosen: Option<Option<String>> = None;
+                        let combo_w = (ui.available_width() - 92.0).max(84.0);
+                        ComboBox::from_id_source(("grpcam", id))
+                            .selected_text(cur_label)
+                            .width(combo_w)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(cur_assign.is_none(), "Ungrouped").clicked() {
+                                    chosen = Some(None);
+                                }
+                                for g in &self.cfg.layout.groups {
+                                    if ui
+                                        .selectable_label(
+                                            cur_assign.as_deref() == Some(g.id.as_str()),
+                                            g.name.clone(),
+                                        )
+                                        .clicked()
+                                    {
+                                        chosen = Some(Some(g.id.clone()));
+                                    }
+                                }
+                            });
+                        if let Some(c) = chosen {
+                            match c {
+                                Some(gid) => {
+                                    self.cfg.layout.assign.insert(id.to_string(), gid);
+                                }
+                                None => {
+                                    self.cfg.layout.assign.remove(id);
+                                }
+                            }
+                            self.save();
+                        }
+                        if ui
+                            .add(Button::new(if pinned { "📌 Unpin" } else { "📌 Pin" }).small())
+                            .clicked()
+                        {
+                            self.toggle_pin(id);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(Button::new("↑ Move up").small()).clicked() {
+                            self.move_in_section(sec, id, -1);
+                        }
+                        if ui.add(Button::new("↓ Move down").small()).clicked() {
+                            self.move_in_section(sec, id, 1);
                         }
                     });
                 }
@@ -2359,11 +3616,16 @@ impl App {
                             Self::field_label(ui, &pal, "Theme");
                             let mut theme = self.cfg.prefs.theme.clone();
                             ComboBox::from_id_source("set_theme")
-                                .selected_text(if theme == "light" { "Light" } else { "Dark" })
-                                .width(220.0)
+                                .selected_text(match theme.as_str() {
+                                    "light" => "Light",
+                                    "black" => "Black",
+                                    _ => "Dark",
+                                })
+                                .width(ui.available_width())
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut theme, "dark".to_string(), "Dark");
                                     ui.selectable_value(&mut theme, "light".to_string(), "Light");
+                                    ui.selectable_value(&mut theme, "black".to_string(), "Black");
                                 });
                             if theme != self.cfg.prefs.theme {
                                 self.cfg.prefs.theme = theme;
@@ -2393,7 +3655,7 @@ impl App {
                             let mut density = self.cfg.prefs.density.clone();
                             ComboBox::from_id_source("set_density")
                                 .selected_text(if density == "compact" { "Compact" } else { "Comfortable" })
-                                .width(220.0)
+                                .width(ui.available_width())
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut density, "comfortable".to_string(), "Comfortable");
                                     ui.selectable_value(&mut density, "compact".to_string(), "Compact");
@@ -2403,6 +3665,90 @@ impl App {
                                 self.save();
                             }
                         });
+                        // ---- App updates ----
+                        let mut upd_act: Option<&str> = None;
+                        Self::settings_panel(ui, &pal, "App updates", |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "You're running version {}. The app checks GitHub for updates at most once a day; you can also check now.",
+                                    APP_VERSION
+                                ))
+                                .size(12.5)
+                                .color(pal.dim),
+                            );
+                            ui.add_space(8.0);
+                            if self.update_checking {
+                                ui.label(RichText::new("Checking for updates…").size(13.5));
+                            } else if let Some((got, total)) = self.update_dl {
+                                let frac = if total > 0 {
+                                    got as f32 / total as f32
+                                } else {
+                                    0.0
+                                };
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .text(format!("Downloading the installer… {}%", (frac * 100.0).round() as i64)),
+                                );
+                            } else if let Some(info) = &self.update_info {
+                                if version_newer(&info.version, APP_VERSION) {
+                                    ui.label(
+                                        RichText::new(format!("Version {} is available.", info.version))
+                                            .size(13.5)
+                                            .strong(),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(
+                                                Button::new(
+                                                    RichText::new("Download & install").color(Color32::WHITE),
+                                                )
+                                                .fill(accent),
+                                            )
+                                            .clicked()
+                                        {
+                                            upd_act = Some("download");
+                                        }
+                                        if ui.add(Button::new("Open releases page")).clicked() {
+                                            upd_act = Some("releases");
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new("The download's file name is verified before it runs. This app closes itself once the installer starts, so the installer can replace it.")
+                                            .size(12.5)
+                                            .color(pal.dim),
+                                    );
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "You're up to date — {} is the latest version.",
+                                            info.version
+                                        ))
+                                        .size(13.5),
+                                    );
+                                }
+                            }
+                            if let Some(err) = &self.update_error {
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(err.clone()).size(12.5).color(DANGER));
+                                if ui.add(Button::new("Open releases page")).clicked() {
+                                    upd_act = Some("releases");
+                                }
+                            }
+                            ui.add_space(8.0);
+                            if ui.add(Button::new("Check for updates")).clicked() {
+                                upd_act = Some("check");
+                            }
+                        });
+                        match upd_act {
+                            Some("check") => self.spawn_update_check(true),
+                            Some("download") => self.spawn_update_download(),
+                            Some("releases") => {
+                                let _ = open_external(RELEASES_PAGE);
+                            }
+                            _ => {}
+                        }
                         // ---- Connection ----
                         Self::settings_panel(ui, &pal, "Connection", |ui| {
                             ui.label(
@@ -2417,7 +3763,7 @@ impl App {
                             let mut interval = self.cfg.prefs.interval;
                             ComboBox::from_id_source("set_interval")
                                 .selected_text(interval_label(interval))
-                                .width(220.0)
+                                .width(ui.available_width())
                                 .show_ui(ui, |ui| {
                                     for (v, l) in INTERVALS {
                                         ui.selectable_value(&mut interval, v, l);
@@ -2427,6 +3773,62 @@ impl App {
                                 self.cfg.prefs.interval = interval;
                                 self.save();
                             }
+                        });
+                        // ---- Stream gateway & cameras ----
+                        Self::settings_panel(ui, &pal, "Stream gateway & cameras", |ui| {
+                            ui.label(
+                                RichText::new("Cameras you add (✎ Edit → + Add camera) stream over RTSP, which this app can't play directly. Point ▶ Watch at a small stream gateway on your network — go2rtc or MediaMTX — and Watch opens the gateway's watch page in your browser. The gateway needs a stream with the same name as the camera here, fed from the same RTSP address (the card's Copy URL button gives you the exact address). Leave the address empty to hand streams to an external player app instead.")
+                                    .size(12.5)
+                                    .color(pal.dim),
+                            );
+                            ui.add_space(8.0);
+                            Self::field_label(ui, &pal, "Stream gateway address (optional)");
+                            let mut gw = self.cfg.prefs.gateway_url.clone();
+                            if ui
+                                .add(
+                                    TextEdit::singleline(&mut gw)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("http://192.168.1.10:1984 (go2rtc) · http://192.168.1.10:8889 (MediaMTX)"),
+                                )
+                                .changed()
+                            {
+                                self.cfg.prefs.gateway_url = gw;
+                                self.save();
+                            }
+                            ui.add_space(10.0);
+                            Self::field_label(ui, &pal, "Gateway type");
+                            let mut gwt = self.cfg.prefs.gateway_type.clone();
+                            ComboBox::from_id_source("set_gw_type")
+                                .selected_text(if gwt == "mediamtx" { "MediaMTX (HLS)" } else { "go2rtc" })
+                                .width(ui.available_width())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut gwt, "go2rtc".to_string(), "go2rtc");
+                                    ui.selectable_value(&mut gwt, "mediamtx".to_string(), "MediaMTX (HLS)");
+                                });
+                            if gwt != self.cfg.prefs.gateway_type {
+                                self.cfg.prefs.gateway_type = gwt;
+                                self.save();
+                            }
+                            ui.add_space(10.0);
+                            Self::field_label(ui, &pal, "External player command");
+                            let mut pc = self.cfg.prefs.player_cmd.clone();
+                            if ui
+                                .add(
+                                    TextEdit::singleline(&mut pc)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("vlc"),
+                                )
+                                .changed()
+                            {
+                                self.cfg.prefs.player_cmd = pc;
+                                self.save();
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Used when no gateway address is set: Watch starts this program with the stream URL as its only argument.")
+                                    .size(12.5)
+                                    .color(pal.dim),
+                            );
                         });
                         // ---- Saved login ----
                         Self::settings_panel(ui, &pal, "Saved login", |ui| {
@@ -2452,7 +3854,7 @@ impl App {
                         // ---- Hidden devices ----
                         Self::settings_panel(ui, &pal, "Hidden devices", |ui| {
                             ui.label(
-                                RichText::new("Devices you hid with the ✕ on their card. They stay hidden until you bring them back here.")
+                                RichText::new("Devices and cameras you hid with the ✕ on their card. They stay hidden until you bring them back here.")
                                     .size(12.5)
                                     .color(pal.dim),
                             );
@@ -2465,6 +3867,10 @@ impl App {
                                 let name = self
                                     .device_index(&id)
                                     .map(|i| self.display(&self.devices[i].clone()))
+                                    .or_else(|| {
+                                        self.camera_index(&id)
+                                            .map(|ci| self.cfg.cameras[ci].name.clone())
+                                    })
                                     .unwrap_or_else(|| id.clone());
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(name).size(14.0));
@@ -2484,7 +3890,9 @@ impl App {
                                 "How login works. This app signs in to Tuya's cloud with the same account you use in the Smart Life (or Tuya Smart) app, then asks Tuya for your device list and sends control commands — the same approach as the classic Smart Life web dashboards. Pick the region where your account was registered; the wrong region is the most common cause of “login failed”.",
                                 "Your credentials. Your username and password go directly to Tuya's servers (px1.tuya*.com) over HTTPS. If you tick “Keep me logged in”, they are kept in this app's config file (in your user profile, under SmartLifeTuyaDesktop\\config.json) so the app can silently sign back in when the session token expires — use it only on your own devices, and use “Forget saved login” above to erase them.",
                                 "The proxy. Some networks block direct calls to Tuya's endpoints. In “Auto” mode, China-region traffic is routed through a community CORS proxy (cors.smartathome.co.uk); US and EU traffic goes direct. Note a proxy can see the requests it forwards (they contain a session token, never your password after sign-in — the sign-in request itself does contain your password, so only use proxies you trust for CN logins).",
-                                "Customising. Sections sort A–Z by name by default. Use ✎ Edit to reorder devices inside a section with ↑/↓ (that order then sticks, and each section has a “Reset to name order” button), create groups (rooms), rename devices with an alias, or hide devices you never use. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top — the device also stays in its group below. Scenes always live in their own Scenes section.",
+                                "Customising. Sections sort A–Z by name by default. Use ✎ Edit to drag cards into your own order inside a section — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top — the device also stays in its group below. Scenes always live in their own Scenes section.",
+                                "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way.",
+                                "Watching a stream. RTSP can't play inside this app. Without a gateway, ▶ Watch hands the stream address to the player app named in Settings → Stream gateway & cameras (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. For in-browser playback, run a small stream gateway such as go2rtc or MediaMTX on your network, give it a stream with the same name as the camera here (fed from the same RTSP address — Copy URL has it), and enter the gateway's address in Settings → Stream gateway & cameras. ▶ Watch then opens the gateway's watch page in your browser.",
                                 "Limits. Tuya rate-limits the device-list call; if you refresh very often the app may briefly show the last known states. Autorefresh every 30s or slower is comfortable.",
                             ];
                             for p in paras {
@@ -2496,6 +3904,133 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// Add/Edit camera dialog — the Rust edition of the web modal.
+    fn camera_window(&mut self, ctx: &egui::Context) {
+        let Some(mut form) = self.cam_form.take() else { return };
+        let pal = self.pal();
+        let mut action: Option<&str> = None; // "save" | "cancel" | "delete"
+        egui::Window::new(if form.id.is_some() { "Edit camera" } else { "Add camera" })
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                let field = |ui: &mut Ui, label: &str, buf: &mut String, password: bool| {
+                    ui.label(RichText::new(label).size(12.5).strong().color(pal.dim));
+                    ui.add_space(4.0);
+                    ui.add(
+                        TextEdit::singleline(buf)
+                            .desired_width(f32::INFINITY)
+                            .password(password),
+                    );
+                    ui.add_space(8.0);
+                };
+                field(ui, "Name", &mut form.name, false);
+                field(ui, "Username", &mut form.user, false);
+                field(ui, "Password", &mut form.pass, true);
+                field(ui, "IP address or host", &mut form.host, false);
+                field(ui, "Port", &mut form.port, false);
+                ui.label(RichText::new("Template").size(12.5).strong().color(pal.dim));
+                ui.add_space(4.0);
+                let cur_label = CAMERA_TEMPLATES
+                    .iter()
+                    .find(|(k, _)| *k == form.template)
+                    .map(|(_, l)| *l)
+                    .unwrap_or("Tapo Stream 1 — High Quality");
+                ComboBox::from_id_source("cam_tpl")
+                    .selected_text(cur_label)
+                    .width(ui.available_width() - 8.0)
+                    .show_ui(ui, |ui| {
+                        for (k, l) in CAMERA_TEMPLATES {
+                            ui.selectable_value(&mut form.template, k.to_string(), l);
+                        }
+                    });
+                ui.add_space(8.0);
+                if form.template == "custom" {
+                    field(ui, "Stream path", &mut form.path, false);
+                }
+                ui.label(
+                    RichText::new("Tapo: in the Tapo app, enable RTSP (Advanced Settings → Camera Account) and create a camera account — the username and password are that account, not your TP-Link cloud login.")
+                        .size(12.5)
+                        .color(pal.dim),
+                );
+                if let Some(err) = &form.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(err.clone()).size(12.5).color(DANGER));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if form.id.is_some()
+                        && ui
+                            .add(Button::new(RichText::new("Delete").color(DANGER)))
+                            .clicked()
+                    {
+                        action = Some("delete");
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(Button::new(RichText::new("Save camera").color(Color32::WHITE)).fill(self.accent()))
+                            .clicked()
+                        {
+                            action = Some("save");
+                        }
+                        if ui.add(Button::new("Cancel")).clicked() {
+                            action = Some("cancel");
+                        }
+                    });
+                });
+            });
+        match action {
+            Some("save") => {
+                let name = form.name.trim().to_string();
+                let host = form.host.trim().to_string();
+                if name.is_empty() || host.is_empty() {
+                    form.error = Some("Name and host are required.".to_string());
+                    self.cam_form = Some(form);
+                    return;
+                }
+                let port: u16 = form
+                    .port
+                    .trim()
+                    .parse::<u32>()
+                    .map(|p| p.min(65535) as u16)
+                    .unwrap_or(554);
+                let cam = Camera {
+                    id: form
+                        .id
+                        .as_ref()
+                        .map(|eid| eid.trim_start_matches("cam:").to_string())
+                        .unwrap_or_else(|| format!("{}", now_ms())),
+                    name,
+                    user: form.user.trim().to_string(),
+                    password: obfuscate(&form.pass),
+                    host,
+                    port,
+                    template: form.template.clone(),
+                    path: form.path.trim().to_string(),
+                };
+                if let Some(eid) = &form.id {
+                    if let Some(ci) = self.camera_index(eid) {
+                        self.cfg.cameras[ci] = cam;
+                    }
+                } else {
+                    self.cfg.cameras.push(cam);
+                }
+                self.save();
+                self.toast("Camera saved", false);
+            }
+            Some("delete") => {
+                if let Some(eid) = form.id.clone() {
+                    self.delete_camera(&eid);
+                }
+            }
+            Some(_) => {}
+            None => {
+                self.cam_form = Some(form);
+            }
+        }
     }
 
     fn show_toasts(&mut self, ctx: &egui::Context) {
@@ -2516,6 +4051,8 @@ impl App {
                     for (msg, err) in items {
                         let (fill, stroke) = if err {
                             (ERR_BG, ERR_BORDER)
+                        } else if self.cfg.prefs.theme == "black" {
+                            (TOAST_BG_BLACK, TOAST_BORDER_BLACK)
                         } else if dark {
                             (TOAST_BG_DARK, TOAST_BORDER)
                         } else {
@@ -2591,6 +4128,24 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_style(ctx);
         self.poll_net();
+        // Drag & drop bookkeeping runs BEFORE rendering, hit-testing
+        // against last frame's card geometry.
+        if self.drag.is_some() {
+            self.update_drag(ctx);
+        }
+        // A verified installer download: run it, then exit so the
+        // per-user installer can replace this app while it isn't running.
+        if let Some(path) = self.update_launch.take() {
+            match Command::new(&path).spawn() {
+                Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => {
+                    self.update_error = Some(format!(
+                        "The installer was downloaded but could not be started: {}",
+                        e
+                    ));
+                }
+            }
+        }
         let pal = self.pal();
         match self.view {
             View::Login => {
@@ -2643,6 +4198,10 @@ impl eframe::App for App {
         if self.new_group.is_some() {
             self.new_group_window(ctx);
         }
+        if self.cam_form.is_some() {
+            self.camera_window(ctx);
+        }
+        self.drag_ghost(ctx);
         self.show_toasts(ctx);
     }
 }
