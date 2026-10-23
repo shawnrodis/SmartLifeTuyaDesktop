@@ -17,9 +17,13 @@ use egui::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -225,6 +229,17 @@ struct Prefs {
     /// External player command for ▶ Watch when no gateway is set.
     #[serde(default = "default_player_cmd")]
     player_cmd: String,
+    /// Live in-tile camera previews (v1.2.0, ffmpeg frame pump).
+    #[serde(default = "default_true")]
+    previews: bool,
+    /// ffmpeg path override ("" = bundled copy beside the app exe,
+    /// then PATH). A full path or a bare program name both work.
+    #[serde(default)]
+    ffmpeg_path: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_gateway_type() -> String {
@@ -248,6 +263,8 @@ impl Default for Prefs {
             gateway_url: String::new(),
             gateway_type: default_gateway_type(),
             player_cmd: default_player_cmd(),
+            previews: true,
+            ffmpeg_path: String::new(),
         }
     }
 }
@@ -592,6 +609,20 @@ fn build_rtsp_url(cam: &Camera) -> String {
     )
 }
 
+/// The URL a TILE preview uses (v1.2.0): Stream 2 (SD) whenever a
+/// Tapo template is set — cheap to decode for a small tile — and the
+/// camera's own path otherwise. The big player uses build_rtsp_url
+/// (the camera's current quality selection; HD = Stream 1).
+fn tile_rtsp_url(cam: &Camera) -> String {
+    if cam.template == "tapo1" || cam.template == "tapo2" {
+        let mut c = cam.clone();
+        c.template = "tapo2".to_string();
+        build_rtsp_url(&c)
+    } else {
+        build_rtsp_url(cam)
+    }
+}
+
 /// In-browser watch URL for a configured stream gateway, or None.
 /// The gateway stream must be named exactly like the camera here.
 /// go2rtc: {gw}/stream.html?src={name} · MediaMTX: {gw}/{name}/index.m3u8
@@ -647,17 +678,385 @@ fn open_external(url: &str) -> Result<(), String> {
         .map_err(|e| format!("{}", e))
 }
 
+/// File name to look for on disk for a bare player name.
+fn player_exe_name(name: &str) -> String {
+    if name.to_lowercase().ends_with(".exe") {
+        name.to_string()
+    } else {
+        format!("{}.exe", name)
+    }
+}
+
+/// Ordered on-disk candidates for a BARE player name (pure — the
+/// caller gathers the inputs, so the order is unit-testable):
+/// (1) every PATH directory, (2) the Windows App Paths registry
+/// value, (3) well-known install directories (VLC's VideoLAN
+/// folders). The first candidate that exists wins.
+fn player_candidates(
+    name: &str,
+    path_dirs: &[PathBuf],
+    app_path: Option<&Path>,
+    known_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let exe = player_exe_name(name);
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in path_dirs {
+        out.push(d.join(&exe));
+    }
+    if let Some(p) = app_path {
+        out.push(p.to_path_buf());
+    }
+    for d in known_dirs {
+        out.push(d.join(&exe));
+    }
+    out
+}
+
+/// Extract the (Default) value from `reg query … /ve` output: the
+/// text after REG_SZ on its line. Pure, for tests.
+fn parse_reg_default_value(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(pos) = line.find("REG_SZ") {
+            let val = line[pos + "REG_SZ".len()..].trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The Windows "App Paths" registry entry for a program — where
+/// installers (VLC included) register their real location.
+/// HKLM first, then HKCU.
+#[cfg(target_os = "windows")]
+fn app_paths_lookup(name: &str) -> Option<PathBuf> {
+    let exe = player_exe_name(name);
+    for root in ["HKLM", "HKCU"] {
+        let key = format!(
+            "{}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{}",
+            root, exe
+        );
+        let mut cmd = Command::new("reg");
+        cmd.args(["query", &key, "/ve"]);
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                if let Some(v) = parse_reg_default_value(&String::from_utf8_lossy(&out.stdout)) {
+                    return Some(PathBuf::from(v));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn app_paths_lookup(_name: &str) -> Option<PathBuf> {
+    None
+}
+
+/// VLC's well-known install folders: its installer registers App
+/// Paths but does NOT add itself to PATH (the v1.1.0 "vlc: program
+/// not found" bug — VLC was installed all along).
+fn vlc_known_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(pf) = std::env::var_os(var) {
+            v.push(PathBuf::from(pf).join("VideoLAN").join("VLC"));
+        }
+    }
+    v
+}
+
+/// Resolve a player program to a spawnable path. A command with a
+/// path separator is used as given. A BARE name is searched in
+/// order: PATH, the App Paths registry entries, and — for vlc —
+/// the VideoLAN install folders. None only after every lookup
+/// failed, so "program not found" is reported exactly then.
+fn resolve_player_program(prog: &str) -> Option<String> {
+    if prog.contains('\\') || prog.contains('/') {
+        return Some(prog.to_string());
+    }
+    let path_dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    let app_path = app_paths_lookup(prog);
+    let known = if prog.eq_ignore_ascii_case("vlc") || prog.eq_ignore_ascii_case("vlc.exe") {
+        vlc_known_dirs()
+    } else {
+        Vec::new()
+    };
+    player_candidates(prog, &path_dirs, app_path.as_deref(), &known)
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Launch the configured external player with the stream URL.
-/// Returns the program name on success.
+/// Returns the program name (as configured) on success.
 fn launch_player(player_cmd: &str, url: &str) -> Result<String, String> {
     let mut parts = player_cmd.split_whitespace();
     let prog = parts.next().unwrap_or("vlc").to_string();
-    Command::new(&prog)
+    let spawn_path = match resolve_player_program(&prog) {
+        Some(p) => p,
+        None => {
+            return Err(format!(
+                "{}: program not found (searched PATH, the Windows App Paths registry entries, and the usual install folders)",
+                prog
+            ))
+        }
+    };
+    Command::new(&spawn_path)
         .args(parts)
         .arg(url)
         .spawn()
         .map(|_| prog.clone())
         .map_err(|e| format!("{}: {}", prog, e))
+}
+
+// ---------------------------------------------------------------------------
+// Live camera previews (v1.2.0, Windows edition) — a bundled ffmpeg.exe
+// decodes each camera's RTSP stream to raw RGBA frames on a worker
+// thread; camera tiles and the big player upload the latest frame as
+// an egui texture, updated in place. One pump per key ("cam:{id}" for
+// tiles, "player" for the big player), driven by a small state
+// machine: Connecting → Live, and on ffmpeg exit/EOF → Backoff with
+// 2 s / 5 s / 15 s retry delays while the preview stays on. The web
+// edition can't run ffmpeg, so its tiles embed the gateway feed
+// instead — a documented platform difference (DESIGN.md).
+// ---------------------------------------------------------------------------
+
+const TILE_W: usize = 480;
+const TILE_H: usize = 270;
+const PLAYER_W: usize = 960;
+const PLAYER_H: usize = 540;
+
+/// Bytes per raw RGBA frame at w×h.
+fn frame_bytes(w: usize, h: usize) -> usize {
+    w * h * 4
+}
+
+/// ffmpeg arguments for the frame pump: TCP RTSP in, scaled + padded
+/// to exactly w×h at 12 fps, raw RGBA frames on stdout. The URL (with
+/// credentials) travels as a single argv — never through a shell.
+fn ffmpeg_args(url: &str, w: usize, h: usize) -> Vec<String> {
+    vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-rtsp_transport".to_string(),
+        "tcp".to_string(),
+        "-i".to_string(),
+        url.to_string(),
+        "-vf".to_string(),
+        format!(
+            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,fps=12",
+            w, h, w, h
+        ),
+        "-f".to_string(),
+        "rawvideo".to_string(),
+        "-pix_fmt".to_string(),
+        "rgba".to_string(),
+        "-".to_string(),
+    ]
+}
+
+/// Candidate ffmpeg locations, in lookup order: (1) beside the app
+/// exe (the installer puts it there), (2) the Settings override (a
+/// path, or a bare name resolved against PATH), (3) PATH.
+fn ffmpeg_candidates(exe_dir: &Path, override_path: &str, path_var: &str) -> Vec<PathBuf> {
+    let bin = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let mut out: Vec<PathBuf> = Vec::new();
+    out.push(exe_dir.join(bin));
+    let ov = override_path.trim();
+    if !ov.is_empty() {
+        let p = PathBuf::from(ov);
+        if p.parent().map(|par| !par.as_os_str().is_empty()).unwrap_or(false) {
+            out.push(p);
+        } else {
+            for dir in std::env::split_paths(path_var) {
+                out.push(dir.join(ov));
+            }
+        }
+    }
+    for dir in std::env::split_paths(path_var) {
+        out.push(dir.join(bin));
+    }
+    out
+}
+
+/// Locate ffmpeg: bundled beside the exe first, then the Settings
+/// override, then PATH. None → previews off, Watch falls back.
+fn find_ffmpeg(override_path: &str) -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    ffmpeg_candidates(&exe_dir, override_path, &path_var.to_string_lossy())
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// Retry delay after a pump failure: 2 s, 5 s, then a 15 s cap.
+fn pump_backoff(streak: u32) -> Duration {
+    match streak {
+        0 => Duration::from_secs(2),
+        1 => Duration::from_secs(5),
+        _ => Duration::from_secs(15),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PumpState {
+    Connecting,
+    Live,
+    Backoff,
+}
+
+enum FrameMsg {
+    Frame(Vec<u8>),
+    Ended,
+}
+
+/// Identity of one pump's feed — when it changes (camera edited,
+/// quality switched, ffmpeg moved) the pump is restarted.
+fn pump_source_key(ffmpeg: &Path, url: &str, w: usize, h: usize) -> String {
+    format!("{}|{}|{}x{}", ffmpeg.display(), url, w, h)
+}
+
+/// One running (or backing-off) frame pump, owned by the UI thread.
+struct Pump {
+    state: PumpState,
+    source_key: String,
+    w: usize,
+    h: usize,
+    rx: Receiver<FrameMsg>,
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<std::process::Child>>>,
+    texture: Option<egui::TextureHandle>,
+    /// Consecutive failures — drives the backoff schedule.
+    streak: u32,
+    retry_at: Option<Instant>,
+}
+
+impl Pump {
+    /// Stop the worker: flag it and kill ffmpeg (killing closes
+    /// stdout, which ends the worker's read loop immediately).
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = self.child.lock() {
+            if let Some(mut ch) = slot.take() {
+                let _ = ch.kill();
+            }
+        }
+    }
+
+    /// A frame arrived: the pump is Live and the failure streak
+    /// resets (state-machine transition, kept pure for tests).
+    fn note_frame(&mut self) {
+        self.state = PumpState::Live;
+        self.streak = 0;
+        self.retry_at = None;
+    }
+
+    /// ffmpeg exited / hit EOF: enter Backoff with the streak's
+    /// delay. A no-op when already backing off — one pump, one
+    /// state machine, never duplicate restarts.
+    fn note_ended(&mut self) {
+        if self.state != PumpState::Backoff {
+            self.state = PumpState::Backoff;
+            self.retry_at = Some(Instant::now() + pump_backoff(self.streak));
+            self.streak += 1;
+        }
+    }
+}
+
+/// Spawn the worker thread for one pump. The thread runs ffmpeg,
+/// reads exact w×h RGBA frames and forwards them; it keeps ffmpeg
+/// blocked on a full pipe rather than building a backlog here, and
+/// the UI keeps only the latest frame, so a slow frame is dropped,
+/// never queued.
+fn spawn_pump(ffmpeg: &Path, url: &str, w: usize, h: usize, ctx: &egui::Context) -> Pump {
+    let (tx, rx) = channel::<FrameMsg>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let child_slot: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+    let source_key = pump_source_key(ffmpeg, url, w, h);
+    {
+        let stop = stop.clone();
+        let child_slot = child_slot.clone();
+        let ctx = ctx.clone();
+        let ff = ffmpeg.to_path_buf();
+        let url = url.to_string();
+        thread::spawn(move || {
+            let mut cmd = Command::new(&ff);
+            cmd.args(ffmpeg_args(&url, w, h))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            // No console window flashing up next to the GUI app.
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = tx.send(FrameMsg::Ended);
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let mut stdout = child.stdout.take();
+            if let Ok(mut slot) = child_slot.lock() {
+                *slot = Some(child);
+            }
+            if let Some(mut out) = stdout.take() {
+                let mut buf = vec![0u8; frame_bytes(w, h)];
+                loop {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match out.read_exact(&mut buf) {
+                        Ok(()) => {
+                            if tx.send(FrameMsg::Frame(buf.clone())).is_err() {
+                                break;
+                            }
+                            ctx.request_repaint();
+                        }
+                        Err(_) => break, // EOF: ffmpeg exited or was killed
+                    }
+                }
+            }
+            // Reap ffmpeg if the UI didn't already take it to kill it.
+            if let Ok(mut slot) = child_slot.lock() {
+                if let Some(mut ch) = slot.take() {
+                    let _ = ch.kill();
+                    let _ = ch.wait();
+                }
+            }
+            if !stop.load(Ordering::SeqCst) {
+                let _ = tx.send(FrameMsg::Ended);
+                ctx.request_repaint();
+            }
+        });
+    }
+    Pump {
+        state: PumpState::Connecting,
+        source_key,
+        w,
+        h,
+        rx,
+        stop,
+        child: child_slot,
+        texture: None,
+        streak: 0,
+        retry_at: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,7 +1747,7 @@ fn net_discovery(
     let body = skill_body("Discovery", json!({ "accessToken": session.access_token }));
     let json = net_skill(client, session, &body, prefs).map_err(DiscoveryFail::Msg)?;
     if let Some(code) = json.get("header").and_then(|h| h.get("code")).and_then(|v| v.as_str()) {
-        if code == "FrequentlyInvoke" {
+        if is_rate_limit_code(code) {
             return Err(DiscoveryFail::Frequent);
         }
     }
@@ -1372,14 +1771,52 @@ enum DiscoveryFail {
     Msg(String),
 }
 
-fn net_control(
+// ---------------------------------------------------------------------------
+// Rate limiting (v1.2.0): Tuya answers bursts with a "FrequentlyInvoke"
+// header code. By product decision the app NEVER surfaces rate-limit
+// warnings — no toasts, banners or status lines. Instead: discovery
+// falls back to the cached devices and backs off internally (see
+// App::note_rate_limited), and control commands retry silently
+// (net_control below) before anything counts as a failure. Genuine
+// errors (device offline, command rejected) are still reported.
+// ---------------------------------------------------------------------------
+
+/// True when a skill-response header code means "rate limited".
+fn is_rate_limit_code(code: &str) -> bool {
+    code.eq_ignore_ascii_case("FrequentlyInvoke")
+        || code.eq_ignore_ascii_case("TooManyRequests")
+        || code.to_ascii_lowercase().contains("frequent")
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ControlOutcome {
+    Ok,
+    RateLimited,
+    Failed,
+}
+
+/// Classify a control response the way the control paths need.
+fn control_outcome(json: &Value) -> ControlOutcome {
+    match json
+        .get("header")
+        .and_then(|h| h.get("code"))
+        .and_then(|v| v.as_str())
+    {
+        Some("SUCCESS") => ControlOutcome::Ok,
+        Some(code) if is_rate_limit_code(code) => ControlOutcome::RateLimited,
+        _ => ControlOutcome::Failed,
+    }
+}
+
+/// A single control attempt, classified.
+fn net_control_once(
     client: &reqwest::blocking::Client,
     session: &Session,
     dev_id: &str,
     action: &str,
     value: &Value,
     prefs: &Prefs,
-) -> bool {
+) -> ControlOutcome {
     let mut payload = Map::new();
     payload.insert("accessToken".into(), Value::String(session.access_token.clone()));
     payload.insert("devId".into(), Value::String(dev_id.to_string()));
@@ -1390,11 +1827,34 @@ fn net_control(
     }
     let body = skill_body(action, Value::Object(payload));
     match net_skill(client, session, &body, prefs) {
-        Ok(json) => {
-            json.get("header").and_then(|h| h.get("code")).and_then(|v| v.as_str()) == Some("SUCCESS")
-        }
-        Err(_) => false,
+        Ok(json) => control_outcome(&json),
+        Err(_) => ControlOutcome::Failed,
     }
+}
+
+/// One control command with silent rate-limit retries: up to 2 extra
+/// attempts, ~1 s apart, when Tuya rate-limits — the retry delay is
+/// also the extra spacing group broadcasts rely on. Only a genuine
+/// failure (or a third rate-limit) returns false, and only then does
+/// the caller roll back / report it.
+fn net_control(
+    client: &reqwest::blocking::Client,
+    session: &Session,
+    dev_id: &str,
+    action: &str,
+    value: &Value,
+    prefs: &Prefs,
+) -> bool {
+    for attempt in 0..3 {
+        match net_control_once(client, session, dev_id, action, value, prefs) {
+            ControlOutcome::Ok => return true,
+            ControlOutcome::RateLimited if attempt < 2 => {
+                thread::sleep(Duration::from_secs(1));
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,6 +2037,17 @@ struct App {
     section_rects: Vec<(String, egui::Rect)>,
     sections_cache: Vec<Section>,
     drag: Option<DragState>,
+    // rate-limit backoff (v1.2.0): while set, autorefresh skips
+    // discovery cycles instead of warning the user.
+    disc_backoff_until: Option<Instant>,
+    disc_freq_streak: u32,
+    // live camera previews (v1.2.0): frame pumps keyed "cam:{id}"
+    // (tiles) and "player" (the big player window).
+    pumps: HashMap<String, Pump>,
+    paused_cams: HashSet<String>,
+    player_for: Option<String>,
+    /// ffmpeg lookup cache: (override string it was computed for, hit).
+    ffmpeg_cache: Option<(String, Option<PathBuf>)>,
 }
 
 /// State of the Add/Edit camera dialog (Rust edition of the web modal).
@@ -1687,6 +2158,12 @@ impl App {
             section_rects: Vec::new(),
             sections_cache: Vec::new(),
             drag: None,
+            disc_backoff_until: None,
+            disc_freq_streak: 0,
+            pumps: HashMap::new(),
+            paused_cams: HashSet::new(),
+            player_for: None,
+            ffmpeg_cache: None,
             applied_style: None,
             view: View::Login,
             cfg: Config::default(),
@@ -2050,6 +2527,12 @@ impl App {
         if let Some(ci) = self.camera_index(item_id) {
             self.cfg.cameras.remove(ci);
         }
+        // Its pumps stop on the next sync_pumps pass (no longer
+        // desired); close the player if it was showing this camera.
+        if self.player_for.as_deref() == Some(item_id) {
+            self.player_for = None;
+        }
+        self.paused_cams.remove(item_id);
         let lay = &mut self.cfg.layout;
         lay.pins.retain(|x| x != item_id);
         lay.hidden.retain(|x| x != item_id);
@@ -2063,16 +2546,156 @@ impl App {
         self.toast("Camera deleted", false);
     }
 
-    /// Watch a camera: gateway watch page in the default browser when a
-    /// stream gateway is configured, else the external player command.
-    fn watch_camera(&mut self, item_id: &str) {
+    // ---------------- live camera previews (v1.2.0) ----------------
+
+    /// ffmpeg location, cached per override string (the lookup stats
+    /// a handful of paths; the Settings field is the only input that
+    /// changes, besides the files themselves).
+    fn ffmpeg_path(&mut self) -> Option<PathBuf> {
+        let key = self.cfg.prefs.ffmpeg_path.clone();
+        if let Some((k, v)) = &self.ffmpeg_cache {
+            if *k == key {
+                return v.clone();
+            }
+        }
+        let found = find_ffmpeg(&key);
+        self.ffmpeg_cache = Some((key, found.clone()));
+        found
+    }
+
+    /// Read-only view of the cached lookup (rendering paths). Stale
+    /// entries (override just edited) resolve on the spot — the cache
+    /// itself is refreshed by ffmpeg_path() from sync_pumps each frame
+    /// before anything renders.
+    fn ffmpeg_cached(&self) -> Option<PathBuf> {
+        match &self.ffmpeg_cache {
+            Some((k, v)) if *k == self.cfg.prefs.ffmpeg_path => v.clone(),
+            _ => find_ffmpeg(&self.cfg.prefs.ffmpeg_path),
+        }
+    }
+
+    /// Reconcile running pumps with what's wanted — called every
+    /// frame from update(), before rendering:
+    ///  - a TILE pump per non-hidden camera while previews are on and
+    ///    the camera isn't paused (Stream 2 for Tapo templates);
+    ///  - the PLAYER pump while the player window is open (the
+    ///    camera's current quality selection).
+    /// A pump whose source changed (camera edited, quality switched,
+    /// ffmpeg moved) is restarted; an unwanted pump is stopped; a
+    /// pump in Backoff restarts when its delay lapses. One pump per
+    /// key, never duplicates. Latest frames are uploaded here as egui
+    /// textures, in place.
+    fn sync_pumps(&mut self, ctx: &egui::Context) {
+        let ff = self.ffmpeg_path();
+        let mut desired: HashMap<String, String> = HashMap::new(); // key -> source key
+        let mut specs: HashMap<String, (String, usize, usize)> = HashMap::new(); // key -> (url, w, h)
+        if let Some(ffp) = &ff {
+            if self.cfg.prefs.previews {
+                for cam in &self.cfg.cameras {
+                    let item = format!("cam:{}", cam.id);
+                    if self.cfg.layout.hidden.contains(&item)
+                        || self.paused_cams.contains(&item)
+                    {
+                        continue;
+                    }
+                    let url = tile_rtsp_url(cam);
+                    desired.insert(item.clone(), pump_source_key(ffp, &url, TILE_W, TILE_H));
+                    specs.insert(item, (url, TILE_W, TILE_H));
+                }
+            }
+            if let Some(item) = &self.player_for {
+                if let Some(ci) = self.camera_index(item) {
+                    let cam = self.cfg.cameras[ci].clone();
+                    let url = build_rtsp_url(&cam);
+                    desired.insert(
+                        "player".to_string(),
+                        pump_source_key(ffp, &url, PLAYER_W, PLAYER_H),
+                    );
+                    specs.insert("player".to_string(), (url, PLAYER_W, PLAYER_H));
+                }
+            }
+        }
+        // Stop pumps that are unwanted or whose source changed.
+        let keys: Vec<String> = self.pumps.keys().cloned().collect();
+        for k in keys {
+            let stale = match (self.pumps.get(&k), desired.get(&k)) {
+                (Some(p), Some(want)) => p.source_key != *want,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if stale {
+                if let Some(p) = self.pumps.remove(&k) {
+                    p.stop();
+                }
+            }
+        }
+        // Start missing pumps; restart Backoff pumps whose time came
+        // (keeping the texture + streak so the tile doesn't flicker
+        // back to a blank "Connecting…" on every retry).
+        if let Some(ffp) = &ff {
+            for (k, want) in &desired {
+                let needs_start = match self.pumps.get(k) {
+                    None => true,
+                    Some(p) => {
+                        p.state == PumpState::Backoff
+                            && p.retry_at.map(|t| Instant::now() >= t).unwrap_or(false)
+                    }
+                };
+                if needs_start {
+                    if let Some((url, w, h)) = specs.get(k) {
+                        let mut np = spawn_pump(ffp, url, *w, *h, ctx);
+                        debug_assert_eq!(&np.source_key, want);
+                        if let Some(mut old) = self.pumps.remove(k) {
+                            np.streak = old.streak;
+                            np.texture = old.texture.take();
+                            old.stop();
+                        }
+                        self.pumps.insert(k.clone(), np);
+                    }
+                }
+            }
+        }
+        // Drain frame channels: keep only the LATEST frame per pump.
+        let mut any_active = false;
+        for (k, p) in self.pumps.iter_mut() {
+            let mut latest: Option<Vec<u8>> = None;
+            let mut ended = false;
+            while let Ok(m) = p.rx.try_recv() {
+                match m {
+                    FrameMsg::Frame(f) => latest = Some(f),
+                    FrameMsg::Ended => ended = true,
+                }
+            }
+            if let Some(f) = latest {
+                let img = egui::ColorImage::from_rgba_unmultiplied([p.w, p.h], &f);
+                match &mut p.texture {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => {
+                        p.texture = Some(ctx.load_texture(
+                            format!("pump-{}", k),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        ))
+                    }
+                }
+                p.note_frame();
+            }
+            if ended {
+                p.note_ended();
+            }
+            if p.state != PumpState::Backoff {
+                any_active = true;
+            }
+        }
+        if any_active {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    /// Hand a camera's stream to the configured external player app.
+    fn open_external_player(&mut self, item_id: &str) {
         let Some(ci) = self.camera_index(item_id) else { return };
         let cam = self.cfg.cameras[ci].clone();
-        if let Some(url) = gateway_watch_url(&cam, &self.cfg.prefs) {
-            open_external(&url);
-            self.toast("Stream opened in your browser", false);
-            return;
-        }
         let url = build_rtsp_url(&cam);
         match launch_player(&self.cfg.prefs.player_cmd, &url) {
             Ok(prog) => self.toast(&format!("Opening stream in {}…", prog), false),
@@ -2084,6 +2707,24 @@ impl App {
                 true,
             ),
         }
+    }
+
+    /// Watch a camera: gateway watch page in the default browser when
+    /// a stream gateway is configured; else the in-app player when
+    /// ffmpeg is available (v1.2.0); else the external player.
+    fn watch_camera(&mut self, item_id: &str) {
+        let Some(ci) = self.camera_index(item_id) else { return };
+        let cam = self.cfg.cameras[ci].clone();
+        if let Some(url) = gateway_watch_url(&cam, &self.cfg.prefs) {
+            open_external(&url);
+            self.toast("Stream opened in your browser", false);
+            return;
+        }
+        if self.ffmpeg_path().is_some() {
+            self.player_for = Some(item_id.to_string());
+            return;
+        }
+        self.open_external_player(item_id);
     }
 
     // ---------------- drag & drop (Edit mode) ----------------
@@ -2393,8 +3034,10 @@ impl App {
 
     /// Broadcast one group action to a section's members: optimistic
     /// local updates now, then ONE thread sends the commands
-    /// sequentially (~200 ms apart — Tuya rate-limits bursts) and
-    /// reports back a GroupDone summary.
+    /// sequentially (~200 ms apart) and reports back a GroupDone
+    /// summary. A member Tuya rate-limits is retried silently after
+    /// ~1 s inside net_control (that wait is its extra spacing), so
+    /// the summary only ever names genuine failures (v1.2.0).
     fn group_broadcast(&mut self, sec: &Section, kind: GroupKind, num: i64, hex: Option<String>) {
         let full = build_sections(&self.all_entries(), &self.cfg.layout, self.editing, "");
         let Some(fsec) = full.iter().find(|s| s.key == sec.key) else { return };
@@ -2461,6 +3104,24 @@ impl App {
 
     // ---------------- net result handling ----------------
 
+    /// Tuya rate-limited a discovery call: never warn (v1.2.0) — the
+    /// app keeps showing the last known states and stretches the
+    /// effective refresh interval instead. The backoff grows with
+    /// consecutive hits (interval ×2, ×4, ×8; at least 60 s, at most
+    /// 5 min) and resets on the next successful fetch.
+    fn note_rate_limited(&mut self) {
+        self.disc_freq_streak = self.disc_freq_streak.saturating_add(1);
+        let shift = self.disc_freq_streak.min(3);
+        let secs = self
+            .cfg
+            .prefs
+            .interval
+            .saturating_mul(1 << shift)
+            .max(60)
+            .min(300);
+        self.disc_backoff_until = Some(Instant::now() + Duration::from_secs(secs));
+    }
+
     fn poll_net(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -2474,7 +3135,11 @@ impl App {
                     self.cfg.session = Some(session);
                     self.view = View::Dashboard;
                     if devices.is_empty() {
-                        self.toast("Tuya is rate-limiting the device list — press Refresh in a few seconds", true);
+                        // The login-time discovery was rate-limited:
+                        // silent (v1.2.0) — cached devices (if any) are
+                        // already on screen, and the backoff lets
+                        // autorefresh quietly fill the list in.
+                        self.note_rate_limited();
                         self.save();
                     } else {
                         self.set_devices(devices, true);
@@ -2491,6 +3156,8 @@ impl App {
                 }
                 NetResult::DiscOk { session, devices } => {
                     self.disc_busy = false;
+                    self.disc_freq_streak = 0;
+                    self.disc_backoff_until = None;
                     self.session = Some(session.clone());
                     self.cfg.session = Some(session);
                     self.set_devices(devices, true);
@@ -2500,10 +3167,10 @@ impl App {
                     self.session = Some(session.clone());
                     self.cfg.session = Some(session);
                     self.save();
-                    if self.devices.is_empty() {
-                        self.toast("Tuya is rate-limiting the device list — wait a few seconds and press Refresh", true);
-                    } else {
-                        self.toast("Tuya is rate-limiting — showing last known states", false);
+                    // Silent (v1.2.0): keep showing the last known
+                    // states and back off internally — no toast.
+                    self.note_rate_limited();
+                    if !self.devices.is_empty() {
                         self.last_fetch = Some(Instant::now());
                     }
                 }
@@ -3364,7 +4031,15 @@ impl App {
     /// open). Part of the row-height cache signature.
     fn card_shape(&self, id: &str) -> String {
         if let Some(ci) = self.camera_index(id) {
-            format!("cam:{}", self.cfg.cameras[ci].template)
+            // The live-preview video area adds a fixed 16:9 block, so
+            // preview state is part of the shape (v1.2.0).
+            let video = self.cfg.prefs.previews && self.ffmpeg_cached().is_some();
+            format!(
+                "cam:{}:{}:{}",
+                self.cfg.cameras[ci].template,
+                video,
+                self.paused_cams.contains(id)
+            )
         } else if let Some(di) = self.device_index(id) {
             let d = &self.devices[di];
             format!(
@@ -3778,6 +4453,19 @@ impl App {
             (16.0, 15.0, 14.0, R_CARD)
         };
         let pinned = self.cfg.layout.pins.contains(&id.to_string());
+        // Live preview (v1.2.0): with previews on and ffmpeg found, a
+        // 16:9 video area replaces the plain icon header. Everything
+        // the closure needs is copied out first (it borrows self).
+        let show_video = self.cfg.prefs.previews && self.ffmpeg_cached().is_some();
+        let paused = self.paused_cams.contains(id);
+        let (pump_state, pump_tex) = if show_video {
+            match self.pumps.get(id) {
+                Some(p) => (Some(p.state), p.texture.as_ref().map(|t| t.id())),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         Frame::none()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
@@ -3788,26 +4476,110 @@ impl App {
                 if fill_h > 0.0 {
                     ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
                 }
+                // ---------- live video (replaces the icon header) ----------
+                if show_video {
+                    let vw = (card_w - 2.0 * pad_x).max(80.0);
+                    let vh = vw * 9.0 / 16.0;
+                    let (rect, resp) =
+                        ui.allocate_exact_size(vec2(vw, vh), Sense::click());
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, Rounding::same(8.0), Color32::BLACK);
+                    if let Some(tid) = pump_tex {
+                        painter.image(
+                            tid,
+                            rect,
+                            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        if pump_state == Some(PumpState::Backoff) && !paused {
+                            // Frozen last frame + a quiet retry note.
+                            painter.text(
+                                pos2(rect.left() + 8.0, rect.bottom() - 10.0),
+                                Align2::LEFT_CENTER,
+                                "Feed unavailable — retrying",
+                                FontId::proportional(11.5),
+                                Color32::WHITE,
+                            );
+                        }
+                    } else {
+                        let msg = if paused {
+                            "Preview paused"
+                        } else {
+                            match pump_state {
+                                Some(PumpState::Backoff) => "Feed unavailable — retrying",
+                                _ => "Connecting…",
+                            }
+                        };
+                        painter.text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            msg,
+                            FontId::proportional(13.0),
+                            pal.dim,
+                        );
+                    }
+                    if pump_state == Some(PumpState::Live) && !paused {
+                        // LIVE badge: red dot + label, top-left.
+                        let c = pos2(rect.left() + 11.0, rect.top() + 11.0);
+                        painter.circle_filled(c, 4.0, Color32::from_rgb(0xe5, 0x39, 0x35));
+                        painter.text(
+                            pos2(c.x + 8.0, c.y),
+                            Align2::LEFT_CENTER,
+                            "LIVE",
+                            FontId::proportional(11.0),
+                            Color32::WHITE,
+                        );
+                    }
+                    if resp.clicked() {
+                        self.player_for = Some(id.to_string());
+                    }
+                    resp.on_hover_text("Open the big player");
+                    // Pause / resume the tile preview, top-right.
+                    let btn_rect = egui::Rect::from_min_size(
+                        pos2(rect.right() - 36.0, rect.top() + 5.0),
+                        vec2(30.0, 24.0),
+                    );
+                    let pbtn = ui
+                        .put(
+                            btn_rect,
+                            Button::new(if paused { "▶" } else { "▮▮" }).small(),
+                        )
+                        .on_hover_text(if paused {
+                            "Resume preview"
+                        } else {
+                            "Pause preview"
+                        });
+                    if pbtn.clicked() {
+                        if paused {
+                            self.paused_cams.remove(id);
+                        } else {
+                            self.paused_cams.insert(id.to_string());
+                        }
+                    }
+                    ui.add_space(10.0);
+                }
                 // ---------- top row ----------
                 ui.horizontal(|ui| {
                     if self.editing {
                         ui.label(RichText::new("⠿").color(pal.dim).size(16.0));
                     }
                     let icon_size = if compact { 36.0 } else { 42.0 };
-                    Frame::none()
-                        .fill(pal.track)
-                        .rounding(Rounding::same(if compact { 11.0 } else { 13.0 }))
-                        .show(ui, |ui| {
-                            ui.allocate_ui_with_layout(
-                                vec2(icon_size, icon_size),
-                                Layout::centered_and_justified(egui::Direction::LeftToRight),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("📷").size(if compact { 18.0 } else { 21.0 }),
-                                    );
-                                },
-                            );
-                        });
+                    if !show_video {
+                        Frame::none()
+                            .fill(pal.track)
+                            .rounding(Rounding::same(if compact { 11.0 } else { 13.0 }))
+                            .show(ui, |ui| {
+                                ui.allocate_ui_with_layout(
+                                    vec2(icon_size, icon_size),
+                                    Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("📷").size(if compact { 18.0 } else { 21.0 }),
+                                        );
+                                    },
+                                );
+                            });
+                    }
                     let name_w = (ui.available_width() - 60.0 - 8.0).max(40.0);
                     ui.allocate_ui_with_layout(
                         vec2(name_w, icon_size),
@@ -3889,6 +4661,16 @@ impl App {
                     if ui.add(Button::new("Copy URL")).clicked() {
                         ui.ctx().copy_text(build_rtsp_url(&cam));
                         self.toast("Stream URL copied", false);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(Button::new("Open in external player").small())
+                        .on_hover_text("Hand the stream to the player app named in Settings")
+                        .clicked()
+                    {
+                        self.open_external_player(id);
                     }
                 });
                 // ---------- edit tools ----------
@@ -4230,11 +5012,46 @@ impl App {
                         // ---- Stream gateway & cameras ----
                         Self::settings_panel(ui, &pal, "Stream gateway & cameras", |ui| {
                             ui.label(
-                                RichText::new("Cameras you add (✎ Edit → + Add camera) stream over RTSP, which this app can't play directly. Point ▶ Watch at a small stream gateway on your network — go2rtc or MediaMTX — and Watch opens the gateway's watch page in your browser. The gateway needs a stream with the same name as the camera here, fed from the same RTSP address (the card's Copy URL button gives you the exact address). Leave the address empty to hand streams to an external player app instead.")
+                                RichText::new("Cameras you add (✎ Edit → + Add camera) stream over RTSP. This app plays them in place: a bundled copy of ffmpeg decodes each stream for the live tile previews and the ▶ Watch player — it just works, nothing to set up. Alternatively, point ▶ Watch at a small stream gateway on your network — go2rtc or MediaMTX — and Watch opens the gateway's watch page in your browser instead (the gateway needs a stream with the same name as the camera here, fed from the same RTSP address — the card's Copy URL button gives you the exact address). If ffmpeg can't be found, previews switch off and Watch falls back to the external player app below.")
                                     .size(12.5)
                                     .color(pal.dim),
                             );
                             ui.add_space(8.0);
+                            let mut previews = self.cfg.prefs.previews;
+                            if ui
+                                .checkbox(&mut previews, "Live camera previews")
+                                .changed()
+                            {
+                                self.cfg.prefs.previews = previews;
+                                self.save();
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Live video inside each camera tile (Stream 2 on Tapo cameras, to keep it light). The ▶ Watch player always uses the quality picked on the card.")
+                                    .size(12.5)
+                                    .color(pal.dim),
+                            );
+                            ui.add_space(10.0);
+                            Self::field_label(ui, &pal, "ffmpeg path (optional override)");
+                            let mut ff = self.cfg.prefs.ffmpeg_path.clone();
+                            if ui
+                                .add(
+                                    TextEdit::singleline(&mut ff)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("Leave empty — the bundled ffmpeg is used"),
+                                )
+                                .changed()
+                            {
+                                self.cfg.prefs.ffmpeg_path = ff;
+                                self.save();
+                            }
+                            ui.add_space(4.0);
+                            let ff_status = match self.ffmpeg_path() {
+                                Some(p) => format!("ffmpeg found: {}", p.display()),
+                                None => "ffmpeg not found — previews are off and ▶ Watch uses the external player.".to_string(),
+                            };
+                            ui.label(RichText::new(ff_status).size(12.5).color(pal.dim));
+                            ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Stream gateway address (optional)");
                             let mut gw = self.cfg.prefs.gateway_url.clone();
                             if ui
@@ -4263,7 +5080,7 @@ impl App {
                                 self.save();
                             }
                             ui.add_space(10.0);
-                            Self::field_label(ui, &pal, "External player command");
+                            Self::field_label(ui, &pal, "External player command (fallback)");
                             let mut pc = self.cfg.prefs.player_cmd.clone();
                             if ui
                                 .add(
@@ -4278,7 +5095,7 @@ impl App {
                             }
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new("Used when no gateway address is set: Watch starts this program with the stream URL as its only argument.")
+                                RichText::new("The fallback when ffmpeg isn't available (and what “Open in external player” uses): this program is started with the stream URL as its only argument. A bare name like vlc is found even when it isn't on PATH — the Windows App Paths registry entries and the usual install folders are checked too.")
                                     .size(12.5)
                                     .color(pal.dim),
                             );
@@ -4346,8 +5163,8 @@ impl App {
                                 "Customising. Sections sort A–Z by name by default. Use ✎ Edit to drag cards into your own order inside a section — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top — the device also stays in its group below. Scenes always live in their own Scenes section.",
                                 "Lighting & group controls. Lights organise themselves: any bulb or strip that isn't assigned to one of your groups lives in the built-in Lighting section, and cameras get their own built-in Cameras section the same way — assigning a device to a group always wins over the automatic sections. The Lighting header (and the header of any group containing a light) has group controls: a master switch (on if any member is on; clicking turns the whole group on or off), brightness and colour-temperature sliders showing the members' average, and colour swatches. Group controls broadcast — they send the command to each member in turn, and changing a single light afterwards simply overrides it for that light. Nothing about the group itself is stored.",
                                 "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way; unassigned cameras live in the built-in Cameras section until you assign them to a group of your own.",
-                                "Watching a stream. RTSP can't play inside this app. Without a gateway, ▶ Watch hands the stream address to the player app named in Settings → Stream gateway & cameras (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. For in-browser playback, run a small stream gateway such as go2rtc or MediaMTX on your network, give it a stream with the same name as the camera here (fed from the same RTSP address — Copy URL has it), and enter the gateway's address in Settings → Stream gateway & cameras. ▶ Watch then opens the gateway's watch page in your browser.",
-                                "Limits. Tuya rate-limits the device-list call; if you refresh very often the app may briefly show the last known states. Autorefresh every 30s or slower is comfortable.",
+                                "Watching a stream. This app plays RTSP streams in place: a bundled copy of ffmpeg decodes the feed for the live tile previews (Tapo Stream 2, the standard-quality stream, to keep tiles light) and for the big ▶ Watch player, which uses the quality picked on the card. Tile previews can be turned off in Settings → Stream gateway & cameras, where you can also point the app at a different ffmpeg. If ffmpeg can't be found, previews switch off and ▶ Watch falls back to the external player app named in Settings (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. If a stream gateway (go2rtc / MediaMTX) is configured instead, ▶ Watch opens the gateway's watch page in your browser. (The web edition of this app can't decode RTSP itself: with a gateway configured, its tiles embed the gateway's feed; without one, its Watch hands the stream to a player app.)",
+                                "Limits. Tuya rate-limits how often the device list can be fetched and how fast commands can be sent. When that happens the app quietly keeps showing the last known states, retries commands a moment later, and stretches its refresh interval until Tuya is happy again — no action needed. Autorefresh every 30s or slower is comfortable.",
                             ];
                             for p in paras {
                                 ui.label(RichText::new(p).size(13.5).color(pal.dim));
@@ -4358,6 +5175,130 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// The big in-app player (v1.2.0): a 960×540 ffmpeg pump for one
+    /// camera at its current quality selection, with a quality
+    /// switch, external-player hand-off and Close. Closing stops the
+    /// pump (sync_pumps no longer wants it).
+    fn player_window(&mut self, ctx: &egui::Context) {
+        let Some(item) = self.player_for.clone() else { return };
+        let Some(ci) = self.camera_index(&item) else {
+            self.player_for = None;
+            return;
+        };
+        let cam = self.cfg.cameras[ci].clone();
+        let pal = self.pal();
+        let accent = self.accent();
+        let (pump_state, pump_tex) = match self.pumps.get("player") {
+            Some(p) => (Some(p.state), p.texture.as_ref().map(|t| t.id())),
+            None => (None, None),
+        };
+        let mut close = false;
+        let mut open_ext = false;
+        let mut copy_url = false;
+        let mut set_tpl: Option<String> = None;
+        egui::Window::new(format!("▶ {}", cam.name))
+            .collapsible(false)
+            .resizable(true)
+            .default_size(vec2(880.0, 580.0))
+            .show(ctx, |ui| {
+                let vw = ui.available_width().max(240.0);
+                let vh = (vw * 9.0 / 16.0).min(540.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(vw, vh), Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, Rounding::same(8.0), Color32::BLACK);
+                if let Some(tid) = pump_tex {
+                    painter.image(
+                        tid,
+                        rect,
+                        egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    if pump_state == Some(PumpState::Backoff) {
+                        painter.text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            "Feed unavailable — retrying",
+                            FontId::proportional(14.0),
+                            Color32::WHITE,
+                        );
+                    }
+                } else {
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        match pump_state {
+                            Some(PumpState::Backoff) => "Feed unavailable — retrying",
+                            _ => "Connecting…",
+                        },
+                        FontId::proportional(14.0),
+                        pal.dim,
+                    );
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(camera_status_text(&cam)).size(12.5).color(pal.dim),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(Button::new("Close")).clicked() {
+                            close = true;
+                        }
+                        if ui.add(Button::new("Copy URL")).clicked() {
+                            copy_url = true;
+                        }
+                        if ui
+                            .add(Button::new("Open in external player"))
+                            .on_hover_text(
+                                "Hand the stream to the player app named in Settings",
+                            )
+                            .clicked()
+                        {
+                            open_ext = true;
+                        }
+                    });
+                });
+                // Quality switch (Tapo templates) — the same selection
+                // the card's segment buttons edit; the pump restarts
+                // on the new stream.
+                if cam.template == "tapo1" || cam.template == "tapo2" {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Quality").size(12.5).color(pal.dim));
+                        for (tpl, label) in
+                            [("tapo1", "Stream 1 · HD"), ("tapo2", "Stream 2 · SD")]
+                        {
+                            let active = cam.template == tpl;
+                            let btn = if active {
+                                Button::new(RichText::new(label).color(Color32::WHITE))
+                                    .fill(accent)
+                            } else {
+                                Button::new(label)
+                            };
+                            if ui.add(btn).clicked() && !active {
+                                set_tpl = Some(tpl.to_string());
+                            }
+                        }
+                    });
+                }
+            });
+        if let Some(tpl) = set_tpl {
+            if let Some(ci2) = self.camera_index(&item) {
+                self.cfg.cameras[ci2].template = tpl;
+                self.save();
+            }
+        }
+        if copy_url {
+            ctx.copy_text(build_rtsp_url(&cam));
+            self.toast("Stream URL copied", false);
+        }
+        if open_ext {
+            self.open_external_player(&item);
+        }
+        if close {
+            self.player_for = None;
+        }
     }
 
     /// Add/Edit camera dialog — the Rust edition of the web modal.
@@ -4582,6 +5523,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_style(ctx);
         self.poll_net();
+        // Live previews (v1.2.0): reconcile pumps and upload the
+        // latest frames as textures before anything renders.
+        self.sync_pumps(ctx);
         // Drag & drop bookkeeping runs BEFORE rendering, hit-testing
         // against last frame's card geometry.
         if self.drag.is_some() {
@@ -4644,7 +5588,13 @@ impl eframe::App for App {
                 .last_fetch
                 .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.prefs.interval))
                 .unwrap_or(false);
-            if due && !self.disc_busy {
+            // Rate-limit backoff (v1.2.0): skip cycles silently until
+            // it lapses — the cached devices stay on screen meanwhile.
+            let backed_off = self
+                .disc_backoff_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
+            if due && !self.disc_busy && !backed_off {
                 self.spawn_discovery(false);
             }
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -4655,8 +5605,21 @@ impl eframe::App for App {
         if self.cam_form.is_some() {
             self.camera_window(ctx);
         }
+        if self.player_for.is_some() {
+            self.player_window(ctx);
+        }
         self.drag_ghost(ctx);
         self.show_toasts(ctx);
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // App exit: stop every pump (kills its ffmpeg) rather than
+        // leaving decoders running behind us.
+        for p in self.pumps.values() {
+            p.stop();
+        }
     }
 }
 
@@ -4828,7 +5791,164 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.1.0");
+        assert_eq!(APP_VERSION, "1.2.0");
+    }
+
+    #[test]
+    fn player_resolution_order() {
+        // Bare name → PATH dirs first, then the App Paths value,
+        // then well-known install dirs (the VLC fix: its installer
+        // registers App Paths but never touches PATH).
+        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+        let app_path = PathBuf::from("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe");
+        let known = vec![PathBuf::from("C:\\Program Files\\VideoLAN\\VLC")];
+        let cands = player_candidates("vlc", &path_dirs, Some(&app_path), &known);
+        assert_eq!(cands[0], PathBuf::from("/bin").join("vlc.exe"));
+        assert_eq!(cands[1], PathBuf::from("/usr/bin").join("vlc.exe"));
+        assert_eq!(cands[2], app_path);
+        assert_eq!(
+            cands[3],
+            PathBuf::from("C:\\Program Files\\VideoLAN\\VLC").join("vlc.exe")
+        );
+        assert_eq!(cands.len(), 4);
+        // ".exe" isn't doubled, and no App Paths hit keeps the order.
+        assert_eq!(player_exe_name("vlc"), "vlc.exe");
+        assert_eq!(player_exe_name("VLC.exe"), "VLC.exe");
+        let cands = player_candidates("mpv", &path_dirs, None, &[]);
+        assert_eq!(cands.len(), 2);
+        // A path-like command is used exactly as given.
+        assert_eq!(
+            resolve_player_program("C:\\tools\\vlc.exe").as_deref(),
+            Some("C:\\tools\\vlc.exe")
+        );
+    }
+
+    #[test]
+    fn reg_value_parsing() {
+        let out = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\vlc.exe\r\n    (Default)    REG_SZ    C:\\Program Files\\VideoLAN\\VLC\\vlc.exe\r\n\r\n";
+        assert_eq!(
+            parse_reg_default_value(out).as_deref(),
+            Some("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe")
+        );
+        assert_eq!(parse_reg_default_value("ERROR: not found"), None);
+        assert_eq!(parse_reg_default_value(""), None);
+    }
+
+    #[test]
+    fn rate_limit_classification() {
+        // Tuya's burst answer, in its exact spelling and variants.
+        assert!(is_rate_limit_code("FrequentlyInvoke"));
+        assert!(is_rate_limit_code("frequentlyinvoke"));
+        assert!(is_rate_limit_code("TooManyRequests"));
+        assert!(!is_rate_limit_code("SUCCESS"));
+        assert!(!is_rate_limit_code("DEVICE_OFFLINE"));
+        assert!(!is_rate_limit_code(""));
+        // Control classification: success / rate-limited / genuine.
+        let ok = json!({ "header": { "code": "SUCCESS" } });
+        assert_eq!(control_outcome(&ok), ControlOutcome::Ok);
+        let rl = json!({ "header": { "code": "FrequentlyInvoke" } });
+        assert_eq!(control_outcome(&rl), ControlOutcome::RateLimited);
+        let bad = json!({ "header": { "code": "DEVICE_OFFLINE" } });
+        assert_eq!(control_outcome(&bad), ControlOutcome::Failed);
+        assert_eq!(control_outcome(&json!({})), ControlOutcome::Failed);
+    }
+
+    #[test]
+    fn ffmpeg_args_and_frame_sizes() {
+        let url = "rtsp://u:p@192.168.1.50:554/stream2";
+        let args = ffmpeg_args(url, TILE_W, TILE_H);
+        // The URL travels as ONE argv right after -i (never a shell).
+        let ipos = args.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(args[ipos + 1], url);
+        assert!(args.iter().any(|a| a == "tcp"));
+        assert!(args.iter().any(|a| a
+            == "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2,fps=12"));
+        let tail = &args[args.len() - 5..];
+        assert_eq!(
+            tail,
+            ["-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+        );
+        let pargs = ffmpeg_args(url, PLAYER_W, PLAYER_H);
+        assert!(pargs.iter().any(|a| a.contains("scale=960:540")));
+        // Exact raw-frame sizes the pump reads.
+        assert_eq!(frame_bytes(TILE_W, TILE_H), 518_400);
+        assert_eq!(frame_bytes(PLAYER_W, PLAYER_H), 2_073_600);
+        assert_eq!(frame_bytes(2, 3), 24);
+    }
+
+    #[test]
+    fn ffmpeg_lookup_order() {
+        let bin = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+        let cands = ffmpeg_candidates(
+            Path::new("/app"),
+            "/opt/ff/ffmpeg.exe",
+            "/usr/bin:/bin",
+        );
+        assert_eq!(cands[0], Path::new("/app").join(bin)); // bundled first
+        assert_eq!(cands[1], PathBuf::from("/opt/ff/ffmpeg.exe")); // override
+        assert_eq!(cands[2], Path::new("/usr/bin").join(bin)); // then PATH
+        assert_eq!(cands[3], Path::new("/bin").join(bin));
+        // A bare-name override resolves against PATH before plain PATH.
+        let cands = ffmpeg_candidates(Path::new("/app"), "myffmpeg", "/usr/bin");
+        assert_eq!(cands[1], Path::new("/usr/bin").join("myffmpeg"));
+        // No override: just bundled + PATH.
+        let cands = ffmpeg_candidates(Path::new("/app"), "", "/usr/bin");
+        assert_eq!(cands.len(), 2);
+    }
+
+    #[test]
+    fn tile_and_player_url_selection() {
+        // Tiles always take Stream 2 (SD) on Tapo templates…
+        assert!(tile_rtsp_url(&cam("tapo1", "")).ends_with("/stream2"));
+        assert!(tile_rtsp_url(&cam("tapo2", "")).ends_with("/stream2"));
+        // …custom cameras keep their own path…
+        assert!(tile_rtsp_url(&cam("custom", "live/ch1")).ends_with("/live/ch1"));
+        // …while the player uses the camera's current selection
+        // (HD = Stream 1 when tapo1 is picked on the card).
+        assert!(build_rtsp_url(&cam("tapo1", "")).ends_with("/stream1"));
+        assert!(build_rtsp_url(&cam("tapo2", "")).ends_with("/stream2"));
+    }
+
+    #[test]
+    fn pump_state_machine() {
+        assert_eq!(pump_backoff(0), Duration::from_secs(2));
+        assert_eq!(pump_backoff(1), Duration::from_secs(5));
+        assert_eq!(pump_backoff(2), Duration::from_secs(15));
+        assert_eq!(pump_backoff(9), Duration::from_secs(15));
+
+        let (_tx, rx) = channel::<FrameMsg>();
+        let mut p = Pump {
+            state: PumpState::Connecting,
+            source_key: "k".into(),
+            w: TILE_W,
+            h: TILE_H,
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(Mutex::new(None)),
+            texture: None,
+            streak: 0,
+            retry_at: None,
+        };
+        // Connecting --frame--> Live, streak reset.
+        p.note_frame();
+        assert_eq!(p.state, PumpState::Live);
+        // Live --ended--> Backoff at +2 s, streak 1.
+        p.note_ended();
+        assert_eq!(p.state, PumpState::Backoff);
+        assert_eq!(p.streak, 1);
+        let first_retry = p.retry_at.unwrap();
+        assert!(first_retry > Instant::now());
+        assert!(first_retry <= Instant::now() + Duration::from_secs(2));
+        // A second Ended while backing off changes nothing (no
+        // duplicate restarts, no streak runaway).
+        p.note_ended();
+        assert_eq!(p.streak, 1);
+        assert_eq!(p.retry_at.unwrap(), first_retry);
+        // Backoff --frame--> Live again, streak cleared.
+        p.note_frame();
+        assert_eq!(p.state, PumpState::Live);
+        assert_eq!(p.streak, 0);
+        assert!(p.retry_at.is_none());
     }
 
     #[test]

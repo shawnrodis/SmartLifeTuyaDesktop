@@ -1,5 +1,7 @@
 /target/
 *.exe
+# …except the bundled ffmpeg binary, which ships inside the installer.
+!assets/ffmpeg.exe
 config.json
 *.log
 .DS_Store
