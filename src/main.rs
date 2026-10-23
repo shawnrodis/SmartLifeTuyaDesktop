@@ -292,6 +292,22 @@ struct LayoutCfg {
     cam_sizes: HashMap<String, String>,
 }
 
+/// Saved window geometry (v1.2.5): where the main window was when
+/// it was last visible, so the next launch reopens on the same
+/// monitor at the same place and size. `pos` is the OUTER window
+/// position and `size` the INNER (client) size, both in points —
+/// the exact pair the viewport builder consumes (with_position /
+/// with_inner_size). When `maximized` is set, pos/size are the
+/// restore (un-maximized) rect, so un-maximizing lands back in
+/// the same place on the same monitor.
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+struct WindowGeom {
+    pos: [f32; 2],
+    size: [f32; 2],
+    #[serde(default)]
+    maximized: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Prefs {
     theme: String,
@@ -333,6 +349,11 @@ struct Prefs {
     /// The one-time "still running in the tray" balloon has shown.
     #[serde(default)]
     tray_notice_shown: bool,
+    /// Window placement to restore on the next launch (v1.2.5).
+    /// None until the window has been seen visible once — a fresh
+    /// profile keeps the OS-default placement, exactly as before.
+    #[serde(default)]
+    window_geom: Option<WindowGeom>,
 }
 
 fn default_true() -> bool {
@@ -370,6 +391,7 @@ impl Default for Prefs {
             launch_mode: default_launch_mode(),
             close_to_tray: false,
             tray_notice_shown: false,
+            window_geom: None,
         }
     }
 }
@@ -1016,6 +1038,132 @@ fn resolve_launch_mode(argv: LaunchMode, prefs: LaunchMode) -> LaunchMode {
     } else {
         prefs
     }
+}
+
+/// The inner size a launch uses when nothing (sane) was saved —
+/// the pre-v1.2.5 hardcoded default.
+const DEFAULT_INNER_SIZE: [f32; 2] = [1120.0, 780.0];
+
+/// The placement a launch should restore (v1.2.5), as decided by
+/// restore_placement: position/size for the viewport builder
+/// (None = today's defaults), and whether to start maximized
+/// (only when the saved state was maximized AND its position
+/// survived validation).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct RestorePlacement {
+    position: Option<[f32; 2]>,
+    size: Option<[f32; 2]>,
+    maximized: bool,
+}
+
+/// A saved inner size is sane if it is finite and neither a
+/// postage stamp nor a continent. (The builder also clamps to
+/// with_min_inner_size, so the low end can be generous.)
+fn sane_window_size(size: [f32; 2]) -> Option<[f32; 2]> {
+    let [w, h] = size;
+    if w.is_finite()
+        && h.is_finite()
+        && (200.0..=8192.0).contains(&w)
+        && (150.0..=8192.0).contains(&h)
+    {
+        Some(size)
+    } else {
+        None
+    }
+}
+
+/// The overlap [width, height] of the rect (pos + size, points)
+/// with the virtual desktop (vd = [x, y, w, h]); zero on an axis
+/// when the rect misses entirely on that axis.
+fn rect_intersection(pos: [f32; 2], size: [f32; 2], vd: [f32; 4]) -> [f32; 2] {
+    let w = (pos[0] + size[0]).min(vd[0] + vd[2]) - pos[0].max(vd[0]);
+    let h = (pos[1] + size[1]).min(vd[1] + vd[3]) - pos[1].max(vd[1]);
+    [w.max(0.0), h.max(0.0)]
+}
+
+/// The off-screen guard (v1.2.5): a saved position is honoured
+/// only when a usable part of the window would land on the
+/// CURRENT virtual desktop — at least 120 pt horizontally and
+/// 40 pt (a title-bar strip) vertically. A monitor unplugged or
+/// rearranged since the geometry was saved must never strand
+/// the window where nobody can see or grab it. The test uses
+/// the inner-size rect, slightly smaller than the real outer
+/// rect, i.e. it errs on the conservative side.
+fn position_is_visible(pos: [f32; 2], size: [f32; 2], vd: [f32; 4]) -> bool {
+    if !pos[0].is_finite() || !pos[1].is_finite() {
+        return false;
+    }
+    let [w, h] = rect_intersection(pos, size, vd);
+    w >= 120.0 && h >= 40.0
+}
+
+/// Decide what a launch restores from the saved geometry
+/// (v1.2.5). Pure: the caller supplies the current virtual
+/// desktop rect (points, [x, y, w, h]), or None when it cannot
+/// be determined (non-Windows) — then a saved position is
+/// honoured unvalidated, there being nothing to validate
+/// against. A rejected position takes the maximized flag down
+/// with it (default placement), but a sane size survives.
+fn restore_placement(geom: Option<&WindowGeom>, vd: Option<[f32; 4]>) -> RestorePlacement {
+    let mut out = RestorePlacement {
+        position: None,
+        size: None,
+        maximized: false,
+    };
+    let Some(g) = geom else { return out };
+    out.size = sane_window_size(g.size);
+    // The visibility test needs a size even when the saved one
+    // was rejected; the default is the closest stand-in.
+    let test_size = out.size.unwrap_or(DEFAULT_INNER_SIZE);
+    let visible = match vd {
+        Some(vd) => position_is_visible(g.pos, test_size, vd),
+        None => g.pos[0].is_finite() && g.pos[1].is_finite(),
+    };
+    if visible {
+        out.position = Some(g.pos);
+        out.maximized = g.maximized;
+    }
+    out
+}
+
+/// The virtual desktop rect in egui points ([x, y, w, h]).
+/// Windows: GetSystemMetrics' virtual-screen values, converted
+/// from physical pixels with the system DPI (window positions
+/// egui reports follow the same scale on the primary display;
+/// on mixed-DPI setups this is the standard approximation —
+/// the guard's 120×40 margins are generous next to the error
+/// it can make). None when the metrics are unavailable.
+#[cfg(target_os = "windows")]
+fn virtual_desktop_rect() -> Option<[f32; 4]> {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    let (x, y, w, h) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForSystem() };
+    let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+    Some([
+        x as f32 / scale,
+        y as f32 / scale,
+        w as f32 / scale,
+        h as f32 / scale,
+    ])
+}
+
+#[cfg(not(target_os = "windows"))]
+fn virtual_desktop_rect() -> Option<[f32; 4]> {
+    None
 }
 
 /// The value stored in the Run key: the exe path in quotes (install
@@ -3383,6 +3531,12 @@ struct App {
     /// (show_from_tray), so an arg-less autostart/restartable-app
     /// relaunch can neither flash nor stick open.
     launch_hidden_pending: bool,
+    /// Window-geometry persistence (v1.2.5): the saved placement
+    /// changed since its last write to disk. Flushed by
+    /// track_window_geometry at most once a second, and by every
+    /// quit-path save.
+    geom_save_pending: bool,
+    last_geom_save: Instant,
     // rate-limit backoff (v1.2.0): while set, autorefresh skips
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
@@ -3567,6 +3721,8 @@ impl App {
             arg_launch_mode: LaunchMode::Normal,
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
+            geom_save_pending: false,
+            last_geom_save: Instant::now(),
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -4452,6 +4608,65 @@ impl App {
     fn enforce_launch_hold(&self, ctx: &egui::Context) {
         if self.launch_hidden_pending {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    /// Window-geometry persistence (v1.2.5): while the window
+    /// is visible, remember where it is — outer position, inner
+    /// size, maximized — in the prefs, so the next launch
+    /// restores it (see restore_placement). Writes are throttled
+    /// to at most one a second while the geometry keeps changing
+    /// (a drag), the in-memory value leads immediately, and the
+    /// quit paths flush it (quit_now's save, on_exit). Two guards
+    /// keep the saved value trustworthy:
+    ///  - never record while hidden in the tray or minimized to
+    ///    the taskbar: a hidden window's reported rect is junk
+    ///    (off-screen sentinel values) or stale, and must not
+    ///    overwrite the last VISIBLE placement;
+    ///  - while maximized, only the flag follows — the recorded
+    ///    pos/size stay the restore rect, so un-maximizing (this
+    ///    session or the next launch) lands in the same place on
+    ///    the same monitor.
+    fn track_window_geometry(&mut self, ctx: &egui::Context) {
+        // The throttled flush runs even on frames that report
+        // nothing usable (e.g. the first hidden frames).
+        if self.geom_save_pending && self.last_geom_save.elapsed() >= Duration::from_secs(1) {
+            self.geom_save_pending = false;
+            self.last_geom_save = Instant::now();
+            self.save();
+        }
+        if self.window_hidden {
+            return;
+        }
+        let (outer, inner, minimized, maximized, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.outer_rect, v.inner_rect, v.minimized, v.maximized, v.fullscreen)
+        });
+        let (Some(outer), Some(inner)) = (outer, inner) else {
+            return;
+        };
+        if minimized.unwrap_or(false) || fullscreen.unwrap_or(false) {
+            return;
+        }
+        let candidate = if maximized.unwrap_or(false) {
+            // Only the flag may change; keep the restore rect.
+            let Some(prev) = self.cfg.prefs.window_geom else {
+                return;
+            };
+            WindowGeom {
+                maximized: true,
+                ..prev
+            }
+        } else {
+            WindowGeom {
+                pos: [outer.min.x, outer.min.y],
+                size: [inner.width(), inner.height()],
+                maximized: false,
+            }
+        };
+        if self.cfg.prefs.window_geom != Some(candidate) {
+            self.cfg.prefs.window_geom = Some(candidate);
+            self.geom_save_pending = true;
         }
     }
 
@@ -7707,12 +7922,25 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Final save on shutdown (v1.2.5): whichever quit path was
+    /// taken — tray Quit saves via quit_now, but a plain window
+    /// close lands here — the last visible window placement (and
+    /// everything else in the config) is on disk.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Fully qualified: inside this impl, `save` is eframe's
+        // own persistence hook, not App::save.
+        App::save(self);
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_style(ctx);
         self.poll_net();
         // Tray + close behaviour (v1.2.1): poll tray events, turn a
         // close into a hide when close-to-tray is on.
         self.handle_window_chrome(ctx, frame);
+        // Window placement memory (v1.2.5): record where the
+        // visible window is, for the next launch to restore.
+        self.track_window_geometry(ctx);
         // Live previews (v1.2.0): reconcile pumps and upload the
         // latest frames as textures before anything renders.
         self.sync_pumps(ctx);
@@ -7846,15 +8074,36 @@ fn main() -> eframe::Result<()> {
         argv_mode,
         LaunchMode::parse(&startup_cfg.prefs.launch_mode),
     );
+    // Window placement (v1.2.5): reopen where the window last
+    // was — same monitor, same spot, same size, maximized if it
+    // was left maximized — validated against the CURRENT virtual
+    // desktop, so a monitor removed or rearranged since can't
+    // strand it off-screen (restore_placement). First run
+    // (nothing saved): the defaults below, exactly as before.
+    let placement = restore_placement(
+        startup_cfg.prefs.window_geom.as_ref(),
+        virtual_desktop_rect(),
+    );
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SmartLife & Tuya Desktop")
-        .with_inner_size([1120.0, 780.0])
+        .with_inner_size(placement.size.unwrap_or(DEFAULT_INNER_SIZE))
         .with_min_inner_size([720.0, 520.0]);
+    if let Some(pos) = placement.position {
+        viewport = viewport.with_position(pos);
+    }
     match launch {
         // Minimized = hidden in the tray from the very first frame.
+        // The placement above still applies underneath, so the
+        // eventual Show lands in the right place.
         LaunchMode::Minimized => viewport = viewport.with_visible(false),
         LaunchMode::Maximized => viewport = viewport.with_maximized(true),
-        LaunchMode::Normal => {}
+        LaunchMode::Normal => {
+            // No launch intent of its own: restore the saved
+            // presentation, maximized included.
+            if placement.maximized {
+                viewport = viewport.with_maximized(true);
+            }
+        }
     }
     let options = eframe::NativeOptions {
         viewport,
@@ -8098,7 +8347,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.2.4");
+        assert_eq!(APP_VERSION, "1.2.5");
     }
 
     #[test]
@@ -8871,6 +9120,136 @@ mod tests {
         assert!(hold_frame_cmds(&app, &ctx).is_empty());
     }
 
+    // ---------------- v1.2.5: window placement memory ----------------
+
+    fn geom(x: f32, y: f32, w: f32, h: f32, maximized: bool) -> WindowGeom {
+        WindowGeom {
+            pos: [x, y],
+            size: [w, h],
+            maximized,
+        }
+    }
+
+    #[test]
+    fn placement_on_second_monitor_is_kept() {
+        // Landscape primary 1920×1080 with a portrait 1080×1920
+        // monitor to its right: virtual desktop [0, 0, 3000, 1920].
+        // (The field case: the app lives on the portrait monitor.)
+        let vd = Some([0.0, 0.0, 3000.0, 1920.0]);
+        let g = geom(2100.0, 100.0, 900.0, 1400.0, false);
+        let p = restore_placement(Some(&g), vd);
+        assert_eq!(p.position, Some([2100.0, 100.0]));
+        assert_eq!(p.size, Some([900.0, 1400.0]));
+        assert!(!p.maximized);
+    }
+
+    #[test]
+    fn placement_on_removed_monitor_is_discarded() {
+        // The portrait monitor was unplugged: only the primary
+        // remains, and the saved rect is entirely outside it.
+        let vd = Some([0.0, 0.0, 1920.0, 1080.0]);
+        let g = geom(2100.0, 100.0, 900.0, 1400.0, true);
+        let p = restore_placement(Some(&g), vd);
+        assert_eq!(p.position, None);
+        assert!(!p.maximized); // falls with the position
+        assert_eq!(p.size, Some([900.0, 1400.0])); // a sane size survives
+    }
+
+    #[test]
+    fn placement_partially_offscreen_but_reachable_is_kept() {
+        let vd = Some([0.0, 0.0, 1920.0, 1080.0]);
+        // Mostly off the right edge, but 200 pt wide and the full
+        // height still on screen — the title bar is grabbable.
+        let g = geom(1720.0, 40.0, 900.0, 700.0, false);
+        assert_eq!(
+            restore_placement(Some(&g), vd).position,
+            Some([1720.0, 40.0])
+        );
+        // Only a sliver left (< 120 pt wide): not usable.
+        let g = geom(1850.0, 40.0, 900.0, 700.0, false);
+        assert_eq!(restore_placement(Some(&g), vd).position, None);
+        // Nearly all of it below the bottom edge (< 40 pt tall).
+        let g = geom(100.0, 1060.0, 900.0, 700.0, false);
+        assert_eq!(restore_placement(Some(&g), vd).position, None);
+    }
+
+    #[test]
+    fn placement_negative_coordinates_monitor_left_of_primary() {
+        // Secondary monitor LEFT of the primary: the virtual
+        // desktop starts at x = -1920.
+        let vd = Some([-1920.0, 0.0, 3840.0, 1080.0]);
+        let g = geom(-1800.0, 50.0, 1000.0, 800.0, false);
+        assert_eq!(
+            restore_placement(Some(&g), vd).position,
+            Some([-1800.0, 50.0])
+        );
+        // The mirrored positive spot is beyond the new right
+        // edge after the rearrangement: discarded.
+        let g = geom(2100.0, 50.0, 1000.0, 800.0, false);
+        assert_eq!(restore_placement(Some(&g), vd).position, None);
+    }
+
+    #[test]
+    fn placement_maximized_restores_flag_and_restore_rect() {
+        let vd = Some([0.0, 0.0, 3000.0, 1920.0]);
+        let g = geom(2000.0, 60.0, 1000.0, 1500.0, true);
+        let p = restore_placement(Some(&g), vd);
+        assert!(p.maximized);
+        // The restore rect rides along: un-maximizing lands here.
+        assert_eq!(p.position, Some([2000.0, 60.0]));
+        assert_eq!(p.size, Some([1000.0, 1500.0]));
+    }
+
+    #[test]
+    fn placement_first_run_and_bad_values() {
+        let vd = Some([0.0, 0.0, 1920.0, 1080.0]);
+        // Nothing saved: pure defaults (first-run behaviour).
+        assert_eq!(
+            restore_placement(None, vd),
+            RestorePlacement {
+                position: None,
+                size: None,
+                maximized: false
+            }
+        );
+        // An insane size is dropped; the position is still
+        // validated (against the default size as stand-in).
+        let g = geom(100.0, 100.0, 99999.0, -4.0, false);
+        let p = restore_placement(Some(&g), vd);
+        assert_eq!(p.size, None);
+        assert_eq!(p.position, Some([100.0, 100.0]));
+        // A NaN position can never be honoured.
+        let g = geom(f32::NAN, 100.0, 900.0, 700.0, false);
+        assert_eq!(restore_placement(Some(&g), vd).position, None);
+        // No virtual-desktop info (non-Windows): honour as-is.
+        let g = geom(2100.0, 100.0, 900.0, 1400.0, false);
+        assert_eq!(
+            restore_placement(Some(&g), None).position,
+            Some([2100.0, 100.0])
+        );
+    }
+
+    #[test]
+    fn window_geom_config_round_trip() {
+        // The geometry survives a config save/load cycle.
+        let mut cfg = Config::default();
+        cfg.prefs.window_geom = Some(geom(2100.0, 100.0, 900.0, 1400.0, true));
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.prefs.window_geom, cfg.prefs.window_geom);
+
+        // A config written before v1.2.5 has no window_geom key
+        // in prefs at all: it loads as None (first-run behaviour
+        // unchanged for existing users).
+        let legacy: Config = serde_json::from_str(
+            "{\"prefs\":{\"theme\":\"dark\",\"accent\":\"#6366f1\",\
+             \"density\":\"comfortable\",\"autorefresh\":true,\"interval\":30,\
+             \"proxy_preset\":\"auto\",\"proxy_custom\":\"\"}}",
+        )
+        .unwrap();
+        assert_eq!(legacy.prefs.window_geom, None);
+    }
+
     #[test]
     fn reg_named_value_parsing() {
         let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    SmartLifeTuyaDesktop    REG_SZ    \"C:\\Users\\Shawn\\app.exe\" --minimized\r\n    OtherApp    REG_SZ    C:\\other.exe\r\n\r\n";
@@ -8994,6 +9373,8 @@ mod tests {
             arg_launch_mode: LaunchMode::Normal,
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
+            geom_save_pending: false,
+            last_geom_save: Instant::now(),
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
