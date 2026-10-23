@@ -801,6 +801,8 @@ fn merge_device_data(fresh: Vec<Value>, previous: &[Value]) -> Vec<Value> {
 #[derive(Clone, PartialEq)]
 enum SectionKind {
     Pinned,
+    Lighting,
+    Cameras,
     Group,
     Ungrouped,
     Scenes,
@@ -824,14 +826,135 @@ struct CardEntry {
     id: String,
     name: String,
     is_scene: bool,
+    /// Light-capable (brightness / colour temp / colour) — such devices
+    /// live in the automatic Lighting section unless grouped.
+    light: bool,
+    /// A user-added RTSP camera — lives in the automatic Cameras
+    /// section unless grouped.
+    camera: bool,
+}
+
+/// Light-capable = can do brightness, colour temperature or colour
+/// (bulbs and RGB strips; cameras never are).
+fn device_is_light(d: &Device) -> bool {
+    !d.is_scene && (d.has_brightness || d.has_temp || d.has_color)
 }
 
 fn device_entry(d: &Device) -> CardEntry {
-    CardEntry { id: d.id.clone(), name: d.name.clone(), is_scene: d.is_scene }
+    CardEntry {
+        id: d.id.clone(),
+        name: d.name.clone(),
+        is_scene: d.is_scene,
+        light: device_is_light(d),
+        camera: false,
+    }
 }
 
 fn camera_entry(c: &Camera) -> CardEntry {
-    CardEntry { id: c.id.clone(), name: c.name.clone(), is_scene: false }
+    // Item ids are "cam:{record id}" everywhere (layout keys, section
+    // ids, camera_index) — the record itself keeps its bare id.
+    CardEntry {
+        id: format!("cam:{}", c.id),
+        name: c.name.clone(),
+        is_scene: false,
+        light: false,
+        camera: true,
+    }
+}
+
+/// The "no explicit group" label for an item in the group dropdown.
+fn auto_section_label(e: &CardEntry) -> &'static str {
+    if e.camera {
+        "Cameras (automatic)"
+    } else if e.light {
+        "Lighting (automatic)"
+    } else {
+        "Ungrouped"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group controls (broadcast, not binding) — a group action computes a
+// plan of per-member Control commands and sends them one by one. No
+// group state is stored: header widgets reflect member states
+// (any-on, averages), exactly like the web edition.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum GroupKind {
+    Toggle,
+    Brightness,
+    Temp,
+    Color,
+}
+
+/// Master-toggle display state: ON if ANY (non-scene) member is on.
+fn group_master_on(members: &[Device]) -> bool {
+    members.iter().filter(|d| !d.is_scene).any(|d| d.state)
+}
+
+fn group_average(values: &[i64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<i64>() as f64 / values.len() as f64)
+    }
+}
+
+/// The fan-out plan for one group action. `num` carries the brightness
+/// percent or temperature slider value; `hex` the colour. Offline
+/// members are skipped (their cards disable controls too).
+fn group_plan(
+    members: &[Device],
+    kind: GroupKind,
+    num: i64,
+    hex: Option<&str>,
+) -> Vec<(String, &'static str, Value)> {
+    let devs: Vec<&Device> = members
+        .iter()
+        .filter(|d| !d.is_scene && d.online)
+        .collect();
+    let mut plan = Vec::new();
+    match kind {
+        GroupKind::Toggle => {
+            let target: i64 = if group_master_on(members) { 0 } else { 1 };
+            for d in devs {
+                plan.push((d.id.clone(), "turnOnOff", json!(target)));
+            }
+        }
+        GroupKind::Brightness => {
+            let pct = num.clamp(11, 100);
+            for d in devs.iter().filter(|d| d.has_brightness) {
+                plan.push((d.id.clone(), "brightnessSet", json!(pct)));
+            }
+        }
+        GroupKind::Temp => {
+            let tv = num.clamp(1000, 10000);
+            for d in devs.iter().filter(|d| d.has_temp) {
+                plan.push((d.id.clone(), "colorTemperatureSet", json!(tv)));
+            }
+        }
+        GroupKind::Color => {
+            let (mut hue, mut sat, _) = hex_to_hsv(hex.unwrap_or("#ffffff"));
+            if sat < 0.02 {
+                hue = 0.0;
+                sat = 0.0;
+            }
+            let sat = (sat * 100.0).round() / 100.0;
+            for d in devs.iter().filter(|d| d.has_color) {
+                plan.push((
+                    d.id.clone(),
+                    "colorSet",
+                    json!({
+                        "hue": hue as i64,
+                        "saturation": sat,
+                        "brightness": d.brightness_pct.unwrap_or(100)
+                    }),
+                ));
+            }
+        }
+    }
+    plan
 }
 
 /// Display name of a device (alias wins) — used for card titles.
@@ -899,6 +1022,13 @@ fn build_sections(
     let so = &layout.section_order;
     let mut sections: Vec<Section> = Vec::new();
 
+    let group_ids: HashSet<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
+    let assigned = |d: &CardEntry| -> bool {
+        match layout.assign.get(&d.id) {
+            Some(g) => group_ids.contains(g.as_str()),
+            None => false,
+        }
+    };
     let pinned: Vec<&CardEntry> = normal.iter().filter(|d| pin_set.contains(d.id.as_str())).cloned().collect();
     if !pinned.is_empty() {
         sections.push(Section {
@@ -910,6 +1040,35 @@ fn build_sections(
             ids: order_section_items(&pinned, so.get("pinned"), layout),
         });
     }
+    // Built-in automatic sections (Pinned → Lighting → Cameras →
+    // groups → Ungrouped → Scenes): an explicit group assignment wins;
+    // unassigned lights land in Lighting, unassigned cameras in Cameras.
+    let lighting: Vec<&CardEntry> = normal
+        .iter()
+        .filter(|d| !assigned(d) && d.light)
+        .cloned()
+        .collect();
+    sections.push(Section {
+        key: "lighting".into(),
+        order_key: "lighting".into(),
+        title: "Lighting".into(),
+        kind: SectionKind::Lighting,
+        group_id: None,
+        ids: order_section_items(&lighting, so.get("lighting"), layout),
+    });
+    let cameras_sec: Vec<&CardEntry> = normal
+        .iter()
+        .filter(|d| !assigned(d) && d.camera)
+        .cloned()
+        .collect();
+    sections.push(Section {
+        key: "cameras".into(),
+        order_key: "cameras".into(),
+        title: "Cameras".into(),
+        kind: SectionKind::Cameras,
+        group_id: None,
+        ids: order_section_items(&cameras_sec, so.get("cameras"), layout),
+    });
     for g in &layout.groups {
         let devs: Vec<&CardEntry> = normal
             .iter()
@@ -926,13 +1085,9 @@ fn build_sections(
             ids: order_section_items(&devs, so.get(&ok), layout),
         });
     }
-    let group_ids: HashSet<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
     let ungrouped: Vec<&CardEntry> = normal
         .iter()
-        .filter(|d| match layout.assign.get(&d.id) {
-            Some(g) => !group_ids.contains(g.as_str()),
-            None => true,
-        })
+        .filter(|d| !assigned(d) && !d.light && !d.camera)
         .cloned()
         .collect();
     sections.push(Section {
@@ -953,7 +1108,13 @@ fn build_sections(
             ids: order_section_items(&scenes, so.get("scenes"), layout),
         });
     }
-    sections.retain(|s| !s.ids.is_empty() || (editing && s.kind == SectionKind::Group));
+    sections.retain(|s| {
+        !s.ids.is_empty()
+            || (editing
+                && (s.kind == SectionKind::Group
+                    || s.kind == SectionKind::Lighting
+                    || s.kind == SectionKind::Cameras))
+    });
     sections
 }
 
@@ -972,6 +1133,7 @@ enum NetResult {
     UpdateChecked { manual: bool, result: Result<ReleaseInfo, String> },
     UpdateProgress { got: u64, total: u64 },
     UpdateDownloaded { result: Result<std::path::PathBuf, String> },
+    GroupDone { title: String, total: usize, failed: Vec<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1562,7 @@ struct App {
     applied_style: Option<(String, String, String)>,
     // cameras
     cam_form: Option<CameraForm>,
+    group_backups: HashMap<String, String>,
     // auto-update
     update_checking: bool,
     update_info: Option<ReleaseInfo>,
@@ -1513,6 +1676,7 @@ impl App {
             new_group: None,
             toasts: Vec::new(),
             cam_form: None,
+            group_backups: HashMap::new(),
             update_checking: false,
             update_info: None,
             update_error: None,
@@ -1818,7 +1982,13 @@ impl App {
 
     fn prune_layout(&mut self) {
         let mut ids: HashSet<&str> = self.devices.iter().map(|d| d.id.as_str()).collect();
-        ids.extend(self.cfg.cameras.iter().map(|c| c.id.as_str()));
+        let cam_ids: Vec<String> = self
+            .cfg
+            .cameras
+            .iter()
+            .map(|c| format!("cam:{}", c.id))
+            .collect();
+        ids.extend(cam_ids.iter().map(|s| s.as_str()));
         let lay = &mut self.cfg.layout;
         lay.pins.retain(|id| ids.contains(id.as_str()));
         lay.hidden.retain(|id| ids.contains(id.as_str()));
@@ -2050,7 +2220,7 @@ impl App {
                         self.cfg.layout.assign.insert(drag.id.clone(), gid.clone());
                     }
                 }
-                SectionKind::Ungrouped => {
+                SectionKind::Ungrouped | SectionKind::Lighting | SectionKind::Cameras => {
                     self.cfg.layout.assign.remove(&drag.id);
                 }
                 SectionKind::Scenes => {}
@@ -2171,6 +2341,107 @@ impl App {
         self.spawn_control(id.to_string(), "colorSet", value, backup, false);
     }
 
+    /// Optimistic local state for one fanned-out group command — the
+    /// same mutations the per-card do_* functions apply.
+    fn apply_group_target(&mut self, idx: usize, action: &str, value: &Value) {
+        let dev = &mut self.devices[idx];
+        match action {
+            "turnOnOff" => {
+                let on = value.as_i64().unwrap_or(0) != 0;
+                dev.state = on;
+                if let Some(data) = dev.raw.get_mut("data").and_then(|v| v.as_object_mut()) {
+                    data.insert("state".into(), json!(on));
+                }
+            }
+            "brightnessSet" => {
+                let pct = value.as_i64().unwrap_or(100);
+                dev.brightness_pct = Some(pct);
+                dev.state = true;
+                if let Some(data) = dev.raw.get_mut("data").and_then(|v| v.as_object_mut()) {
+                    data.insert("brightness".into(), json!(pct * 10));
+                    data.insert("state".into(), json!(true));
+                }
+            }
+            "colorTemperatureSet" => {
+                let slider = value.as_i64().unwrap_or(4000);
+                dev.temp_slider = Some(slider);
+                dev.state = true;
+                dev.color_mode = Some("white".to_string());
+                if let Some(data) = dev.raw.get_mut("data").and_then(|v| v.as_object_mut()) {
+                    data.insert("color_temp".into(), json!(temp_slider_to_reported(slider)));
+                    data.insert("state".into(), json!(true));
+                    data.insert("color_mode".into(), json!("white"));
+                }
+            }
+            "colorSet" => {
+                let hue = value.get("hue").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let sat = value.get("saturation").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                dev.hue = Some(hue);
+                dev.saturation = Some(sat);
+                dev.state = true;
+                dev.color_mode = Some("colour".to_string());
+                if let Some(data) = dev.raw.get_mut("data").and_then(|v| v.as_object_mut()) {
+                    data.insert("hue".into(), json!(hue));
+                    data.insert("saturation".into(), json!(sat));
+                    data.insert("state".into(), json!(true));
+                    data.insert("color_mode".into(), json!("colour"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Broadcast one group action to a section's members: optimistic
+    /// local updates now, then ONE thread sends the commands
+    /// sequentially (~200 ms apart — Tuya rate-limits bursts) and
+    /// reports back a GroupDone summary.
+    fn group_broadcast(&mut self, sec: &Section, kind: GroupKind, num: i64, hex: Option<String>) {
+        let full = build_sections(&self.all_entries(), &self.cfg.layout, self.editing, "");
+        let Some(fsec) = full.iter().find(|s| s.key == sec.key) else { return };
+        let members: Vec<Device> = fsec
+            .ids
+            .iter()
+            .filter_map(|id| self.device_index(id).map(|i| self.devices[i].clone()))
+            .collect();
+        let plan = group_plan(&members, kind, num, hex.as_deref());
+        if plan.is_empty() {
+            return;
+        }
+        self.group_backups.clear();
+        for (id, action, value) in &plan {
+            if let Some(idx) = self.device_index(id) {
+                self.group_backups.insert(id.clone(), self.backup_data(idx));
+                self.apply_group_target(idx, action, value);
+            }
+        }
+        let Some(session) = self.session.clone() else { return };
+        let tx = self.tx.clone();
+        let prefs = self.cfg.prefs.clone();
+        let creds = self.creds_for_net();
+        let title = sec.title.clone();
+        let total = plan.len();
+        thread::spawn(move || {
+            let client = http_client();
+            let mut failed: Vec<String> = Vec::new();
+            match fresh_session(&client, &session, &creds, &prefs, false) {
+                Ok(s) => {
+                    for (i, (id, action, value)) in plan.iter().enumerate() {
+                        if !net_control(&client, &s, id, action, value, &prefs) {
+                            failed.push(id.clone());
+                        }
+                        if i + 1 < plan.len() {
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                }
+                Err(_) => {
+                    failed = plan.iter().map(|(id, _, _)| id.clone()).collect();
+                }
+            }
+            let _ = tx.send(NetResult::GroupDone { title, total, failed });
+        });
+    }
+
     fn toggle_pin(&mut self, id: &str) {
         if let Some(idx) = self.device_index(id) {
             if self.devices[idx].is_scene {
@@ -2274,6 +2545,33 @@ impl App {
                             }
                         }
                     }
+                }
+                NetResult::GroupDone { title, total, failed } => {
+                    let mut names: Vec<String> = Vec::new();
+                    for id in &failed {
+                        if let Some(b) = self.group_backups.remove(id) {
+                            self.restore_backup(id, &b);
+                        }
+                        names.push(
+                            self.device_index(id)
+                                .map(|i| self.display(&self.devices[i].clone()))
+                                .unwrap_or_else(|| id.clone()),
+                        );
+                    }
+                    self.group_backups.clear();
+                    if !names.is_empty() {
+                        self.toast(
+                            format!(
+                                "{}: {} of {} updated — {} didn't respond",
+                                title,
+                                total - failed.len(),
+                                total,
+                                names.join(", ")
+                            ),
+                            true,
+                        );
+                    }
+                    self.spawn_discovery(false);
                 }
                 NetResult::UpdateProgress { got, total } => {
                     self.update_dl = Some((got, total));
@@ -2736,6 +3034,155 @@ impl App {
             });
     }
 
+    /// Group-wide controls strip for the Lighting section and for user
+    /// groups containing at least one light — the same components as
+    /// the cards (toggle_switch, slim_slider, swatches + picker),
+    /// broadcasting via group_broadcast. Pinned, Ungrouped, Cameras
+    /// and Scenes never get these.
+    fn group_controls(&mut self, ui: &mut Ui, sec: &Section) {
+        if sec.kind != SectionKind::Lighting && sec.kind != SectionKind::Group {
+            return;
+        }
+        let full = build_sections(&self.all_entries(), &self.cfg.layout, self.editing, "");
+        let Some(fsec) = full.iter().find(|s| s.key == sec.key) else { return };
+        let members: Vec<Device> = fsec
+            .ids
+            .iter()
+            .filter_map(|id| self.device_index(id).map(|i| self.devices[i].clone()))
+            .collect();
+        let devs: Vec<&Device> = members.iter().filter(|d| !d.is_scene).collect();
+        if !devs.iter().any(|d| device_is_light(d)) {
+            return;
+        }
+        let pal = self.pal();
+        let accent = self.accent();
+        let any_on = group_master_on(&members);
+        let b_vals: Vec<i64> = devs.iter().filter_map(|d| d.brightness_pct).collect();
+        let t_vals: Vec<i64> = devs.iter().filter_map(|d| d.temp_slider).collect();
+        let has_color = devs.iter().any(|d| d.has_color);
+        let sec2 = sec.clone();
+        Frame::none()
+            .fill(pal.card)
+            .stroke(Stroke::new(1.0, pal.border))
+            .rounding(Rounding::same(R_CARD))
+            .inner_margin(Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.set_width((ui.available_width() - 32.0).max(200.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("All").size(12.5).strong().color(pal.dim));
+                        if toggle_switch(ui, any_on, true, accent, pal.track) {
+                            self.group_broadcast(&sec2, GroupKind::Toggle, 0, None);
+                        }
+                    });
+                    if let Some(avg) = group_average(&b_vals) {
+                        self.group_slider(
+                            ui, &sec2, "b", "Brightness", 11.0, 100.0, avg as f32,
+                            |v| format!("{}%", v.round() as i64),
+                            GroupKind::Brightness,
+                        );
+                    }
+                    if let Some(avg) = group_average(&t_vals) {
+                        self.group_slider(
+                            ui, &sec2, "t", "Colour temperature", 1000.0, 10000.0, avg as f32,
+                            |v| format!("{}K", temp_slider_to_kelvin((v / 50.0).round() as i64 * 50)),
+                            GroupKind::Temp,
+                        );
+                    }
+                    if has_color {
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, hex) in SWATCHES {
+                                if swatch(ui, hex, name, false, pal.text) {
+                                    self.group_broadcast(&sec2, GroupKind::Color, 0, Some(hex.to_string()));
+                                }
+                            }
+                            let gkey = format!("grp:{}", sec2.key);
+                            let more = ui
+                                .add(Button::new("🎨").frame(false))
+                                .on_hover_text("More colours…");
+                            if more.clicked() {
+                                if self.open_color_for.as_deref() == Some(gkey.as_str()) {
+                                    self.open_color_for = None;
+                                } else {
+                                    self.open_color_for = Some(gkey.clone());
+                                    self.color_pick.insert(gkey.clone(), Color32::WHITE);
+                                }
+                            }
+                            if self.open_color_for.as_deref() == Some(gkey.as_str()) {
+                                let mut color = self
+                                    .color_pick
+                                    .get(&gkey)
+                                    .copied()
+                                    .unwrap_or(Color32::WHITE);
+                                if egui::color_picker::color_edit_button_srgba(
+                                    ui,
+                                    &mut color,
+                                    egui::color_picker::Alpha::Opaque,
+                                )
+                                .changed()
+                                {
+                                    self.color_pick.insert(gkey.clone(), color);
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Apply colour").color(Color32::WHITE)).fill(accent))
+                                    .clicked()
+                                {
+                                    let hex = format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b());
+                                    self.open_color_for = None;
+                                    self.group_broadcast(&sec2, GroupKind::Color, 0, Some(hex));
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+        ui.add_space(12.0);
+    }
+
+    /// One average slider in the group-controls strip; commits on
+    /// release, like the card sliders.
+    fn group_slider(
+        &mut self,
+        ui: &mut Ui,
+        sec: &Section,
+        tag: &str,
+        label: &str,
+        min: f32,
+        max: f32,
+        avg: f32,
+        fmt: impl Fn(f32) -> String,
+        kind: GroupKind,
+    ) {
+        let pal = self.pal();
+        let accent = self.accent();
+        let key = format!("grp:{}|{}", sec.key, tag);
+        let live = self.slider_live.get(&key).copied().unwrap_or(avg);
+        ui.allocate_ui_with_layout(vec2(210.0, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).size(12.5).color(pal.dim));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(fmt(live)).size(12.5).strong());
+                });
+            });
+            ui.add_space(3.0);
+            let out = slim_slider(ui, egui::Id::new(&key), live, min, max, true, accent, pal.track);
+            if out.changed {
+                let v = if tag == "t" {
+                    (out.value / 50.0).round() * 50.0
+                } else {
+                    out.value
+                };
+                self.slider_live.insert(key.clone(), v);
+                self.dragging_slider = true;
+            }
+            if out.released {
+                let v = self.slider_live.remove(&key).unwrap_or(out.value);
+                self.dragging_slider = false;
+                self.group_broadcast(sec, kind, v.round() as i64, None);
+            }
+        });
+    }
+
     fn section_view(&mut self, ui: &mut Ui, sec: &Section, avail: f32) {
         let pal = self.pal();
         let sec_top = ui.cursor().top();
@@ -2799,6 +3246,7 @@ impl App {
             });
         });
         ui.add_space(8.0);
+        self.group_controls(ui, sec);
         if collapsed {
             ui.add_space(10.0);
             return;
@@ -3252,6 +3700,11 @@ impl App {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             let cur_assign = self.cfg.layout.assign.get(&dev.id).cloned();
+                            let auto_label = if device_is_light(&dev) {
+                                "Lighting (automatic)"
+                            } else {
+                                "Ungrouped"
+                            };
                             let cur_label = match &cur_assign {
                                 Some(gid) => self
                                     .cfg
@@ -3260,8 +3713,8 @@ impl App {
                                     .iter()
                                     .find(|g| &g.id == gid)
                                     .map(|g| g.name.clone())
-                                    .unwrap_or_else(|| "Ungrouped".to_string()),
-                                None => "Ungrouped".to_string(),
+                                    .unwrap_or_else(|| auto_label.to_string()),
+                                None => auto_label.to_string(),
                             };
                             let mut chosen: Option<Option<String>> = None;
                             let combo_w = (ui.available_width() - 92.0).max(84.0);
@@ -3269,7 +3722,7 @@ impl App {
                                 .selected_text(cur_label)
                                 .width(combo_w)
                                 .show_ui(ui, |ui| {
-                                    if ui.selectable_label(cur_assign.is_none(), "Ungrouped").clicked() {
+                                    if ui.selectable_label(cur_assign.is_none(), auto_label).clicked() {
                                         chosen = Some(None);
                                     }
                                     for g in &self.cfg.layout.groups {
@@ -3465,8 +3918,8 @@ impl App {
                                 .iter()
                                 .find(|g| &g.id == gid)
                                 .map(|g| g.name.clone())
-                                .unwrap_or_else(|| "Ungrouped".to_string()),
-                            None => "Ungrouped".to_string(),
+                                .unwrap_or_else(|| "Cameras (automatic)".to_string()),
+                            None => "Cameras (automatic)".to_string(),
                         };
                         let mut chosen: Option<Option<String>> = None;
                         let combo_w = (ui.available_width() - 92.0).max(84.0);
@@ -3474,7 +3927,7 @@ impl App {
                             .selected_text(cur_label)
                             .width(combo_w)
                             .show_ui(ui, |ui| {
-                                if ui.selectable_label(cur_assign.is_none(), "Ungrouped").clicked() {
+                                if ui.selectable_label(cur_assign.is_none(), "Cameras (automatic)").clicked() {
                                     chosen = Some(None);
                                 }
                                 for g in &self.cfg.layout.groups {
@@ -3891,7 +4344,8 @@ impl App {
                                 "Your credentials. Your username and password go directly to Tuya's servers (px1.tuya*.com) over HTTPS. If you tick “Keep me logged in”, they are kept in this app's config file (in your user profile, under SmartLifeTuyaDesktop\\config.json) so the app can silently sign back in when the session token expires — use it only on your own devices, and use “Forget saved login” above to erase them.",
                                 "The proxy. Some networks block direct calls to Tuya's endpoints. In “Auto” mode, China-region traffic is routed through a community CORS proxy (cors.smartathome.co.uk); US and EU traffic goes direct. Note a proxy can see the requests it forwards (they contain a session token, never your password after sign-in — the sign-in request itself does contain your password, so only use proxies you trust for CN logins).",
                                 "Customising. Sections sort A–Z by name by default. Use ✎ Edit to drag cards into your own order inside a section — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top — the device also stays in its group below. Scenes always live in their own Scenes section.",
-                                "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way.",
+                                "Lighting & group controls. Lights organise themselves: any bulb or strip that isn't assigned to one of your groups lives in the built-in Lighting section, and cameras get their own built-in Cameras section the same way — assigning a device to a group always wins over the automatic sections. The Lighting header (and the header of any group containing a light) has group controls: a master switch (on if any member is on; clicking turns the whole group on or off), brightness and colour-temperature sliders showing the members' average, and colour swatches. Group controls broadcast — they send the command to each member in turn, and changing a single light afterwards simply overrides it for that light. Nothing about the group itself is stored.",
+                                "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way; unassigned cameras live in the built-in Cameras section until you assign them to a group of your own.",
                                 "Watching a stream. RTSP can't play inside this app. Without a gateway, ▶ Watch hands the stream address to the player app named in Settings → Stream gateway & cameras (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. For in-browser playback, run a small stream gateway such as go2rtc or MediaMTX on your network, give it a stream with the same name as the camera here (fed from the same RTSP address — Copy URL has it), and enter the gateway's address in Settings → Stream gateway & cameras. ▶ Watch then opens the gateway's watch page in your browser.",
                                 "Limits. Tuya rate-limits the device-list call; if you refresh very often the app may briefly show the last known states. Autorefresh every 30s or slower is comfortable.",
                             ];
@@ -4219,4 +4673,182 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(App::new(cc))),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Tests (cargo test): camera URLs, section classification (incl. the
+// automatic Lighting / Cameras sections), group fan-out plans, and
+// update version/release parsing — mirrors the web edition's harness.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cam(template: &str, path: &str) -> Camera {
+        Camera {
+            id: "1".into(),
+            name: "Porch".into(),
+            user: "tap o".into(),
+            password: obfuscate("p@ss:w/rd#?x"),
+            host: "192.168.1.50".into(),
+            port: 554,
+            template: template.into(),
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn rtsp_url_encodes_credentials() {
+        let c = cam("tapo1", "");
+        assert_eq!(
+            build_rtsp_url(&c),
+            "rtsp://tap%20o:p%40ss%3Aw%2Frd%23%3Fx@192.168.1.50:554/stream1"
+        );
+    }
+
+    #[test]
+    fn rtsp_url_templates_and_ports() {
+        assert!(build_rtsp_url(&cam("tapo2", "")).ends_with(":554/stream2"));
+        let mut c = cam("custom", "live/ch1");
+        assert!(build_rtsp_url(&c).ends_with(":554/live/ch1"));
+        c.path = "/onvif/stream".into();
+        assert!(build_rtsp_url(&c).ends_with(":554/onvif/stream"));
+        c.port = 8554;
+        assert!(build_rtsp_url(&c).contains(":8554/"));
+        c.port = 0; // treated as default
+        assert!(build_rtsp_url(&c).contains(":554/"));
+    }
+
+    #[test]
+    fn gateway_urls() {
+        let prefs = Prefs { gateway_url: "http://gw.local:1984/".into(), gateway_type: "go2rtc".into(), ..Default::default() };
+        assert_eq!(
+            gateway_watch_url(&cam("tapo1", ""), &prefs).as_deref(),
+            Some("http://gw.local:1984/stream.html?src=Porch")
+        );
+        let prefs2 = Prefs { gateway_url: "http://gw.local:8889".into(), gateway_type: "mediamtx".into(), ..Default::default() };
+        assert_eq!(
+            gateway_watch_url(&cam("tapo1", ""), &prefs2).as_deref(),
+            Some("http://gw.local:8889/Porch/index.m3u8")
+        );
+        let prefs3 = Prefs::default();
+        assert_eq!(gateway_watch_url(&cam("tapo1", ""), &prefs3), None);
+    }
+
+    fn dev(id: &str, name: &str, data: Value) -> Device {
+        parse_device(&json!({ "id": id, "name": name, "dev_type": "light", "data": data }))
+    }
+
+    fn bulb(id: &str, name: &str) -> Device {
+        dev(id, name, json!({ "state": true, "brightness": 800 }))
+    }
+
+    fn layout_with_group() -> LayoutCfg {
+        let mut l = LayoutCfg::default();
+        l.groups.push(Group { id: "g1".into(), name: "Kitchen".into() });
+        l
+    }
+
+    fn keys(secs: &[Section]) -> Vec<&str> {
+        secs.iter().map(|s| s.key.as_str()).collect()
+    }
+
+    #[test]
+    fn classification_lighting_cameras_ungrouped() {
+        let b = bulb("lb", "Bright bulb");
+        let plug = dev("p1", "Plug", json!({ "state": false }));
+        let c = cam("tapo1", "");
+        let entries = vec![device_entry(&b), device_entry(&plug), camera_entry(&c)];
+        let secs = build_sections(&entries, &LayoutCfg::default(), false, "");
+        assert_eq!(keys(&secs), vec!["lighting", "cameras", "ungrouped"]);
+        assert_eq!(secs[0].ids, vec!["lb".to_string()]);
+        assert_eq!(secs[1].ids, vec!["cam:1".to_string()]);
+        assert_eq!(secs[2].ids, vec!["p1".to_string()]);
+        assert!(device_is_light(&b));
+        assert!(!device_is_light(&plug));
+        assert_eq!(auto_section_label(&entries[0]), "Lighting (automatic)");
+        assert_eq!(auto_section_label(&entries[1]), "Ungrouped");
+        assert_eq!(auto_section_label(&entries[2]), "Cameras (automatic)");
+    }
+
+    #[test]
+    fn classification_assignment_wins() {
+        let b = bulb("lb", "Bright bulb");
+        let c = cam("tapo1", "");
+        let mut layout = layout_with_group();
+        layout.assign.insert("lb".into(), "g1".into());
+        layout.assign.insert("cam:1".into(), "g1".into());
+        let entries = vec![device_entry(&b), camera_entry(&c)];
+        let secs = build_sections(&entries, &layout, false, "");
+        assert_eq!(keys(&secs), vec!["g1"]);
+        assert_eq!(secs[0].ids.len(), 2);
+    }
+
+    #[test]
+    fn group_plan_fanout() {
+        let on_bulb = bulb("lb", "On bulb");
+        let temp_bulb = dev("lt", "Temp bulb", json!({ "state": false, "brightness": 400, "color_temp": 29000 }));
+        let strip = dev("ls", "RGB strip", json!({ "state": false, "color_mode": "colour", "hue": 10, "saturation": 0.5 }));
+        let plug = dev("p1", "Plug", json!({ "state": false }));
+        let members = vec![on_bulb.clone(), temp_bulb, strip, plug];
+        assert!(group_master_on(&members));
+        assert!(!group_master_on(&[members[1].clone()]));
+
+        let plan = group_plan(&members, GroupKind::Toggle, 0, None);
+        assert_eq!(plan.len(), 4);
+        assert!(plan.iter().all(|(_, a, v)| *a == "turnOnOff" && *v == json!(0)));
+
+        let plan = group_plan(&members, GroupKind::Brightness, 55, None);
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|(_, _, v)| *v == json!(55)));
+
+        let plan = group_plan(&members, GroupKind::Temp, 6000, None);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, "lt");
+
+        let plan = group_plan(&members, GroupKind::Color, 0, Some("#00ff00"));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, "ls");
+        assert_eq!(plan[0].2["hue"], json!(120));
+        assert_eq!(plan[0].2["brightness"], json!(100)); // strip reports no brightness
+
+        let off = dev("lo", "Off bulb", json!({ "state": false, "brightness": 500, "online": false }));
+        let plan = group_plan(&[off, on_bulb], GroupKind::Brightness, 70, None);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0, "lb");
+
+        assert_eq!(group_average(&[80, 40]), Some(60.0));
+        assert_eq!(group_average(&[]), None);
+    }
+
+    #[test]
+    fn version_compare() {
+        assert!(version_newer("1.1.0", "1.0.0"));
+        assert!(!version_newer("1.0.0", "1.1.0"));
+        assert!(!version_newer("1.1.0", "1.1.0"));
+        assert!(version_newer("1.10.0", "1.9.0"));
+        assert!(version_newer("v1.2.0", "1.1.0"));
+        assert_eq!(APP_VERSION, "1.1.0");
+    }
+
+    #[test]
+    fn release_parse_and_installer_name() {
+        let v = json!({
+            "tag_name": "v1.2.0",
+            "html_url": "https://github.com/x/releases/v1.2.0",
+            "assets": [
+                { "name": "SmartLife_Tuya_Desktop.html", "browser_download_url": "https://dl/html", "size": 100 },
+                { "name": "SmartLifeTuyaDesktop-Setup-v1.2.0.exe", "browser_download_url": "https://dl/exe", "size": 200 }
+            ]
+        });
+        let info = parse_release(&v).expect("release parses");
+        assert_eq!(info.version, "1.2.0");
+        assert_eq!(info.exe_name, "SmartLifeTuyaDesktop-Setup-v1.2.0.exe");
+        assert_eq!(info.exe_name, expected_installer_name(&info.version));
+        assert_ne!(
+            "SmartLifeTuyaDesktop-Setup-v9.9.9.exe",
+            expected_installer_name(&info.version)
+        );
+        assert!(parse_release(&json!({ "tag_name": "v1.2.0", "html_url": "x", "assets": [] })).is_none());
+    }
 }
