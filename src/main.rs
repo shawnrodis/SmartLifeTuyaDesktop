@@ -603,6 +603,12 @@ fn temp_slider_to_reported(slider: i64) -> i64 {
     (((slider - 1000) as f64) * 4.033 + 1000.0).round() as i64
 }
 
+/// Neutral colour-temperature slider position (≈4600K, mid-scale)
+/// shown when a temp-capable device or group currently has no
+/// reading — the control stays, at a sane middle value, instead of
+/// snapping to the 2700K floor or vanishing (v1.2.2).
+const TEMP_NEUTRAL_SLIDER: i64 = 5500;
+
 fn temp_slider_to_kelvin(slider: i64) -> i64 {
     ((2700.0 + (clampf(slider as f64, 1000.0, 10000.0) - 1000.0) * (3800.0 / 9000.0)) / 10.0).round() as i64 * 10
 }
@@ -1050,6 +1056,140 @@ fn close_action(close_to_tray: bool, quitting: bool) -> CloseAction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Single instance (v1.2.2, Windows) — v1.2.1 had NO instance guard:
+// closing to the tray hid the process, and every later Start Menu /
+// shortcut launch started ANOTHER process — each with its own tray
+// icon (the user's "duplicating icon") and its own set of camera
+// pumps competing for the cameras' ~2 RTSP sessions. Now the first
+// process holds a named mutex; a later launch just signals the
+// primary's named event ("show your window") and exits before it
+// creates a window, an icon, or a single pump. Stale state is a
+// non-issue: the kernel releases a mutex when its owner process
+// dies, however it dies.
+// ---------------------------------------------------------------------------
+
+/// Kernel object names for the instance guard and the show signal.
+const SINGLE_INSTANCE_MUTEX: &str = "SmartLifeTuyaDesktop.SingleInstance";
+const SHOW_WINDOW_EVENT: &str = "SmartLifeTuyaDesktop.ShowWindow";
+
+/// Set by the primary's waiter thread when a secondary launch asks
+/// it to show its window; consumed by handle_window_chrome.
+static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The egui context, registered by App::new (Windows builds) so the
+/// waiter thread can poke the event loop awake — a bare flag could
+/// otherwise wait for a frame a sleeping hidden window never runs.
+#[cfg(target_os = "windows")]
+static WAKE_CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum InstanceRole {
+    Primary,
+    Secondary,
+}
+
+/// The role follows from the mutex creation result alone: the name
+/// already existed (ERROR_ALREADY_EXISTS) → another process is the
+/// primary and this one is a secondary launcher.
+fn instance_role(already_exists: bool) -> InstanceRole {
+    if already_exists {
+        InstanceRole::Secondary
+    } else {
+        InstanceRole::Primary
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A kernel HANDLE riding to the waiter thread (HANDLE is a raw
+/// pointer; the handle itself is process-wide and thread-safe to
+/// wait on).
+#[cfg(target_os = "windows")]
+struct SendHandle(usize);
+#[cfg(target_os = "windows")]
+unsafe impl Send for SendHandle {}
+
+/// The primary's kernel objects. Dropping closes the handles,
+/// releasing the mutex for the next launch.
+#[cfg(target_os = "windows")]
+struct InstanceGuard {
+    _mutex: usize,
+    _event: usize,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            CloseHandle(self._mutex as _);
+            CloseHandle(self._event as _);
+        }
+    }
+}
+
+/// Acquire the single-instance guard (Windows). The EVENT is
+/// created before the MUTEX, so whichever process wins the mutex
+/// has necessarily created the event already — a secondary can
+/// therefore always signal it. A primary spawns the waiter thread
+/// that flips SHOW_REQUESTED (+ a repaint poke) per signal.
+#[cfg(target_os = "windows")]
+fn acquire_single_instance() -> (InstanceRole, Option<InstanceGuard>) {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, CreateMutexW, SetEvent, WaitForSingleObject, INFINITE,
+    };
+    unsafe {
+        let ev_name = wide_z(SHOW_WINDOW_EVENT);
+        let event = CreateEventW(std::ptr::null(), 0, 0, ev_name.as_ptr());
+        let mu_name = wide_z(SINGLE_INSTANCE_MUTEX);
+        let mutex = CreateMutexW(std::ptr::null(), 1, mu_name.as_ptr());
+        if mutex.is_null() {
+            // Couldn't even ask — never block the launch itself.
+            if !event.is_null() {
+                CloseHandle(event);
+            }
+            return (InstanceRole::Primary, None);
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            // Secondary: ask the primary to show itself, then let
+            // main exit BEFORE any window / tray icon / pump exists.
+            if !event.is_null() {
+                SetEvent(event);
+                CloseHandle(event);
+            }
+            CloseHandle(mutex);
+            return (InstanceRole::Secondary, None);
+        }
+        if !event.is_null() {
+            let h = SendHandle(event as usize);
+            std::thread::spawn(move || loop {
+                // WAIT_OBJECT_0 == 0; anything else ends the watch.
+                if WaitForSingleObject(h.0 as _, INFINITE) != 0 {
+                    break;
+                }
+                SHOW_REQUESTED.store(true, Ordering::SeqCst);
+                if let Ok(slot) = WAKE_CTX.lock() {
+                    if let Some(ctx) = &*slot {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        }
+        (
+            InstanceRole::Primary,
+            Some(InstanceGuard {
+                _mutex: mutex as usize,
+                _event: event as usize,
+            }),
+        )
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn reg_command() -> Command {
     let mut cmd = Command::new("reg");
@@ -1453,12 +1593,103 @@ fn find_ffmpeg(override_path: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Retry delay after a pump failure: 2 s, 5 s, then a 15 s cap.
+/// Retry delay after a pump failure: 2 s, 4 s, then an 8 s cap
+/// (v1.2.2 — tightened from 2/5/15 so a feed that dropped for a
+/// transient reason — a DHCP move, a freed RTSP session — comes
+/// back in seconds, not half a minute).
 fn pump_backoff(streak: u32) -> Duration {
     match streak {
         0 => Duration::from_secs(2),
-        1 => Duration::from_secs(5),
-        _ => Duration::from_secs(15),
+        1 => Duration::from_secs(4),
+        _ => Duration::from_secs(8),
+    }
+}
+
+/// Map an ffmpeg stderr tail to a short, user-showable failure
+/// reason (v1.2.2) — the tile displays it under the retry status
+/// after repeated failures so a dead feed is diagnosable ("the
+/// camera moved", "wrong camera-account password") instead of a
+/// bare "retrying" loop. None when nothing recognisable is found.
+fn ffmpeg_failure_reason(stderr_tail: &str) -> Option<String> {
+    let s = stderr_tail.to_lowercase();
+    if s.contains("401") || s.contains("unauthorized") {
+        Some("401 Unauthorized".to_string())
+    } else if s.contains("connection refused") {
+        Some("Connection refused".to_string())
+    } else if s.contains("timed out") || s.contains("timeout") {
+        Some("Connection timed out".to_string())
+    } else if s.contains("failed to resolve hostname")
+        || s.contains("name or service not known")
+        || s.contains("temporary failure in name resolution")
+        || s.contains("could not resolve")
+    {
+        Some("Host not found".to_string())
+    } else if s.contains("404") {
+        Some("Stream path not found (404)".to_string())
+    } else if s.contains("connection reset") {
+        Some("Connection reset by camera".to_string())
+    } else {
+        None
+    }
+}
+
+/// What sync_pumps should do with one pump slot this frame
+/// (v1.2.2), as a pure decision so the recovery rules are testable:
+/// a missing pump starts fresh; a source change (camera edited —
+/// the generation in the source key moves — quality/size change,
+/// ffmpeg moved) restarts IMMEDIATELY with the failure streak
+/// reset; a forced retry (Retry button, Watch/tile click, window
+/// focus, player success, record change) does the same from
+/// Backoff; a lapsed backoff retries on schedule, keeping the
+/// streak so the delays keep growing to the cap.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PumpAction {
+    Keep,
+    StartFresh,
+    RetryDue,
+}
+
+fn pump_action(
+    state: Option<PumpState>,
+    source_matches: bool,
+    force: bool,
+    due: bool,
+) -> PumpAction {
+    match state {
+        None => PumpAction::StartFresh,
+        Some(_) if !source_matches => PumpAction::StartFresh,
+        Some(PumpState::Backoff) if force => PumpAction::StartFresh,
+        Some(PumpState::Backoff) if due => PumpAction::RetryDue,
+        Some(_) => PumpAction::Keep,
+    }
+}
+
+/// Whether a camera's TILE pump should exist at all (v1.2.2):
+/// previews on, camera not hidden, preview not user-paused, and
+/// the in-app player is NOT open for this camera — Tapo cameras
+/// allow only ~2 concurrent RTSP sessions, so while the player
+/// holds one, the tile pump stands down and frees its session
+/// (it restarts, fresh, when the player closes).
+fn tile_pump_wanted(
+    previews: bool,
+    hidden: bool,
+    user_paused: bool,
+    player_holds_this: bool,
+) -> bool {
+    previews && !hidden && !user_paused && !player_holds_this
+}
+
+/// How long to wait before the next frame is needed purely to fire
+/// a lapsed pump retry — clamped so a Backoff pump restarts on
+/// schedule even when nothing else is repainting the window
+/// (v1.2.2: in v1.2.1 a lone backed-off pump could sit past its
+/// retry time indefinitely on an idle window).
+fn backoff_wake_delay(retry_at: Option<Instant>, now: Instant) -> Duration {
+    match retry_at {
+        Some(t) => t
+            .saturating_duration_since(now)
+            .clamp(Duration::from_millis(50), Duration::from_secs(1)),
+        None => Duration::from_millis(500),
     }
 }
 
@@ -1471,7 +1702,9 @@ enum PumpState {
 
 enum FrameMsg {
     Frame(Vec<u8>),
-    Ended,
+    /// ffmpeg exited / hit EOF; carries the mapped failure reason
+    /// (ffmpeg_failure_reason over the stderr tail), when known.
+    Ended(Option<String>),
 }
 
 /// Painted play/pause overlay chip for camera video (v1.2.1
@@ -1537,6 +1770,9 @@ struct Pump {
     /// Consecutive failures — drives the backoff schedule.
     streak: u32,
     retry_at: Option<Instant>,
+    /// Last mapped failure reason (v1.2.2) — shown under the
+    /// tile's retry status after repeated failures.
+    last_error: Option<String>,
 }
 
 impl Pump {
@@ -1557,16 +1793,20 @@ impl Pump {
         self.state = PumpState::Live;
         self.streak = 0;
         self.retry_at = None;
+        self.last_error = None;
     }
 
     /// ffmpeg exited / hit EOF: enter Backoff with the streak's
-    /// delay. A no-op when already backing off — one pump, one
-    /// state machine, never duplicate restarts.
-    fn note_ended(&mut self) {
+    /// delay, remembering why. A no-op when already backing off —
+    /// one pump, one state machine, never duplicate restarts.
+    fn note_ended(&mut self, reason: Option<String>) {
         if self.state != PumpState::Backoff {
             self.state = PumpState::Backoff;
             self.retry_at = Some(Instant::now() + pump_backoff(self.streak));
             self.streak += 1;
+            if reason.is_some() {
+                self.last_error = reason;
+            }
         }
     }
 }
@@ -1575,12 +1815,21 @@ impl Pump {
 /// reads exact w×h RGBA frames and forwards them; it keeps ffmpeg
 /// blocked on a full pipe rather than building a backlog here, and
 /// the UI keeps only the latest frame, so a slow frame is dropped,
-/// never queued.
-fn spawn_pump(ffmpeg: &Path, url: &str, w: usize, h: usize, ctx: &egui::Context) -> Pump {
+/// never queued. ffmpeg's stderr is captured (last few lines) so
+/// an exit can carry its mapped failure reason (v1.2.2).
+/// `source_key` is computed by the caller (sync_pumps) so the
+/// generation tag for camera edits rides along.
+fn spawn_pump(
+    ffmpeg: &Path,
+    url: &str,
+    w: usize,
+    h: usize,
+    source_key: String,
+    ctx: &egui::Context,
+) -> Pump {
     let (tx, rx) = channel::<FrameMsg>();
     let stop = Arc::new(AtomicBool::new(false));
     let child_slot: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
-    let source_key = pump_source_key(ffmpeg, url, w, h);
     {
         let stop = stop.clone();
         let child_slot = child_slot.clone();
@@ -1592,7 +1841,7 @@ fn spawn_pump(ffmpeg: &Path, url: &str, w: usize, h: usize, ctx: &egui::Context)
             cmd.args(ffmpeg_args(&url, w, h))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null());
+                .stderr(Stdio::piped());
             // No console window flashing up next to the GUI app.
             #[cfg(target_os = "windows")]
             {
@@ -1602,11 +1851,40 @@ fn spawn_pump(ffmpeg: &Path, url: &str, w: usize, h: usize, ctx: &egui::Context)
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(_) => {
-                    let _ = tx.send(FrameMsg::Ended);
+                    let _ = tx.send(FrameMsg::Ended(Some(
+                        "Could not start ffmpeg".to_string(),
+                    )));
                     ctx.request_repaint();
                     return;
                 }
             };
+            // stderr tail: last lines, for the failure reason.
+            let err_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            if let Some(stderr) = child.stderr.take() {
+                let tail = err_tail.clone();
+                thread::spawn(move || {
+                    use std::io::{BufRead, BufReader};
+                    let mut reader = BufReader::new(stderr);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let t = line.trim().to_string();
+                                if !t.is_empty() {
+                                    if let Ok(mut v) = tail.lock() {
+                                        v.push(t);
+                                        if v.len() > 12 {
+                                            v.remove(0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
             let mut stdout = child.stdout.take();
             if let Ok(mut slot) = child_slot.lock() {
                 *slot = Some(child);
@@ -1636,7 +1914,14 @@ fn spawn_pump(ffmpeg: &Path, url: &str, w: usize, h: usize, ctx: &egui::Context)
                 }
             }
             if !stop.load(Ordering::SeqCst) {
-                let _ = tx.send(FrameMsg::Ended);
+                // Brief grace so the stderr reader can drain the
+                // final lines (the reason is best-effort).
+                thread::sleep(Duration::from_millis(30));
+                let tail = err_tail
+                    .lock()
+                    .map(|v| v.join("\n"))
+                    .unwrap_or_default();
+                let _ = tx.send(FrameMsg::Ended(ffmpeg_failure_reason(&tail)));
                 ctx.request_repaint();
             }
         });
@@ -1652,6 +1937,7 @@ fn spawn_pump(ffmpeg: &Path, url: &str, w: usize, h: usize, ctx: &egui::Context)
         texture: None,
         streak: 0,
         retry_at: None,
+        last_error: None,
     }
 }
 
@@ -1740,12 +2026,21 @@ fn parse_device(raw: &Value) -> Device {
         has_brightness,
         has_temp,
         has_color,
-        brightness_pct: if has_brightness {
+        // The VALUES additionally require a real reading
+        // (fresh_value_counts): a stub payload's placeholder
+        // (null / 0) yields None — "no current value" — while the
+        // capability flags above stay presence-based, so the
+        // control itself never disappears with the value.
+        brightness_pct: if has_brightness
+            && data.get("brightness").map(|v| fresh_value_counts("brightness", v)).unwrap_or(false)
+        {
             data_f64(data, "brightness").map(brightness_to_pct)
         } else {
             None
         },
-        temp_slider: if has_temp {
+        temp_slider: if has_temp
+            && data.get("color_temp").map(|v| fresh_value_counts("color_temp", v)).unwrap_or(false)
+        {
             data_f64(data, "color_temp").map(temp_reported_to_slider)
         } else {
             None
@@ -1757,8 +2052,30 @@ fn parse_device(raw: &Value) -> Device {
     }
 }
 
-/// Keep previously-known data fields when a fresh discovery omits them
-/// (same merge the web edition performs).
+/// Does this fresh payload value actually REPORT the field
+/// (v1.2.2)? A JSON null never does. For brightness / colour
+/// temperature a numeric 0 (or a non-numeric junk value) doesn't
+/// either: on the reported scales those mean "no reading" — Tuya
+/// stubs for lights the account can't fully see carry exactly such
+/// placeholders — and treating them as real made colour temp snap
+/// to the 2700K floor and brightness read 0 in v1.2.1.
+fn fresh_value_counts(key: &str, v: &Value) -> bool {
+    if v.is_null() {
+        return false;
+    }
+    if key == "brightness" || key == "color_temp" {
+        return v.as_f64().map(|n| n > 0.0).unwrap_or(false);
+    }
+    true
+}
+
+/// Keep previously-known data fields when a fresh discovery omits
+/// them — or reports them as placeholders (see fresh_value_counts).
+/// Capabilities therefore stick: once any payload has shown a
+/// device has brightness / colour temp / colour, later thin
+/// payloads can't take the controls away, because the merged data
+/// still carries the keys and their last-known values (same merge
+/// the web edition performs).
 fn merge_device_data(fresh: Vec<Value>, previous: &[Value]) -> Vec<Value> {
     if previous.is_empty() {
         return fresh;
@@ -1778,7 +2095,11 @@ fn merge_device_data(fresh: Vec<Value>, previous: &[Value]) -> Vec<Value> {
             if let Some(prev_data) = prev_by_id.get(&id) {
                 if let Some(data) = d.get_mut("data").and_then(|v| v.as_object_mut()) {
                     for (k, v) in prev_data.iter() {
-                        if !data.contains_key(k) {
+                        let counts = data
+                            .get(k)
+                            .map(|fv| fresh_value_counts(k, fv))
+                            .unwrap_or(false);
+                        if !counts {
                             data.insert(k.clone(), v.clone());
                         }
                     }
@@ -2585,6 +2906,28 @@ struct Toast {
     at: Instant,
 }
 
+/// Header name/status budget (v1.2.2). The name block's width is
+/// whatever remains in the card header after the icon block —
+/// measured honestly by egui at layout time — minus the TRAILING
+/// controls' true footprint and one layout gap. The footprints
+/// below are MEASURED (headless egui harness, the app's own
+/// styles): pin 16 + toggle 48 + hide 13 + two 8px item spacings
+/// = 93 for a device; hide alone = 13 for a scene; pin + hide +
+/// one spacing = 37 for a camera. v1.2.1 reserved 124 / 36 / 68
+/// instead — a phantom 15–23px tax on every card that, at ordinary
+/// card widths, collapsed the budget to its 40px floor ("De…",
+/// "Scene — tap St…") even though the cells were wide.
+/// The stretch of a wider cell passes through to the budget 1:1.
+fn header_name_budget(avail_after_icon: f32, trailing_deduct: f32) -> f32 {
+    (avail_after_icon - trailing_deduct).max(40.0)
+}
+
+/// Total deduction (true trailing footprint + the name-to-controls
+/// gap + a few px of safety) per card kind.
+const TRAILING_DEDUCT_DEVICE: f32 = 104.0;
+const TRAILING_DEDUCT_SCENE: f32 = 24.0;
+const TRAILING_DEDUCT_CAMERA: f32 = 48.0;
+
 fn status_text(d: &Device) -> String {
     if !d.online {
         return "Offline".to_string();
@@ -2764,6 +3107,24 @@ struct App {
     // live camera previews (v1.2.0): frame pumps keyed "cam:{id}"
     // (tiles) and "player" (the big player window).
     pumps: HashMap<String, Pump>,
+    /// Force-retry requests for pump keys (v1.2.2): filled by the
+    /// tile Retry button, Watch/tile clicks, a successful player
+    /// connection and window focus/visible kicks; consumed (and
+    /// cleared) by sync_pumps each frame.
+    pump_force: HashSet<String>,
+    /// Per-camera edit generation ("cam:{id}" -> counter, v1.2.2):
+    /// bumped on every camera edit save and folded into the pump
+    /// source key, so saving a camera restarts its pump immediately
+    /// (backoff reset) even when the id — or even the URL — is
+    /// unchanged on paper.
+    cam_gen: HashMap<String, u64>,
+    /// Last textures of tile pumps displaced by the big player
+    /// (v1.2.2): the tile keeps showing the frozen frame while the
+    /// player holds the camera's RTSP session.
+    held_textures: HashMap<String, egui::TextureHandle>,
+    /// Previous frame's viewport focus, for the focus-gained
+    /// backoff kick (v1.2.2).
+    prev_focused: bool,
     paused_cams: HashSet<String>,
     player_for: Option<String>,
     /// ffmpeg lookup cache: (override string it was computed for, hit).
@@ -2869,6 +3230,12 @@ fn drag_should_promote(press: egui::Pos2, cur: egui::Pos2) -> bool {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
+        // Let the single-instance waiter thread poke this context
+        // awake when a secondary launch asks us to show (v1.2.2).
+        #[cfg(target_os = "windows")]
+        if let Ok(mut slot) = WAKE_CTX.lock() {
+            *slot = Some(cc.egui_ctx.clone());
+        }
         let cfg = load_config();
         let (tx, rx) = channel::<NetResult>();
         let mut app = App {
@@ -2918,6 +3285,10 @@ impl App {
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
+            pump_force: HashSet::new(),
+            cam_gen: HashMap::new(),
+            held_textures: HashMap::new(),
+            prev_focused: true,
             paused_cams: HashSet::new(),
             player_for: None,
             ffmpeg_cache: None,
@@ -3064,10 +3435,16 @@ impl App {
         self.login_busy = true;
         let tx = self.tx.clone();
         let prefs = self.cfg.prefs.clone();
+        // The login-time discovery merges against last-known data
+        // too (v1.2.2): v1.2.1 passed an EMPTY previous list here,
+        // so any re-login (token expiry, cold start) let a thin
+        // payload replace the full device state wholesale — and the
+        // result was then persisted as the new cache / merge anchor.
+        let previous = self.raw_devices.clone();
         thread::spawn(move || {
             let client = http_client();
             let msg = match net_auth(&client, &creds, &plain_pw, &prefs) {
-                Ok(session) => match net_discovery(&client, &session, &prefs, &[]) {
+                Ok(session) => match net_discovery(&client, &session, &prefs, &previous) {
                     Ok(devices) => NetResult::LoginOk { session, devices },
                     Err(DiscoveryFail::Frequent) => NetResult::LoginOk { session, devices: Vec::new() },
                     Err(DiscoveryFail::Msg(e)) => NetResult::LoginErr(e),
@@ -3323,6 +3700,9 @@ impl App {
             self.player_for = None;
         }
         self.paused_cams.remove(item_id);
+        self.cam_gen.remove(item_id);
+        self.held_textures.remove(item_id);
+        self.pump_force.remove(item_id);
         self.save();
         self.toast("Camera deleted", false);
     }
@@ -3355,101 +3735,153 @@ impl App {
         }
     }
 
+    /// Ask sync_pumps to restart one pump NOW, failure streak
+    /// reset (v1.2.2 manual/implicit retry).
+    fn kick_pump(&mut self, key: &str) {
+        self.pump_force.insert(key.to_string());
+    }
+
+    /// Kick every pump currently in Backoff — the window just
+    /// became visible/focused again, so feeds that dropped while
+    /// the user wasn't looking get an immediate retry instead of
+    /// waiting out their delay (v1.2.2 reset trigger).
+    fn kick_all_backoff(&mut self) {
+        let keys: Vec<String> = self
+            .pumps
+            .iter()
+            .filter(|(_, p)| p.state == PumpState::Backoff)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            self.pump_force.insert(k);
+        }
+    }
+
     /// Reconcile running pumps with what's wanted — called every
     /// frame from update(), before rendering:
-    ///  - a TILE pump per non-hidden camera while previews are on and
-    ///    the camera isn't paused (Stream 2 for Tapo templates);
+    ///  - a TILE pump per camera while previews are on, the camera
+    ///    isn't hidden/paused, and the big player isn't open for it
+    ///    (tile_pump_wanted — the player takes the RTSP session);
     ///  - the PLAYER pump while the player window is open (the
     ///    camera's current quality selection).
-    /// A pump whose source changed (camera edited, quality switched,
-    /// ffmpeg moved) is restarted; an unwanted pump is stopped; a
-    /// pump in Backoff restarts when its delay lapses. One pump per
-    /// key, never duplicates. Latest frames are uploaded here as egui
-    /// textures, in place.
+    /// Pump sources are derived fresh from the CURRENT camera
+    /// records every frame, and the source key additionally carries
+    /// the camera's edit generation: any change (address, port,
+    /// template, credentials, size, ffmpeg path, an edit save)
+    /// restarts the pump immediately with its failure streak reset
+    /// (pump_action). Backoff retries fire on schedule — a wake
+    /// repaint is armed for the earliest one so an idle window
+    /// can't strand a feed. One pump per key, never duplicates.
     fn sync_pumps(&mut self, ctx: &egui::Context) {
         let ff = self.ffmpeg_path();
         let mut desired: HashMap<String, String> = HashMap::new(); // key -> source key
         let mut specs: HashMap<String, (String, usize, usize)> = HashMap::new(); // key -> (url, w, h)
         if let Some(ffp) = &ff {
-            if self.cfg.prefs.previews {
-                for cam in &self.cfg.cameras {
-                    let item = format!("cam:{}", cam.id);
-                    if self.cfg.layout.hidden.contains(&item)
-                        || self.paused_cams.contains(&item)
-                    {
-                        continue;
-                    }
+            for cam in &self.cfg.cameras {
+                let item = format!("cam:{}", cam.id);
+                let gen = self.cam_gen.get(&item).copied().unwrap_or(0);
+                if tile_pump_wanted(
+                    self.cfg.prefs.previews,
+                    self.cfg.layout.hidden.contains(&item),
+                    self.paused_cams.contains(&item),
+                    self.player_for.as_deref() == Some(&item),
+                ) {
                     // The tile pump follows the card's size (v1.2.1):
                     // Normal 480×270 SD, Large 960×540 SD, Wide
                     // 960×540 at the card's selected quality. The
-                    // source key includes url+w+h, so a resize
-                    // restarts the pump at the new spec on its own.
+                    // source key includes url+w+h+gen, so a resize
+                    // or an edit restarts the pump on its own.
                     let (url, w, h) = tile_feed(cam, cam_size_of(&self.cfg.layout, &item));
-                    desired.insert(item.clone(), pump_source_key(ffp, &url, w, h));
+                    desired.insert(
+                        item.clone(),
+                        format!("{}|g{}", pump_source_key(ffp, &url, w, h), gen),
+                    );
                     specs.insert(item, (url, w, h));
                 }
             }
             if let Some(item) = &self.player_for {
                 if let Some(ci) = self.camera_index(item) {
                     let cam = self.cfg.cameras[ci].clone();
+                    let gen = self.cam_gen.get(item).copied().unwrap_or(0);
                     let url = build_rtsp_url(&cam);
                     desired.insert(
                         "player".to_string(),
-                        pump_source_key(ffp, &url, PLAYER_W, PLAYER_H),
+                        format!(
+                            "{}|g{}",
+                            pump_source_key(ffp, &url, PLAYER_W, PLAYER_H),
+                            gen
+                        ),
                     );
                     specs.insert("player".to_string(), (url, PLAYER_W, PLAYER_H));
                 }
             }
         }
-        // Stop pumps that are unwanted or whose source changed.
+        if !self.cfg.prefs.previews {
+            self.held_textures.clear();
+        }
+        // Stop pumps that are no longer wanted at all. A tile pump
+        // displaced by the big player keeps its last texture in
+        // held_textures, so the tile shows the frozen frame (not a
+        // blank "Connecting…") while the player holds the session.
         let keys: Vec<String> = self.pumps.keys().cloned().collect();
         for k in keys {
-            let stale = match (self.pumps.get(&k), desired.get(&k)) {
-                (Some(p), Some(want)) => p.source_key != *want,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if stale {
-                if let Some(p) = self.pumps.remove(&k) {
+            if !desired.contains_key(&k) {
+                if let Some(mut p) = self.pumps.remove(&k) {
+                    if self.player_for.as_deref() == Some(k.as_str()) {
+                        if let Some(tex) = p.texture.take() {
+                            self.held_textures.insert(k.clone(), tex);
+                        }
+                    }
                     p.stop();
                 }
             }
         }
-        // Start missing pumps; restart Backoff pumps whose time came
-        // (keeping the texture + streak so the tile doesn't flicker
-        // back to a blank "Connecting…" on every retry).
+        // Start / restart pumps per the pure decision (pump_action).
         if let Some(ffp) = &ff {
+            let now = Instant::now();
             for (k, want) in &desired {
-                let needs_start = match self.pumps.get(k) {
-                    None => true,
-                    Some(p) => {
-                        p.state == PumpState::Backoff
-                            && p.retry_at.map(|t| Instant::now() >= t).unwrap_or(false)
-                    }
+                let (state, matches, due) = match self.pumps.get(k) {
+                    None => (None, true, false),
+                    Some(p) => (
+                        Some(p.state),
+                        p.source_key == *want,
+                        p.retry_at.map(|t| now >= t).unwrap_or(false),
+                    ),
                 };
-                if needs_start {
-                    if let Some((url, w, h)) = specs.get(k) {
-                        let mut np = spawn_pump(ffp, url, *w, *h, ctx);
-                        debug_assert_eq!(&np.source_key, want);
-                        if let Some(mut old) = self.pumps.remove(k) {
-                            np.streak = old.streak;
-                            np.texture = old.texture.take();
-                            old.stop();
+                let force = self.pump_force.contains(k);
+                match pump_action(state, matches, force, due) {
+                    PumpAction::Keep => {}
+                    action => {
+                        if let Some((url, w, h)) = specs.get(k) {
+                            let mut np =
+                                spawn_pump(ffp, url, *w, *h, want.clone(), ctx);
+                            if let Some(mut old) = self.pumps.remove(k) {
+                                if action == PumpAction::RetryDue {
+                                    np.streak = old.streak;
+                                }
+                                np.texture = old.texture.take();
+                                old.stop();
+                            }
+                            if np.texture.is_none() {
+                                np.texture = self.held_textures.remove(k);
+                            }
+                            self.pumps.insert(k.clone(), np);
                         }
-                        self.pumps.insert(k.clone(), np);
                     }
                 }
             }
         }
+        self.pump_force.clear();
         // Drain frame channels: keep only the LATEST frame per pump.
         let mut any_active = false;
+        let mut next_retry: Option<Instant> = None;
         for (k, p) in self.pumps.iter_mut() {
             let mut latest: Option<Vec<u8>> = None;
-            let mut ended = false;
+            let mut ended: Option<Option<String>> = None;
             while let Ok(m) = p.rx.try_recv() {
                 match m {
                     FrameMsg::Frame(f) => latest = Some(f),
-                    FrameMsg::Ended => ended = true,
+                    FrameMsg::Ended(reason) => ended = Some(reason),
                 }
             }
             if let Some(f) = latest {
@@ -3465,16 +3897,31 @@ impl App {
                     }
                 }
                 p.note_frame();
+                // A player connection that succeeds proves the
+                // camera is reachable again — reset the TILE pump's
+                // backoff too (v1.2.2 reset trigger).
+                if k == "player" {
+                    if let Some(item) = self.player_for.clone() {
+                        self.pump_force.insert(item);
+                    }
+                }
             }
-            if ended {
-                p.note_ended();
+            if let Some(reason) = ended {
+                p.note_ended(reason);
             }
             if p.state != PumpState::Backoff {
                 any_active = true;
+            } else if let Some(t) = p.retry_at {
+                next_retry = Some(next_retry.map(|x: Instant| x.min(t)).unwrap_or(t));
             }
         }
         if any_active {
             ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if let Some(t) = next_retry {
+            // Arm a wake-up for the earliest scheduled retry so it
+            // fires on time even on an otherwise idle window.
+            ctx.request_repaint_after(backoff_wake_delay(Some(t), Instant::now()));
         }
     }
 
@@ -3500,6 +3947,9 @@ impl App {
     /// ffmpeg is available (v1.2.0); else the external player.
     fn watch_camera(&mut self, item_id: &str) {
         let Some(ci) = self.camera_index(item_id) else { return };
+        // Clicking Watch is a backoff reset trigger (v1.2.2): the
+        // user is actively trying to see this camera — retry now.
+        self.kick_pump(item_id);
         let cam = self.cfg.cameras[ci].clone();
         if let Some(url) = gateway_watch_url(&cam, &self.cfg.prefs) {
             open_external(&url);
@@ -3658,36 +4108,65 @@ impl App {
         }
     }
 
-    /// Tray events + window-close behaviour (v1.2.1), run every
-    /// frame before rendering:
-    ///  - tray "Open" / icon left-click → show + focus the window;
-    ///  - tray "Quit" → stop the pumps, save, and REALLY exit
-    ///    (the quitting flag keeps close-to-tray from swallowing
-    ///    the close, as does an installer launch);
+    /// Bring the window back from the tray (v1.2.2): visible,
+    /// UN-minimized and focused — v1.2.1 sent Visible + Focus only,
+    /// which left a taskbar-minimized window sitting minimized.
+    /// Restoring also kicks backed-off camera pumps: the user is
+    /// looking again, so feeds retry immediately.
+    fn show_from_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.window_hidden = false;
+        self.kick_all_backoff();
+    }
+
+    /// Tray events + window-close behaviour, run every frame before
+    /// rendering (tray/muda events arrive on process-global
+    /// channels; they only take effect when a frame drains them —
+    /// hence the heartbeat below):
+    ///  - tray "Open" / icon left-click, or a secondary launch's
+    ///    ShowWindow signal → restore the window (show_from_tray);
+    ///  - tray "Quit" → drop the tray icon, stop the pumps, save,
+    ///    and REALLY exit (the quitting flag keeps close-to-tray
+    ///    from swallowing the close, as for an installer launch);
     ///  - a window close with close-to-tray on → cancel the close
-    ///    and hide instead, with the one-time balloon.
-    /// While hidden, a slow heartbeat keeps frames coming so tray
-    /// events are polled even if the OS stops waking the loop.
+    ///    and hide instead, with the one-time balloon;
+    ///  - focus regained → backed-off camera pumps retry at once.
+    /// While hidden, a 200 ms heartbeat keeps frames coming so the
+    /// channels and the ShowWindow flag are consumed promptly even
+    /// though a hidden window gets no paint-driven frames.
     fn handle_window_chrome(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if let Some(tray) = &self.tray {
-            for action in drain_tray_events(tray) {
-                match action {
-                    TrayAction::Show => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        self.window_hidden = false;
+        if SHOW_REQUESTED.swap(false, Ordering::SeqCst) {
+            self.show_from_tray(ctx);
+        }
+        let tray_actions: Vec<TrayAction> = match &self.tray {
+            Some(tray) => drain_tray_events(tray),
+            None => Vec::new(),
+        };
+        for action in tray_actions {
+            match action {
+                TrayAction::Show => self.show_from_tray(ctx),
+                TrayAction::Quit => {
+                    self.quitting = true;
+                    // Drop the icon BEFORE the close so no phantom
+                    // icon is left in the tray (v1.2.2).
+                    self.tray = None;
+                    for p in self.pumps.values() {
+                        p.stop();
                     }
-                    TrayAction::Quit => {
-                        self.quitting = true;
-                        for p in self.pumps.values() {
-                            p.stop();
-                        }
-                        self.save();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+                    self.save();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }
+        // Focus regained (clicking back into the window) is a
+        // backoff reset trigger for camera feeds (v1.2.2).
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.prev_focused {
+            self.kick_all_backoff();
+        }
+        self.prev_focused = focused;
         if ctx.input(|i| i.viewport().close_requested()) {
             if close_action(self.cfg.prefs.close_to_tray, self.quitting)
                 == CloseAction::HideToTray
@@ -3706,7 +4185,7 @@ impl App {
             }
         }
         if self.window_hidden {
-            ctx.request_repaint_after(Duration::from_millis(400));
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -4612,14 +5091,22 @@ impl App {
                             self.group_broadcast(&sec2, GroupKind::Toggle, 0, None);
                         }
                     });
-                    if let Some(avg) = group_average(&b_vals) {
+                    // Group sliders are capability-gated too
+                    // (v1.2.2): shown whenever any member CAN do
+                    // brightness / temp, positioned at the average
+                    // of the members that currently have readings —
+                    // or a neutral default when none do — never
+                    // dropped just because values are missing.
+                    if devs.iter().any(|d| d.has_brightness) {
+                        let avg = group_average(&b_vals).unwrap_or(100.0);
                         self.group_slider(
                             ui, &sec2, "b", "Brightness", 11.0, 100.0, avg as f32,
                             |v| format!("{}%", v.round() as i64),
                             GroupKind::Brightness,
                         );
                     }
-                    if let Some(avg) = group_average(&t_vals) {
+                    if devs.iter().any(|d| d.has_temp) {
+                        let avg = group_average(&t_vals).unwrap_or(TEMP_NEUTRAL_SLIDER as f64);
                         self.group_slider(
                             ui, &sec2, "t", "Colour temperature", 1000.0, 10000.0, avg as f32,
                             |v| format!("{}K", temp_slider_to_kelvin((v / 50.0).round() as i64 * 50)),
@@ -5134,9 +5621,16 @@ impl App {
                         });
                     // name + status — a fixed-width block so the name
                     // truncates with an ellipsis instead of ever
-                    // reaching the pin / toggle / hide controls.
-                    let trailing_w = if dev.is_scene { 28.0 } else { 116.0 };
-                    let name_w = (ui.available_width() - trailing_w - 8.0).max(40.0);
+                    // reaching the pin / toggle / hide controls. The
+                    // budget is the REAL remainder after the icon,
+                    // minus the trailing controls' measured footprint
+                    // (header_name_budget, v1.2.2).
+                    let trailing_w = if dev.is_scene {
+                        TRAILING_DEDUCT_SCENE
+                    } else {
+                        TRAILING_DEDUCT_DEVICE
+                    };
+                    let name_w = header_name_budget(ui.available_width(), trailing_w);
                     ui.allocate_ui_with_layout(
                         vec2(name_w, icon_size),
                         Layout::top_down(Align::Min),
@@ -5206,13 +5700,22 @@ impl App {
                     });
                 });
                 // ---------- controls ----------
+                // Sliders are gated on CAPABILITY (has_brightness /
+                // has_temp — parse-time flags over merged data),
+                // never on the current value (v1.2.2): a missing or
+                // placeholder reading renders the slider at its
+                // last-known value (the merge guarantees one once
+                // the device has ever reported) or a neutral
+                // default — the control itself must not vanish.
                 if dev.online && !dev.is_scene {
-                    if let Some(pct) = dev.brightness_pct {
+                    if dev.has_brightness {
+                        let pct = dev.brightness_pct.filter(|&p| p > 0).unwrap_or(100);
                         self.slider_row(ui, &dev, "b", "Brightness", 11.0, 100.0, pct as f32, |v| {
                             format!("{}%", v.round() as i64)
                         });
                     }
-                    if let Some(t) = dev.temp_slider {
+                    if dev.has_temp {
+                        let t = dev.temp_slider.unwrap_or(TEMP_NEUTRAL_SLIDER);
                         self.slider_row(ui, &dev, "t", "Colour temperature", 1000.0, 10000.0, t as f32, |v| {
                             format!("{}K", temp_slider_to_kelvin((v / 50.0).round() as i64 * 50))
                         });
@@ -5401,14 +5904,23 @@ impl App {
         // the closure needs is copied out first (it borrows self).
         let show_video = self.cfg.prefs.previews && self.ffmpeg_cached().is_some();
         let paused = self.paused_cams.contains(id);
-        let (pump_state, pump_tex) = if show_video {
+        // With no live pump, a texture may still be HELD (v1.2.2)
+        // while the big player has this camera — the frozen frame
+        // stays on the tile.
+        let (pump_state, pump_tex, pump_streak, pump_err) = if show_video {
             match self.pumps.get(id) {
-                Some(p) => (Some(p.state), p.texture.as_ref().map(|t| t.id())),
-                None => (None, None),
+                Some(p) => (
+                    Some(p.state),
+                    p.texture.as_ref().map(|t| t.id()),
+                    p.streak,
+                    p.last_error.clone(),
+                ),
+                None => (None, self.held_textures.get(id).map(|t| t.id()), 0, None),
             }
         } else {
-            (None, None)
+            (None, None, 0, None)
         };
+        let in_player = self.player_for.as_deref() == Some(id);
         Frame::none()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
@@ -5425,8 +5937,17 @@ impl App {
                     let vh = vw * 9.0 / 16.0;
                     let (rect, resp) =
                         ui.allocate_exact_size(vec2(vw, vh), Sense::click());
-                    let painter = ui.painter();
+                    // Cloned: the Retry buttons below need &mut ui.
+                    let painter = ui.painter().clone();
                     painter.rect_filled(rect, Rounding::same(8.0), Color32::BLACK);
+                    // Backoff presentation (v1.2.2): a clickable
+                    // Retry (force-restart the pump now) instead of
+                    // a bare "retrying" label, plus — after repeated
+                    // failures — the mapped ffmpeg reason in small
+                    // text, so the failure is diagnosable.
+                    let backoff = pump_state == Some(PumpState::Backoff) && !paused;
+                    let show_reason = backoff && pump_streak >= 2 && pump_err.is_some();
+                    let mut retry_clicked = false;
                     if let Some(tid) = pump_tex {
                         painter.image(
                             tid,
@@ -5434,24 +5955,63 @@ impl App {
                             egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                             Color32::WHITE,
                         );
-                        if pump_state == Some(PumpState::Backoff) && !paused {
-                            // Frozen last frame + a quiet retry note.
+                        if backoff {
+                            // Frozen last frame + Retry, bottom-left.
+                            if show_reason {
+                                painter.text(
+                                    pos2(rect.left() + 8.0, rect.bottom() - 40.0),
+                                    Align2::LEFT_CENTER,
+                                    pump_err.clone().unwrap_or_default(),
+                                    FontId::proportional(11.0),
+                                    Color32::from_white_alpha(200),
+                                );
+                            }
+                            let btn = egui::Rect::from_min_size(
+                                pos2(rect.left() + 8.0, rect.bottom() - 32.0),
+                                vec2(96.0, 24.0),
+                            );
+                            if ui
+                                .put(btn, Button::new("↻ Retry now").small())
+                                .on_hover_text("Restart the feed now")
+                                .clicked()
+                            {
+                                retry_clicked = true;
+                            }
+                        } else if in_player && pump_state.is_none() {
                             painter.text(
                                 pos2(rect.left() + 8.0, rect.bottom() - 10.0),
                                 Align2::LEFT_CENTER,
-                                "Feed unavailable — retrying",
+                                "In the big player — tile paused",
                                 FontId::proportional(11.5),
                                 Color32::WHITE,
+                            );
+                        }
+                    } else if backoff {
+                        let btn = egui::Rect::from_center_size(
+                            rect.center() + vec2(0.0, -8.0),
+                            vec2(196.0, 30.0),
+                        );
+                        if ui
+                            .put(btn, Button::new("Feed unavailable — ↻ Retry"))
+                            .on_hover_text("Restart the feed now")
+                            .clicked()
+                        {
+                            retry_clicked = true;
+                        }
+                        if show_reason {
+                            painter.text(
+                                rect.center() + vec2(0.0, 16.0),
+                                Align2::CENTER_CENTER,
+                                pump_err.clone().unwrap_or_default(),
+                                FontId::proportional(11.5),
+                                pal.dim,
                             );
                         }
                     } else {
                         let msg = if paused {
                             "Preview paused"
                         } else {
-                            match pump_state {
-                                Some(PumpState::Backoff) => "Feed unavailable — retrying",
-                                _ => "Connecting…",
-                            }
+                            "Connecting…"
                         };
                         painter.text(
                             rect.center(),
@@ -5460,6 +6020,9 @@ impl App {
                             FontId::proportional(13.0),
                             pal.dim,
                         );
+                    }
+                    if retry_clicked {
+                        self.kick_pump(id);
                     }
                     if pump_state == Some(PumpState::Live) && !paused {
                         // LIVE badge: red dot + label, top-left.
@@ -5474,6 +6037,9 @@ impl App {
                         );
                     }
                     if resp.clicked() {
+                        // Clicking the tile is a backoff reset
+                        // trigger too (v1.2.2).
+                        self.kick_pump(id);
                         self.player_for = Some(id.to_string());
                     }
                     resp.on_hover_text("Open the big player");
@@ -5522,7 +6088,7 @@ impl App {
                                 );
                             });
                     }
-                    let name_w = (ui.available_width() - 60.0 - 8.0).max(40.0);
+                    let name_w = header_name_budget(ui.available_width(), TRAILING_DEDUCT_CAMERA);
                     ui.allocate_ui_with_layout(
                         vec2(name_w, icon_size),
                         Layout::top_down(Align::Min),
@@ -6253,13 +6819,19 @@ impl App {
         let cam = self.cfg.cameras[ci].clone();
         let pal = self.pal();
         let accent = self.accent();
-        let (pump_state, pump_tex) = match self.pumps.get("player") {
-            Some(p) => (Some(p.state), p.texture.as_ref().map(|t| t.id())),
-            None => (None, None),
+        let (pump_state, pump_tex, pump_streak, pump_err) = match self.pumps.get("player") {
+            Some(p) => (
+                Some(p.state),
+                p.texture.as_ref().map(|t| t.id()),
+                p.streak,
+                p.last_error.clone(),
+            ),
+            None => (None, None, 0, None),
         };
         let mut close = false;
         let mut open_ext = false;
         let mut copy_url = false;
+        let mut retry = false;
         let mut set_tpl: Option<String> = None;
         egui::Window::new(format!("▶ {}", cam.name))
             .collapsible(false)
@@ -6286,6 +6858,17 @@ impl App {
                             FontId::proportional(14.0),
                             Color32::WHITE,
                         );
+                        if pump_streak >= 2 {
+                            if let Some(err) = &pump_err {
+                                painter.text(
+                                    rect.center() + vec2(0.0, 22.0),
+                                    Align2::CENTER_CENTER,
+                                    err.clone(),
+                                    FontId::proportional(12.0),
+                                    Color32::from_white_alpha(200),
+                                );
+                            }
+                        }
                     }
                 } else {
                     painter.text(
@@ -6298,6 +6881,17 @@ impl App {
                         FontId::proportional(14.0),
                         pal.dim,
                     );
+                    if pump_state == Some(PumpState::Backoff) && pump_streak >= 2 {
+                        if let Some(err) = &pump_err {
+                            painter.text(
+                                rect.center() + vec2(0.0, 22.0),
+                                Align2::CENTER_CENTER,
+                                err.clone(),
+                                FontId::proportional(12.0),
+                                pal.dim,
+                            );
+                        }
+                    }
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -6307,6 +6901,14 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.add(Button::new("Close")).clicked() {
                             close = true;
+                        }
+                        if pump_state == Some(PumpState::Backoff)
+                            && ui
+                                .add(Button::new("↻ Retry"))
+                                .on_hover_text("Restart the feed now")
+                                .clicked()
+                        {
+                            retry = true;
                         }
                         if ui.add(Button::new("Copy URL")).clicked() {
                             copy_url = true;
@@ -6351,6 +6953,9 @@ impl App {
                 self.cfg.cameras[ci2].template = tpl;
                 self.save();
             }
+        }
+        if retry {
+            self.kick_pump("player");
         }
         if copy_url {
             ctx.copy_text(build_rtsp_url(&cam));
@@ -6482,6 +7087,13 @@ impl App {
                     match self.camera_index(eid) {
                         Some(ci) => {
                             self.cfg.cameras[ci] = cam;
+                            // Any edit save invalidates the pump
+                            // (v1.2.2): bump the camera's generation
+                            // so sync_pumps restarts it immediately
+                            // with the backoff reset — even if the
+                            // stream URL happens to be unchanged.
+                            *self.cam_gen.entry(eid.clone()).or_insert(0) += 1;
+                            self.kick_pump(eid);
                         }
                         None => {
                             // The camera being edited is gone —
@@ -6717,6 +7329,15 @@ impl Drop for App {
 }
 
 fn main() -> eframe::Result<()> {
+    // Single instance (v1.2.2, Windows): when another copy is
+    // already running — typically hidden in the tray — signal it to
+    // show its window and exit immediately, before creating a
+    // window, a tray icon or any camera pump.
+    #[cfg(target_os = "windows")]
+    let _instance_guard = match acquire_single_instance() {
+        (InstanceRole::Secondary, _) => return Ok(()),
+        (InstanceRole::Primary, guard) => guard,
+    };
     // Launch flags (v1.2.1): the autostart Run command carries
     // --minimized / --maximized per the Settings launch mode, and
     // the same flags work for manual (shortcut) launches.
@@ -6896,7 +7517,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.2.1");
+        assert_eq!(APP_VERSION, "1.2.2");
     }
 
     #[test]
@@ -7016,10 +7637,11 @@ mod tests {
 
     #[test]
     fn pump_state_machine() {
+        // v1.2.2 schedule: 2 s, 4 s, then an 8 s cap.
         assert_eq!(pump_backoff(0), Duration::from_secs(2));
-        assert_eq!(pump_backoff(1), Duration::from_secs(5));
-        assert_eq!(pump_backoff(2), Duration::from_secs(15));
-        assert_eq!(pump_backoff(9), Duration::from_secs(15));
+        assert_eq!(pump_backoff(1), Duration::from_secs(4));
+        assert_eq!(pump_backoff(2), Duration::from_secs(8));
+        assert_eq!(pump_backoff(9), Duration::from_secs(8));
 
         let (_tx, rx) = channel::<FrameMsg>();
         let mut p = Pump {
@@ -7033,27 +7655,217 @@ mod tests {
             texture: None,
             streak: 0,
             retry_at: None,
+            last_error: None,
         };
         // Connecting --frame--> Live, streak reset.
         p.note_frame();
         assert_eq!(p.state, PumpState::Live);
-        // Live --ended--> Backoff at +2 s, streak 1.
-        p.note_ended();
+        // Live --ended--> Backoff at +2 s, streak 1, reason kept.
+        p.note_ended(Some("Connection refused".to_string()));
         assert_eq!(p.state, PumpState::Backoff);
         assert_eq!(p.streak, 1);
+        assert_eq!(p.last_error.as_deref(), Some("Connection refused"));
         let first_retry = p.retry_at.unwrap();
         assert!(first_retry > Instant::now());
         assert!(first_retry <= Instant::now() + Duration::from_secs(2));
         // A second Ended while backing off changes nothing (no
         // duplicate restarts, no streak runaway).
-        p.note_ended();
+        p.note_ended(Some("Connection refused".to_string()));
         assert_eq!(p.streak, 1);
         assert_eq!(p.retry_at.unwrap(), first_retry);
-        // Backoff --frame--> Live again, streak cleared.
+        // Backoff --frame--> Live again, streak + reason cleared.
         p.note_frame();
         assert_eq!(p.state, PumpState::Live);
         assert_eq!(p.streak, 0);
         assert!(p.retry_at.is_none());
+        assert!(p.last_error.is_none());
+    }
+
+    // ---------------- v1.2.2: failure reasons + pump decisions ----------------
+
+    #[test]
+    fn ffmpeg_failure_reason_mapping() {
+        assert_eq!(
+            ffmpeg_failure_reason("[tcp @ 0x1] Connection refused").as_deref(),
+            Some("Connection refused")
+        );
+        assert_eq!(
+            ffmpeg_failure_reason("Server returned 401 Unauthorized (authorization failed)").as_deref(),
+            Some("401 Unauthorized")
+        );
+        assert_eq!(
+            ffmpeg_failure_reason("Operation timed out").as_deref(),
+            Some("Connection timed out")
+        );
+        assert_eq!(
+            ffmpeg_failure_reason("Failed to resolve hostname cam.local").as_deref(),
+            Some("Host not found")
+        );
+        assert_eq!(
+            ffmpeg_failure_reason("Server returned 404 Not Found").as_deref(),
+            Some("Stream path not found (404)")
+        );
+        assert_eq!(ffmpeg_failure_reason(""), None);
+        assert_eq!(ffmpeg_failure_reason("some unrelated ffmpeg noise"), None);
+    }
+
+    #[test]
+    fn pump_action_decisions() {
+        use PumpState::{Backoff, Connecting, Live};
+        // Missing pump → fresh start.
+        assert_eq!(pump_action(None, true, false, false), PumpAction::StartFresh);
+        // Source changed (edit gen / URL / size) → immediate fresh
+        // restart regardless of state or backoff.
+        assert_eq!(pump_action(Some(Live), false, false, false), PumpAction::StartFresh);
+        assert_eq!(pump_action(Some(Backoff), false, false, false), PumpAction::StartFresh);
+        // Forced (Retry / Watch / focus / player success) → fresh
+        // restart out of Backoff, streak reset.
+        assert_eq!(pump_action(Some(Backoff), true, true, false), PumpAction::StartFresh);
+        // Lapsed backoff → scheduled retry (keeps the streak).
+        assert_eq!(pump_action(Some(Backoff), true, false, true), PumpAction::RetryDue);
+        // Backoff not yet due, not forced → wait.
+        assert_eq!(pump_action(Some(Backoff), true, false, false), PumpAction::Keep);
+        // Live / Connecting with matching source → untouched.
+        assert_eq!(pump_action(Some(Live), true, false, false), PumpAction::Keep);
+        assert_eq!(pump_action(Some(Connecting), true, true, false), PumpAction::Keep);
+    }
+
+    #[test]
+    fn tile_pump_wanted_rules() {
+        assert!(tile_pump_wanted(true, false, false, false));
+        assert!(!tile_pump_wanted(false, false, false, false), "previews off");
+        assert!(!tile_pump_wanted(true, true, false, false), "hidden");
+        assert!(!tile_pump_wanted(true, false, true, false), "user-paused");
+        assert!(
+            !tile_pump_wanted(true, false, false, true),
+            "the big player holds this camera's session — tile stands down"
+        );
+    }
+
+    #[test]
+    fn backoff_wake_delay_clamps() {
+        let now = Instant::now();
+        assert_eq!(backoff_wake_delay(None, now), Duration::from_millis(500));
+        // Due in 300 ms → wake in 300 ms.
+        assert_eq!(
+            backoff_wake_delay(Some(now + Duration::from_millis(300)), now),
+            Duration::from_millis(300)
+        );
+        // Long delay → capped at 1 s (recomputed each frame anyway).
+        assert_eq!(
+            backoff_wake_delay(Some(now + Duration::from_secs(30)), now),
+            Duration::from_secs(1)
+        );
+        // Already overdue → the 50 ms floor, not zero.
+        assert_eq!(
+            backoff_wake_delay(Some(now), now),
+            Duration::from_millis(50)
+        );
+    }
+
+    // ---------------- v1.2.2: degenerate merges + sticky capabilities ----------------
+
+    fn raw_dev(id: &str, data: Value) -> Value {
+        json!({ "id": id, "name": id, "dev_type": "light", "data": data })
+    }
+
+    #[test]
+    fn merge_keeps_last_known_through_thin_payloads() {
+        let previous = vec![raw_dev(
+            "b1",
+            json!({ "state": true, "brightness": 640, "color_temp": 12000, "color_mode": "colour", "hue": 200, "saturation": 0.5 }),
+        )];
+        // A thin payload: brightness omitted, colour temp reported
+        // as the 0 placeholder, colour mode null.
+        let fresh = vec![raw_dev(
+            "b1",
+            json!({ "state": false, "color_temp": 0, "color_mode": null }),
+        )];
+        let merged = merge_device_data(fresh, &previous);
+        let d = parse_device(&merged[0]);
+        assert!(d.has_brightness && d.has_temp && d.has_color, "capabilities survive");
+        assert_eq!(d.brightness_pct, Some(64), "last-known brightness kept");
+        assert_eq!(
+            d.temp_slider,
+            Some(temp_reported_to_slider(12000.0)),
+            "last-known temp kept — no 2700K snap"
+        );
+        assert_eq!(d.color_mode.as_deref(), Some("colour"));
+        assert!(!d.state, "fresh state still wins (state is always a real reading)");
+    }
+
+    #[test]
+    fn merge_fresh_real_values_win() {
+        let previous = vec![raw_dev(
+            "b1",
+            json!({ "state": true, "brightness": 640, "color_temp": 12000 }),
+        )];
+        let fresh = vec![raw_dev(
+            "b1",
+            json!({ "state": true, "brightness": 300, "color_temp": 5000 }),
+        )];
+        let merged = merge_device_data(fresh, &previous);
+        let d = parse_device(&merged[0]);
+        assert_eq!(d.brightness_pct, Some(30));
+        assert_eq!(d.temp_slider, Some(temp_reported_to_slider(5000.0)));
+    }
+
+    #[test]
+    fn parse_stub_payload_yields_no_values_but_keeps_capability() {
+        // No previous to merge against: the stub's keys are present
+        // (so capability stands) but its placeholder values parse
+        // as "no reading" — no 2700K slider, no 0% slider.
+        let d = parse_device(&raw_dev(
+            "b1",
+            json!({ "state": true, "brightness": null, "color_temp": 0 }),
+        ));
+        assert!(d.has_brightness && d.has_temp);
+        assert_eq!(d.brightness_pct, None);
+        assert_eq!(d.temp_slider, None);
+    }
+
+    #[test]
+    fn fresh_value_counts_rules() {
+        assert!(!fresh_value_counts("brightness", &Value::Null));
+        assert!(!fresh_value_counts("brightness", &json!(0)));
+        assert!(fresh_value_counts("brightness", &json!(250)));
+        assert!(!fresh_value_counts("color_temp", &json!(0)));
+        assert!(fresh_value_counts("color_temp", &json!(9000)));
+        assert!(fresh_value_counts("state", &json!(false)), "false is a real reading");
+        assert!(!fresh_value_counts("color_mode", &Value::Null));
+        assert!(fresh_value_counts("color_mode", &json!("colour")));
+    }
+
+    // ---------------- v1.2.2: header name budget + single instance ----------------
+
+    #[test]
+    fn header_name_budget_stretch_and_floor() {
+        // The stretch of a wider cell passes through 1:1: a 350px
+        // cell vs the 238px token width, same reserves, must give
+        // exactly the stretch amount more budget.
+        // (avail-after-icon: 350 cell → 268; 238 cell → 156.)
+        let wide = header_name_budget(268.0, TRAILING_DEDUCT_DEVICE);
+        let token = header_name_budget(156.0, TRAILING_DEDUCT_DEVICE);
+        assert_eq!(wide - token, 112.0);
+        assert_eq!(wide, 164.0, "a 350px cell fits full device names");
+        // Scenes pay only for the lone hide button.
+        assert_eq!(
+            header_name_budget(268.0, TRAILING_DEDUCT_SCENE),
+            244.0
+        );
+        // Cameras: pin + hide only.
+        assert_eq!(
+            header_name_budget(268.0, TRAILING_DEDUCT_CAMERA),
+            220.0
+        );
+        // The 40px floor still guards absurdly narrow cells.
+        assert_eq!(header_name_budget(50.0, TRAILING_DEDUCT_DEVICE), 40.0);
+    }
+
+    #[test]
+    fn instance_role_from_mutex_result() {
+        assert_eq!(instance_role(true), InstanceRole::Secondary);
+        assert_eq!(instance_role(false), InstanceRole::Primary);
     }
 
     #[test]
