@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.2.2">
+<meta name="version" content="1.2.3">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -171,14 +171,20 @@
   .card.offline{opacity:.55}
   .card.dragging{opacity:.4; outline:2px dashed var(--accent)}
   .card.drop-target{outline:2px solid var(--accent)}
-  .card-top{display:flex; align-items:flex-start; gap:11px}
+  .card-top{display:flex; align-items:flex-start; gap:11px; flex-wrap:wrap}
+  /* Two-row card header (v1.2.3, mirrors the Windows app): the
+     pin + switch live in .head-controls; when a card is too
+     narrow for icon + a readable name + controls on one line,
+     the controls wrap as one right-aligned group UNDER the
+     name instead of squeezing the name into an ellipsis. */
+  .head-controls{display:flex; align-items:flex-start; gap:2px; margin-left:auto}
   .dev-icon{
     width:42px; height:42px; flex:0 0 42px; border-radius:13px; display:flex; align-items:center; justify-content:center;
     font-size:21px; background:var(--track);
   }
   .card.on .dev-icon{background:var(--accent-soft)}
   body[data-density="compact"] .dev-icon{width:36px;height:36px;flex-basis:36px;font-size:18px;border-radius:11px}
-  .dev-meta{flex:1; min-width:0}
+  .dev-meta{flex:1 1 96px; min-width:96px}
   .dev-name{font-weight:700; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .dev-status{font-size:12.5px; color:var(--text-dim); margin-top:2px}
   .dev-status .dot{display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--text-dim); margin-right:5px; vertical-align:1px}
@@ -465,7 +471,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.2.2</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.2.3</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -913,7 +919,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.2.2";
+var APP_VERSION = "1.2.3";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -2101,24 +2107,24 @@ function renderCard(d, sec) {
   top.appendChild(meta);
 
   if (!d.isScene) {
+    // Pin + switch travel as ONE .head-controls group so the
+    // header can wrap them under the name on narrow cards
+    // instead of truncating it (v1.2.3, mirrors Windows).
+    var headCtl = el("div", "head-controls");
     var isPinned = S.layout.pins.indexOf(d.id) >= 0;
     var pinBtn = el("button", "pin-btn" + (isPinned ? " pinned" : ""), "📌");
     pinBtn.title = isPinned ? "Unpin (remove shortcut from the top)" : "Pin a shortcut to the top";
     pinBtn.setAttribute("aria-label", pinBtn.title);
     pinBtn.addEventListener("click", function () { togglePin(d.id); });
-    top.appendChild(pinBtn);
-  }
-
-  if (d.isScene) {
-    /* scene: no toggle in top row */
-  } else {
+    headCtl.appendChild(pinBtn);
     var sw = el("button", "switch");
     sw.setAttribute("role", "switch");
     sw.setAttribute("aria-checked", d.state && d.online ? "true" : "false");
     sw.setAttribute("aria-label", "Toggle " + displayName(d));
     if (!d.online) sw.disabled = true;
     sw.addEventListener("click", function () { doToggle(d); });
-    top.appendChild(sw);
+    headCtl.appendChild(sw);
+    top.appendChild(headCtl);
   }
   card.appendChild(top);
 
@@ -2265,12 +2271,14 @@ function fillCameraCard(card, d, sec) {
   st.appendChild(document.createTextNode(statusText(d)));
   meta.appendChild(st);
   top.appendChild(meta);
+  var headCtl = el("div", "head-controls");
   var isPinned = S.layout.pins.indexOf(d.id) >= 0;
   var pinBtn = el("button", "pin-btn" + (isPinned ? " pinned" : ""), "📌");
   pinBtn.title = isPinned ? "Unpin (remove shortcut from the top)" : "Pin a shortcut to the top";
   pinBtn.setAttribute("aria-label", pinBtn.title);
   pinBtn.addEventListener("click", function () { togglePin(d.id); });
-  top.appendChild(pinBtn);
+  headCtl.appendChild(pinBtn);
+  top.appendChild(headCtl);
   card.appendChild(top);
 
   if (cam.template !== "custom") {
