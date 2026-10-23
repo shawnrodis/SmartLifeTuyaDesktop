@@ -88,6 +88,21 @@ instructions below.)
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.2.4
+
+- **Fixed: "Minimized (to tray)" launches opening as a normal
+  window (Windows app).** The saved Launch-as mode is now
+  honoured by *every* launch, not only ones that arrive through
+  the Windows-startup entry with its command-line flag: a launch
+  carrying `--minimized`/`--maximized` still wins for that launch,
+  but an ordinary launch (Start Menu, shortcut — including
+  Windows' automatic relaunch of running apps at sign-in, which
+  passes no flag at all) now falls back to the saved mode. And
+  while a minimized launch hasn't been explicitly shown from the
+  tray, the app re-asserts its hidden state every frame, so it
+  can neither flash on screen nor stick open. Regression-tested
+  for the arg-less launch case.
+
 ## What's new in 1.2.3
 
 - **Fixed: the Lighting header's controls tangling (Windows app).**

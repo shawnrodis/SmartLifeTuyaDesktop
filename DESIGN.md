@@ -262,6 +262,19 @@ column max width: 760px.
   the window; the right-click menu offers Open and Quit (Quit stops
   the pumps, saves and truly exits, as does the updater's installer
   hand-off). Logging out does not quit the app.
+  **Effective launch mode (v1.2.4):** the launch presentation is
+  resolved by `resolve_launch_mode` — an explicit argv flag wins
+  for that launch; with no flag, the SAVED "Launch as" mode
+  applies to every launch. (v1.2.1–v1.2.3 consulted only argv, so
+  launches with no Run-entry command line — a Start Menu click,
+  or Windows' "restartable apps" sign-in relaunch, which uses the
+  bare exe path — opened as a normal window even with "Minimized
+  (to tray)" saved.) main() resolves the mode through the same
+  registry reconcile App::new runs, so the initial viewport and
+  `window_hidden` agree; and while a Minimized launch has not yet
+  been shown by a real Show action, every frame re-asserts
+  `Visible(false)` (the launch hold, `enforce_launch_hold`) so
+  the window can neither flash nor stick open.
 - **Single instance & tray event pumping (v1.2.2) — Windows.** The
   app is single-instance: the first process holds the named mutex
   `SmartLifeTuyaDesktop.SingleInstance` for its lifetime. A later
