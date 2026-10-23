@@ -21,10 +21,12 @@ customisable interface they always deserved.
 
 ## Download (Windows)
 
-Grab `SmartLifeTuyaDesktop-Setup-v1.1.0.exe` from
+Grab `SmartLifeTuyaDesktop-Setup-v1.2.0.exe` from
 [Releases](https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases) and
 run it — per-user install to `%LOCALAPPDATA%\SmartLifeTuyaDesktop`, with
 Start Menu shortcuts and an uninstaller. No administrator rights required.
+The installer is larger than it used to be (~100 MB) because it bundles
+ffmpeg for live camera video — see [Camera video](#camera-video) below.
 The web edition is the `SmartLife_Tuya_Desktop.html` asset on the same
 release. Both editions share one version number and check for updates
 themselves (Settings → App updates). (Building from source is optional;
@@ -50,10 +52,14 @@ instructions below.)
 - **Group controls** — the Lighting header (and any group containing a
   light) gets a master switch, average brightness / colour-temperature
   sliders and colour swatches that broadcast to every member.
-- **RTSP cameras** — add Tapo (or any RTSP) cameras in Edit mode; cards
-  sit alongside devices with pinning, grouping and ordering. Watch hands
-  the stream to VLC, or plays in-app via an optional go2rtc / MediaMTX
-  gateway (Settings → Stream gateway & cameras).
+- **RTSP cameras with live in-tile video** — add Tapo (or any RTSP)
+  cameras in Edit mode; cards sit alongside devices with pinning,
+  grouping and ordering, and the picture plays right inside the tile.
+  ▶ Watch opens a big player. See [Camera video](#camera-video).
+- **No rate-limit nagging** — when Tuya rate-limits, the apps never show
+  a warning: they quietly keep the last known states, retry commands a
+  moment later, and stretch the refresh interval until things settle.
+  Genuine errors (a device that's actually offline) are still reported.
 - **Pinned shortcuts** — pin any device with 📌 and a full working copy
   appears in the Pinned section at the top; the device also stays in its
   group below. Scenes always get their own Scenes section.
@@ -68,6 +74,33 @@ instructions below.)
   over HTTPS. "Keep me logged in" stores them only on your device
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
+
+## Camera video
+
+Camera tiles play **live video in place** — no external player needed:
+
+- **Windows app:** a bundled copy of **FFmpeg** decodes each camera's
+  RTSP stream. Tiles use the low-bandwidth stream (Tapo Stream 2) at a
+  small size; clicking a tile (or ▶ Watch) opens the big in-app player
+  at the quality picked on the card, with a quality switch. If a feed
+  drops, the tile quietly retries on its own. The app looks for ffmpeg
+  beside its own exe first (that's where the installer puts it), then
+  at the optional path in Settings → Stream gateway & cameras, then on
+  `PATH`; if none is found, previews turn off and Watch falls back to
+  an external player (VLC by default) or a configured stream gateway.
+- **Web edition:** browsers can't decode RTSP, so when a stream gateway
+  (go2rtc / MediaMTX) is configured in Settings, tiles embed the
+  gateway's feed (go2rtc MJPEG / MediaMTX HLS) and Watch plays in-page;
+  without a gateway, Watch hands the stream to a player app as before.
+
+**FFmpeg attribution.** The Windows installer bundles `ffmpeg.exe`
+from the [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) **FFmpeg
+7.1.1 essentials** static build
+([source](https://github.com/GyanD/codexffmpeg/releases/tag/7.1.1)).
+FFmpeg is licensed under the **GNU GPL v3** — its full license text
+ships in the install folder (`licenses\FFmpeg-LICENSE.txt`, and in
+this repo under `licenses/`) — which is compatible with this project's
+own GPL-3.0. Bundling it is why the installer is ~100 MB.
 
 ## Which region / platform?
 
@@ -119,7 +152,10 @@ SmartLifeTuyaDesktop/
 │   ├── SmartLifeTuyaDesktop.ico      # exe icon
 │   ├── SmartLifeTuyaDesktop.manifest # asInvoker manifest
 │   ├── icon.png                      # runtime / README icon
+│   ├── ffmpeg.exe                    # bundled FFmpeg 7.1.1 (GPL v3) for live camera video
 │   └── fonts/                        # embedded glyph fallbacks (egui)
+├── licenses/
+│   └── FFmpeg-LICENSE.txt            # FFmpeg's GPL v3 license text
 ├── web/
 │   └── SmartLife_Tuya_Desktop.html   # the web edition (single file)
 ├── installer/

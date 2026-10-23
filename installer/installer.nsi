@@ -4,7 +4,7 @@
 ; Add/Remove Programs entry.
 
 !define APP_NAME "SmartLife & Tuya Desktop"
-!define APP_VERSION "1.1.0"
+!define APP_VERSION "1.2.0"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/SmartLifeTuyaDesktop"
 
@@ -33,6 +33,14 @@ Section "SmartLife & Tuya Desktop" SecApp
   SectionIn RO  ; required — cannot be unchecked
   SetOutPath "$INSTDIR"
   File "SmartLifeTuyaDesktop.exe"
+  ; Bundled FFmpeg 7.1.1 (gyan.dev essentials build, GPL v3 — see the
+  ; licenses folder): installed NEXT TO the app exe, which is where
+  ; the app looks for it first, so live camera previews just work.
+  File "..\assets\ffmpeg.exe"
+  SetOutPath "$INSTDIR\licenses"
+  File "..\licenses\FFmpeg-LICENSE.txt"
+  File "..\LICENSE"
+  SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   ; Add/Remove Programs entry (per-user).
@@ -42,7 +50,7 @@ Section "SmartLife & Tuya Desktop" SecApp
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "URLInfoAbout" "${APP_URL}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "DisplayIcon" "$INSTDIR\SmartLifeTuyaDesktop.exe"
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "EstimatedSize" 16838
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "EstimatedSize" 104650
 
   ; Start Menu shortcuts (per-user).
   CreateDirectory "$SMPROGRAMS\SmartLife & Tuya Desktop"
@@ -61,6 +69,10 @@ SectionEnd
 
 Section "Uninstall"
   Delete "$INSTDIR\SmartLifeTuyaDesktop.exe"
+  Delete "$INSTDIR\ffmpeg.exe"
+  Delete "$INSTDIR\licenses\FFmpeg-LICENSE.txt"
+  Delete "$INSTDIR\licenses\LICENSE"
+  RMDir "$INSTDIR\licenses"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
 

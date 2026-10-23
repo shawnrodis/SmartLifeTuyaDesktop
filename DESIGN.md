@@ -46,6 +46,7 @@ accent colour. Accent-soft (edit bar, icon box when on) is the accent at
 | Content max width | 1240px, 18px page padding |
 | Grid | `minmax(238px, 1fr)`, gap 14px (compact: 198px / 10px) |
 | Device icon box | 42×42px, radius 13px (compact 36×36, radius 11) |
+| Camera tile video | 16:9 of the card's inner width, black background, small radius; red-dot "LIVE" badge top-left; replaces the icon header when shown |
 | Toggle switch | 48×27px, knob 21px, inset 3px |
 | Slider | 22px tall hit area, 6px track (rounded 3px), accent fill, 18px white thumb |
 | Swatches | 26px circles |
@@ -110,6 +111,32 @@ column max width: 760px.
   in one toast ("…: 4 of 5 updated — X didn't respond") and a refresh
   reconciles. Pinned, Ungrouped, Cameras and Scenes get no group
   controls.
+- **Camera video (v1.2.0) — a stated platform difference.** Both
+  editions show live video inside camera tiles (16:9 area replacing
+  the icon header; name/host/quality row and Watch/Copy stay below),
+  with a "Live camera previews" Settings toggle (default on). The
+  mechanism differs by platform, honestly: the **Windows** edition
+  decodes RTSP natively — a bundled ffmpeg (installed beside the app
+  exe; Settings can point at another) pumps raw frames to the tile
+  (Stream 2/SD on Tapo templates) and to a big in-app player window
+  (the card's selected quality; quality switch, external-player
+  hand-off, Close). The **web** edition cannot decode RTSP, so its
+  tiles embed the configured stream gateway's feed instead (go2rtc
+  MJPEG `<img>`, MediaMTX HLS `<video>`); without a gateway its tiles
+  keep the plain header and Watch hands off as before. Windows Watch
+  routing: gateway configured → gateway page in the browser; else the
+  in-app player; else (no ffmpeg found) the external player.
+- **Rate limiting (v1.2.0).** Rate-limit responses
+  (`FrequentlyInvoke`) are NEVER shown to the user — no toast, banner
+  or status line, in either edition. Discovery falls back to the
+  cached devices silently and backs off internally (the effective
+  refresh interval stretches ×2/×4/×8 with consecutive hits, 60s–5min,
+  resetting on success; autorefresh skips cycles while backed off).
+  Control commands retry silently ~1s later (up to 2 extra attempts)
+  before counting as failures at all — group broadcasts rely on that
+  retry for extra spacing, and their summary toast names only genuine
+  failures. Genuine errors (offline, rejected) are still reported
+  exactly as before.
 - A pinned device shows as a full working card in Pinned **and** stays in
   its normal section. Scenes can't be pinned or grouped; they always live
   in Scenes.
