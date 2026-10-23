@@ -999,6 +999,25 @@ fn launch_mode_from_command(cmd: &str) -> LaunchMode {
     }
 }
 
+/// The EFFECTIVE launch mode for this process (v1.2.4). An
+/// explicit command-line flag wins — it describes THIS launch.
+/// Otherwise the saved Settings launch mode applies to EVERY
+/// launch: before v1.2.4 only the argv flag was consulted, so any
+/// launch that didn't come through the registry Run entry — a
+/// Start Menu / shortcut / installer-finish launch, or Windows'
+/// "restartable apps" sign-in relaunch (bare exe path, no Run
+/// command line at all) — opened as a normal visible window
+/// whatever Settings said. `argv` is Normal both for "no flag"
+/// and an explicit plain launch, which is exactly when the saved
+/// preference should decide.
+fn resolve_launch_mode(argv: LaunchMode, prefs: LaunchMode) -> LaunchMode {
+    if argv != LaunchMode::Normal {
+        argv
+    } else {
+        prefs
+    }
+}
+
 /// The value stored in the Run key: the exe path in quotes (install
 /// paths contain spaces), plus the launch-mode flag if any.
 fn autostart_command(exe: &Path, mode: LaunchMode) -> String {
@@ -3354,6 +3373,16 @@ struct App {
     window_hidden: bool,
     quitting: bool,
     arg_launch_mode: LaunchMode,
+    /// The EFFECTIVE launch mode (v1.2.4): argv flag if present,
+    /// else the saved Settings launch mode. Drives the initial
+    /// hidden state and the launch hold below.
+    launch_mode: LaunchMode,
+    /// Launch hold (v1.2.4): while true, every frame re-asserts
+    /// the window invisible. Set when the effective launch mode
+    /// is Minimized; cleared only by a real Show action
+    /// (show_from_tray), so an arg-less autostart/restartable-app
+    /// relaunch can neither flash nor stick open.
+    launch_hidden_pending: bool,
     // rate-limit backoff (v1.2.0): while set, autorefresh skips
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
@@ -3536,6 +3565,8 @@ impl App {
             window_hidden: false,
             quitting: false,
             arg_launch_mode: LaunchMode::Normal,
+            launch_mode: LaunchMode::Normal,
+            launch_hidden_pending: false,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -3569,7 +3600,19 @@ impl App {
         app.arg_launch_mode =
             launch_mode_from_args(&std::env::args().collect::<Vec<String>>());
         reconcile_autostart(&mut app.cfg);
-        app.window_hidden = app.arg_launch_mode == LaunchMode::Minimized;
+        // Effective launch mode (v1.2.4): the argv flag if one was
+        // given, else the saved launch mode — which the reconcile
+        // above just re-derived from the Run entry when one
+        // exists. window_hidden and the launch hold follow the
+        // EFFECTIVE mode, so an arg-less launch (Start menu,
+        // restartable-apps relaunch) with "Minimized (to tray)"
+        // saved starts hidden too.
+        app.launch_mode = resolve_launch_mode(
+            app.arg_launch_mode,
+            LaunchMode::parse(&app.cfg.prefs.launch_mode),
+        );
+        app.window_hidden = app.launch_mode == LaunchMode::Minimized;
+        app.launch_hidden_pending = app.window_hidden;
         if app.window_hidden || app.cfg.prefs.close_to_tray {
             app.ensure_tray();
         }
@@ -4393,7 +4436,23 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.window_hidden = false;
+        // A real Show action: the v1.2.4 launch hold is over.
+        self.launch_hidden_pending = false;
         self.kick_all_backoff();
+    }
+
+    /// Launch hold (v1.2.4): while a Minimized launch hasn't been
+    /// shown by a real Show action yet, re-assert the window
+    /// invisible. main() already starts the viewport invisible,
+    /// but that single builder flag is the ONLY thing that used
+    /// to keep an autostart launch hidden — if the window got
+    /// shown anyway during startup, nothing ever re-hid it. Runs
+    /// AFTER the frame's show drains in handle_window_chrome, so
+    /// a Show landing in the same frame wins.
+    fn enforce_launch_hold(&self, ctx: &egui::Context) {
+        if self.launch_hidden_pending {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
     }
 
     /// Tray actions + window-close behaviour, run every frame
@@ -4428,6 +4487,10 @@ impl App {
                 TrayAction::Quit => self.quit_now(ctx),
             }
         }
+        // Launch hold (v1.2.4): after this frame's Show signals
+        // have had their chance, a still-pending Minimized launch
+        // re-asserts its invisibility.
+        self.enforce_launch_hold(ctx);
         // Focus regained (clicking back into the window) is a
         // backoff reset trigger for camera feeds (v1.2.2).
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
@@ -6996,7 +7059,7 @@ impl App {
                             }
                             ui.add_space(10.0);
                             ui.label(
-                                RichText::new("Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a Windows-app feature; the web edition has no equivalent.")
+                                RichText::new("Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. The “Launch as” choice applies to every launch of the app — autostart, Start Menu, and shortcuts alike — not just the Windows-startup one; a launch that carries its own --minimized or --maximized flag (as the autostart entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a Windows-app feature; the web edition has no equivalent.")
                                     .size(12.5)
                                     .color(pal.dim),
                             );
@@ -7765,10 +7828,24 @@ fn main() -> eframe::Result<()> {
         (InstanceRole::Secondary, _) => return Ok(()),
         (InstanceRole::Primary, guard) => guard,
     };
-    // Launch flags (v1.2.1): the autostart Run command carries
-    // --minimized / --maximized per the Settings launch mode, and
-    // the same flags work for manual (shortcut) launches.
-    let launch = launch_mode_from_args(&std::env::args().collect::<Vec<String>>());
+    // Launch mode (v1.2.1 flags; v1.2.4 resolution): the autostart
+    // Run command carries --minimized / --maximized per the
+    // Settings launch mode, and the same flags work for manual
+    // (shortcut) launches. But an argv flag is only ONE input:
+    // the EFFECTIVE mode falls back to the saved Settings mode
+    // (resolve_launch_mode), so launches with no command line at
+    // all — Windows' restartable-apps relaunch after sign-in, a
+    // Start Menu click — honour "Minimized (to tray)" too. The
+    // saved prefs are read through the same registry reconcile
+    // App::new runs (an existing Run entry re-derives them; the
+    // reconcile is idempotent, App::new's pass becomes a no-op).
+    let argv_mode = launch_mode_from_args(&std::env::args().collect::<Vec<String>>());
+    let mut startup_cfg = load_config();
+    reconcile_autostart(&mut startup_cfg);
+    let launch = resolve_launch_mode(
+        argv_mode,
+        LaunchMode::parse(&startup_cfg.prefs.launch_mode),
+    );
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SmartLife & Tuya Desktop")
         .with_inner_size([1120.0, 780.0])
@@ -8021,7 +8098,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.2.3");
+        assert_eq!(APP_VERSION, "1.2.4");
     }
 
     #[test]
@@ -8710,6 +8787,90 @@ mod tests {
         );
     }
 
+    // ---------------- v1.2.4: effective launch mode ----------------
+
+    #[test]
+    fn launch_mode_resolution() {
+        use LaunchMode::*;
+        // An explicit argv flag wins over any saved mode.
+        assert_eq!(resolve_launch_mode(Minimized, Maximized), Minimized);
+        assert_eq!(resolve_launch_mode(Minimized, Normal), Minimized);
+        assert_eq!(resolve_launch_mode(Maximized, Minimized), Maximized);
+        assert_eq!(resolve_launch_mode(Maximized, Normal), Maximized);
+        // No flag → the saved Settings mode decides (the v1.2.4
+        // fix: previously the saved mode was never consulted, so
+        // arg-less launches always opened Normal).
+        assert_eq!(resolve_launch_mode(Normal, Minimized), Minimized);
+        assert_eq!(resolve_launch_mode(Normal, Maximized), Maximized);
+        assert_eq!(resolve_launch_mode(Normal, Normal), Normal);
+    }
+
+    /// The viewport commands one headless frame of the launch
+    /// hold produces (drives the REAL App::enforce_launch_hold).
+    fn hold_frame_cmds(app: &App, ctx: &egui::Context) -> Vec<egui::ViewportCommand> {
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            app.enforce_launch_hold(ctx)
+        });
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// The reboot/login regression (v1.2.4): Windows relaunches
+    /// the app — via the Run entry or its "restartable apps"
+    /// sign-in feature — possibly with NO command line at all,
+    /// while Settings say "Minimized (to tray)". The launch must
+    /// resolve to Minimized, the window must be commanded
+    /// invisible from the start AND on every early frame, and
+    /// only a real Show action may make it visible.
+    #[test]
+    fn argless_minimized_launch_stays_hidden_until_show() {
+        // Arg-less argv (the restartable-apps case) + saved mode.
+        let argv = launch_mode_from_args(&["app.exe".to_string()]);
+        assert_eq!(argv, LaunchMode::Normal); // no flag arrived
+        let effective = resolve_launch_mode(argv, LaunchMode::parse("minimized"));
+        assert_eq!(effective, LaunchMode::Minimized);
+
+        // App::new's outcome for that resolution: hidden state and
+        // the launch hold both follow the EFFECTIVE mode.
+        let mut app = test_app(vec![]);
+        app.launch_mode = effective;
+        app.window_hidden = app.launch_mode == LaunchMode::Minimized;
+        app.launch_hidden_pending = app.window_hidden;
+        assert!(app.window_hidden);
+        assert!(app.launch_hidden_pending);
+
+        // Early frames: invisibility is re-asserted every frame —
+        // the window is commanded invisible and stays so.
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            assert_eq!(
+                hold_frame_cmds(&app, &ctx),
+                vec![egui::ViewportCommand::Visible(false)]
+            );
+            assert!(app.window_hidden && app.launch_hidden_pending);
+        }
+
+        // A real Show action (tray Open / single-instance summon
+        // both land in show_from_tray): the window is commanded
+        // visible and the hold is released.
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_from_tray(ctx)
+        });
+        let cmds = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default();
+        assert!(cmds.contains(&egui::ViewportCommand::Visible(true)));
+        assert!(!app.window_hidden);
+        assert!(!app.launch_hidden_pending);
+
+        // Later frames assert nothing: visible is left alone.
+        assert!(hold_frame_cmds(&app, &ctx).is_empty());
+    }
+
     #[test]
     fn reg_named_value_parsing() {
         let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    SmartLifeTuyaDesktop    REG_SZ    \"C:\\Users\\Shawn\\app.exe\" --minimized\r\n    OtherApp    REG_SZ    C:\\other.exe\r\n\r\n";
@@ -8831,6 +8992,8 @@ mod tests {
             window_hidden: false,
             quitting: false,
             arg_launch_mode: LaunchMode::Normal,
+            launch_mode: LaunchMode::Normal,
+            launch_hidden_pending: false,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
