@@ -187,6 +187,76 @@ fn default_rtsp_port() -> u16 {
     554
 }
 
+/// Generate a fresh camera record id. Ids used to be a bare
+/// millisecond timestamp (web: Date.now() base36) — two cameras
+/// created in the same millisecond (or a clock tie) then SHARED one
+/// id, and every id-keyed lookup (edit, delete, layout) hit the
+/// first match, making the second camera uneditable and
+/// undeletable. Ids are now nanosecond timestamps plus a process-wide
+/// monotonic counter, and callers still check the result against the
+/// existing cameras before using it.
+fn new_camera_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", nanos, SEQ.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Remove one camera by ITEM id ("cam:{record id}") and scrub its
+/// layout entries (pins, hidden, assign, alias, sizes, section
+/// order). Returns the removed record, or None when the id matched
+/// nothing — callers must not claim a deletion that didn't happen.
+fn remove_camera_record(
+    cameras: &mut Vec<Camera>,
+    layout: &mut LayoutCfg,
+    item_id: &str,
+) -> Option<Camera> {
+    let ci = cameras.iter().position(|c| format!("cam:{}", c.id) == item_id)?;
+    let removed = cameras.remove(ci);
+    layout.pins.retain(|x| x != item_id);
+    layout.hidden.retain(|x| x != item_id);
+    layout.assign.remove(item_id);
+    layout.alias.remove(item_id);
+    layout.cam_sizes.remove(item_id);
+    for list in layout.section_order.values_mut() {
+        list.retain(|x| x != item_id);
+    }
+    layout.section_order.retain(|_, list| !list.is_empty());
+    Some(removed)
+}
+
+/// Repair duplicate / missing camera ids in stored data (v1.2.1
+/// migration). The FIRST camera with a given id keeps it — layout
+/// entries (pins / assign / order / sizes) are keyed by "cam:{id}",
+/// were always attached to that first match, and stay attached.
+/// Later duplicates and id-less records get fresh ids from `gen`
+/// (called until its result is unused). Returns true if anything
+/// changed. `layout` is part of the signature for parity with the
+/// web edition's repair (which documents the same keep-first rule);
+/// entries are deliberately NOT remapped — they were ambiguous.
+fn repair_camera_ids(
+    cameras: &mut Vec<Camera>,
+    _layout: &LayoutCfg,
+    gen: &mut dyn FnMut() -> String,
+) -> bool {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut changed = false;
+    for cam in cameras.iter_mut() {
+        if cam.id.trim().is_empty() || !seen.insert(cam.id.clone()) {
+            let mut fresh = gen();
+            while !seen.insert(fresh.clone()) {
+                fresh = gen();
+            }
+            cam.id = fresh;
+            changed = true;
+        }
+    }
+    changed
+}
+
 const CAMERA_TEMPLATES: [(&str, &str); 3] = [
     ("tapo1", "Tapo Stream 1 — High Quality"),
     ("tapo2", "Tapo Stream 2 — Standard"),
@@ -209,6 +279,17 @@ struct LayoutCfg {
     section_order: HashMap<String, Vec<String>>,
     #[serde(default)]
     collapsed: HashMap<String, bool>,
+    /// User-arranged order of the SECTIONS themselves (v1.2.1), as
+    /// section order_keys: "cameras" | "pinned" | "lighting" |
+    /// "group:{gid}" | "ungrouped" | "scenes". Empty/absent = the
+    /// built-in default order; a section missing from the list slots
+    /// in by that default (see effective_section_seq).
+    #[serde(default)]
+    section_seq: Vec<String>,
+    /// Per-camera card size (v1.2.1), keyed by item id ("cam:{id}"):
+    /// "large" | "wide"; absent = normal (one grid cell).
+    #[serde(default)]
+    cam_sizes: HashMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,10 +317,30 @@ struct Prefs {
     /// then PATH). A full path or a bare program name both work.
     #[serde(default)]
     ffmpeg_path: String,
+    /// Start with Windows (v1.2.1): an entry exists in the per-user
+    /// HKCU Run key. The registry is the source of truth — this is
+    /// reconciled against it at startup (see reconcile_autostart).
+    #[serde(default)]
+    start_with_windows: bool,
+    /// How autostart launches the app: "normal" | "minimized" |
+    /// "maximized" — carried as a flag in the Run command.
+    #[serde(default = "default_launch_mode")]
+    launch_mode: String,
+    /// Keep running in the system tray when the window is closed
+    /// (v1.2.1) instead of quitting.
+    #[serde(default)]
+    close_to_tray: bool,
+    /// The one-time "still running in the tray" balloon has shown.
+    #[serde(default)]
+    tray_notice_shown: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_launch_mode() -> String {
+    "normal".to_string()
 }
 
 fn default_gateway_type() -> String {
@@ -265,6 +366,10 @@ impl Default for Prefs {
             player_cmd: default_player_cmd(),
             previews: true,
             ffmpeg_path: String::new(),
+            start_with_windows: false,
+            launch_mode: default_launch_mode(),
+            close_to_tray: false,
+            tray_notice_shown: false,
         }
     }
 }
@@ -311,7 +416,15 @@ fn config_path() -> PathBuf {
 fn load_config() -> Config {
     let path = config_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(cfg) = serde_json::from_str::<Config>(&text) {
+        if let Ok(mut cfg) = serde_json::from_str::<Config>(&text) {
+            // v1.2.1 migration: cameras stored by older builds can
+            // share one timestamp id, which made every camera after
+            // the first uneditable/undeletable. Repair in place and
+            // persist immediately so the fix sticks.
+            let mut gen = new_camera_id;
+            if repair_camera_ids(&mut cfg.cameras, &cfg.layout, &mut gen) {
+                save_config(&cfg);
+            }
             return cfg;
         }
     }
@@ -609,6 +722,59 @@ fn build_rtsp_url(cam: &Camera) -> String {
     )
 }
 
+/// Per-camera card size (v1.2.1), stored in the layout keyed by
+/// item id: Normal = one grid cell, Large = two columns, Wide = the
+/// full section row. Cameras only — devices and scenes never resize.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CamSize {
+    Normal,
+    Large,
+    Wide,
+}
+
+impl CamSize {
+    fn parse(s: Option<&String>) -> CamSize {
+        match s.map(|v| v.as_str()) {
+            Some("large") => CamSize::Large,
+            Some("wide") => CamSize::Wide,
+            _ => CamSize::Normal,
+        }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            CamSize::Normal => "normal",
+            CamSize::Large => "large",
+            CamSize::Wide => "wide",
+        }
+    }
+    /// Grid columns this size occupies in a `cols`-column grid.
+    fn span(&self, cols: usize) -> usize {
+        let want = match self {
+            CamSize::Normal => 1,
+            CamSize::Large => 2,
+            CamSize::Wide => cols,
+        };
+        want.max(1).min(cols.max(1))
+    }
+}
+
+fn cam_size_of(layout: &LayoutCfg, item_id: &str) -> CamSize {
+    CamSize::parse(layout.cam_sizes.get(item_id))
+}
+
+/// A tile feed spec: (RTSP URL, pump frame width, pump frame
+/// height). Normal and Large tiles decode the cheap Stream 2 on
+/// Tapo templates (the source selection is unchanged by size);
+/// only the pump resolution grows (480×270 → 960×540). A Wide tile
+/// uses the card's own selected quality, like the big player.
+fn tile_feed(cam: &Camera, size: CamSize) -> (String, usize, usize) {
+    match size {
+        CamSize::Normal => (tile_rtsp_url(cam), TILE_W, TILE_H),
+        CamSize::Large => (tile_rtsp_url(cam), PLAYER_W, PLAYER_H),
+        CamSize::Wide => (build_rtsp_url(cam), PLAYER_W, PLAYER_H),
+    }
+}
+
 /// The URL a TILE preview uses (v1.2.0): Stream 2 (SD) whenever a
 /// Tapo template is set — cheap to decode for a small tile — and the
 /// camera's own path otherwise. The big player uses build_rtsp_url
@@ -758,6 +924,392 @@ fn app_paths_lookup(name: &str) -> Option<PathBuf> {
 fn app_paths_lookup(_name: &str) -> Option<PathBuf> {
     None
 }
+
+// ---------------------------------------------------------------------------
+// Startup & system tray (v1.2.1) — WINDOWS EDITION ONLY. Starting
+// with Windows, running minimized to the tray and closing to the
+// tray are system behaviours a web page simply doesn't have; the
+// web edition is unchanged and DESIGN.md documents the difference.
+// ---------------------------------------------------------------------------
+
+/// The per-user autostart (Run) key + this app's value name in it.
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE_NAME: &str = "SmartLifeTuyaDesktop";
+
+/// How the app presents itself at launch. Carried as a flag in the
+/// autostart command ("--minimized" / "--maximized") and honoured
+/// for manual launches (shortcuts) too.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum LaunchMode {
+    Normal,
+    Minimized,
+    Maximized,
+}
+
+impl LaunchMode {
+    fn parse(s: &str) -> LaunchMode {
+        match s {
+            "minimized" => LaunchMode::Minimized,
+            "maximized" => LaunchMode::Maximized,
+            _ => LaunchMode::Normal,
+        }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            LaunchMode::Normal => "normal",
+            LaunchMode::Minimized => "minimized",
+            LaunchMode::Maximized => "maximized",
+        }
+    }
+    fn flag(&self) -> Option<&'static str> {
+        match self {
+            LaunchMode::Normal => None,
+            LaunchMode::Minimized => Some("--minimized"),
+            LaunchMode::Maximized => Some("--maximized"),
+        }
+    }
+}
+
+/// Launch mode requested on the command line. If both flags sneak
+/// in, --minimized wins (the more conservative presentation).
+fn launch_mode_from_args(args: &[String]) -> LaunchMode {
+    if args.iter().any(|a| a == "--minimized") {
+        LaunchMode::Minimized
+    } else if args.iter().any(|a| a == "--maximized") {
+        LaunchMode::Maximized
+    } else {
+        LaunchMode::Normal
+    }
+}
+
+/// Launch mode encoded in a stored autostart command string.
+fn launch_mode_from_command(cmd: &str) -> LaunchMode {
+    if cmd.contains("--minimized") {
+        LaunchMode::Minimized
+    } else if cmd.contains("--maximized") {
+        LaunchMode::Maximized
+    } else {
+        LaunchMode::Normal
+    }
+}
+
+/// The value stored in the Run key: the exe path in quotes (install
+/// paths contain spaces), plus the launch-mode flag if any.
+fn autostart_command(exe: &Path, mode: LaunchMode) -> String {
+    let mut s = format!("\"{}\"", exe.display());
+    if let Some(f) = mode.flag() {
+        s.push(' ');
+        s.push_str(f);
+    }
+    s
+}
+
+/// What the Run key SHOULD hold for these prefs: the command when
+/// "Start with Windows" is ON, or None when OFF — OFF is a
+/// first-class state meaning NO autostart entry exists at all.
+fn desired_autostart(prefs: &Prefs, exe: &Path) -> Option<String> {
+    if prefs.start_with_windows {
+        Some(autostart_command(exe, LaunchMode::parse(&prefs.launch_mode)))
+    } else {
+        None
+    }
+}
+
+/// Parse a NAMED REG_SZ value out of `reg query` output (the App
+/// Paths parser reads the "(Default)" value; the Run key's values
+/// are named, so the name must head the line).
+fn parse_reg_named_value(output: &str, name: &str) -> Option<String> {
+    for line in output.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix(name) {
+            if let Some(pos) = rest.find("REG_SZ") {
+                let val = rest[pos + "REG_SZ".len()..].trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// What a window-close request should do: quit outright, or hide
+/// to the tray (only when close-to-tray is on and the close isn't
+/// the app's own Quit).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CloseAction {
+    Quit,
+    HideToTray,
+}
+
+fn close_action(close_to_tray: bool, quitting: bool) -> CloseAction {
+    if close_to_tray && !quitting {
+        CloseAction::HideToTray
+    } else {
+        CloseAction::Quit
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn reg_command() -> Command {
+    let mut cmd = Command::new("reg");
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
+/// The current Run-key value for this app, if an entry exists.
+#[cfg(target_os = "windows")]
+fn reg_run_value() -> Option<String> {
+    let key = format!("HKCU\\{}", RUN_KEY);
+    let out = reg_command()
+        .args(["query", &key, "/v", RUN_VALUE_NAME])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_reg_named_value(&String::from_utf8_lossy(&out.stdout), RUN_VALUE_NAME)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reg_run_value() -> Option<String> {
+    None
+}
+
+/// Write (Some) or remove (None) the Run-key value.
+#[cfg(target_os = "windows")]
+fn reg_set_run_value(cmdline: Option<&str>) -> bool {
+    let key = format!("HKCU\\{}", RUN_KEY);
+    let status = match cmdline {
+        Some(c) => reg_command()
+            .args(["add", &key, "/v", RUN_VALUE_NAME, "/t", "REG_SZ", "/d", c, "/f"])
+            .status(),
+        None => reg_command()
+            .args(["delete", &key, "/v", RUN_VALUE_NAME, "/f"])
+            .status(),
+    };
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reg_set_run_value(_cmdline: Option<&str>) -> bool {
+    false
+}
+
+/// Startup reconciliation: the REGISTRY is the truth for "Start
+/// with Windows". An existing entry wins — the toggle shows ON,
+/// its flag sets the stored launch mode, and a stale command (an
+/// old exe path after a move, say) is rewritten canonically for
+/// the current exe. No entry → the toggle shows OFF, whatever the
+/// saved prefs claimed, so the switch never lies.
+fn reconcile_autostart(cfg: &mut Config) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    match reg_run_value() {
+        Some(existing) => {
+            cfg.prefs.start_with_windows = true;
+            let mode = launch_mode_from_command(&existing);
+            cfg.prefs.launch_mode = mode.as_str().to_string();
+            let want = autostart_command(&exe, mode);
+            if existing != want {
+                reg_set_run_value(Some(&want));
+            }
+        }
+        None => {
+            cfg.prefs.start_with_windows = false;
+        }
+    }
+}
+
+/// Apply the Start-with-Windows prefs to the registry; true when
+/// the registry afterwards holds exactly what the prefs intend.
+fn apply_autostart(prefs: &Prefs) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let want = desired_autostart(prefs, &exe);
+    let _ = reg_set_run_value(want.as_deref());
+    reg_run_value() == want
+}
+
+/// The tray icon and its menu ids. The icon object must simply
+/// stay alive — dropping it removes the icon — so it rides along
+/// in the App for the whole session once created.
+struct TrayState {
+    #[cfg(target_os = "windows")]
+    _icon: tray_icon::TrayIcon,
+    #[cfg(target_os = "windows")]
+    open_id: tray_icon::menu::MenuId,
+    #[cfg(target_os = "windows")]
+    quit_id: tray_icon::menu::MenuId,
+}
+
+/// What the user asked the tray to do.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TrayAction {
+    Show,
+    Quit,
+}
+
+#[cfg(target_os = "windows")]
+fn build_tray() -> Option<TrayState> {
+    use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let open_item = MenuItem::new("Open SmartLife & Tuya Desktop", true, None);
+    let quit_item = MenuItem::new("Quit", true, None);
+    let open_id = open_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    let menu = Menu::new();
+    menu.append(&open_item).ok()?;
+    menu.append(&PredefinedMenuItem::separator()).ok()?;
+    menu.append(&quit_item).ok()?;
+    let icon = tray_icon::Icon::from_rgba(
+        include_bytes!("../assets/tray_icon.rgba").to_vec(),
+        64,
+        64,
+    )
+    .ok()?;
+    let tray = tray_icon::TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("SmartLife & Tuya Desktop")
+        .with_icon(icon)
+        .build()
+        .ok()?;
+    Some(TrayState {
+        _icon: tray,
+        open_id,
+        quit_id,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_tray() -> Option<TrayState> {
+    None
+}
+
+/// Drain pending tray events (menu clicks + icon clicks) into
+/// actions. The receivers are process-global channels fed by the
+/// OS message loop; polling each frame is the standard pattern
+/// for egui apps. Left-click UP or a double-click restores —
+/// Windows fires the tray callback on the click, and acting on
+/// release feels like every other tray icon.
+#[cfg(target_os = "windows")]
+fn drain_tray_events(tray: &TrayState) -> Vec<TrayAction> {
+    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+    let mut out = Vec::new();
+    let menu_rx = tray_icon::menu::MenuEvent::receiver();
+    while let Ok(ev) = menu_rx.try_recv() {
+        if ev.id() == &tray.quit_id {
+            out.push(TrayAction::Quit);
+        } else if ev.id() == &tray.open_id {
+            out.push(TrayAction::Show);
+        }
+    }
+    let icon_rx = TrayIconEvent::receiver();
+    while let Ok(ev) = icon_rx.try_recv() {
+        match ev {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => out.push(TrayAction::Show),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "windows"))]
+fn drain_tray_events(_tray: &TrayState) -> Vec<TrayAction> {
+    Vec::new()
+}
+
+/// The main window's HWND, for the one-time tray balloon.
+#[cfg(target_os = "windows")]
+fn main_hwnd(frame: &eframe::Frame) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = frame.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main_hwnd(_frame: &eframe::Frame) -> Option<isize> {
+    None
+}
+
+/// The one-time "still running in the tray" balloon (Windows,
+/// best-effort). Shell_NotifyIcon hangs balloons on an icon owned
+/// by a window; the tray-icon crate doesn't expose one, so this
+/// adds a TRANSIENT notify icon against the main window (a second
+/// (hwnd, id) pair — the real tray icon is a different pair and is
+/// untouched), shows the balloon from it, and removes it a few
+/// seconds later from a helper thread. Any failure is silent.
+#[cfg(target_os = "windows")]
+fn show_tray_balloon(hwnd: isize) {
+    const BALLOON_UID: u32 = 0x5A21;
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::Shell::{
+            Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+            NIIF_INFO, NOTIFYICONDATAW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
+
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd as HWND;
+        nid.uID = BALLOON_UID;
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
+        nid.uCallbackMessage = 0x8001;
+        let hinst = GetModuleHandleW(std::ptr::null());
+        // Resource 101 is the app icon embedded by build.rs; fall
+        // back to a stock icon if it can't be loaded.
+        let mut hicon = LoadIconW(hinst, 101 as *const u16);
+        if hicon.is_null() {
+            hicon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        }
+        nid.hIcon = hicon;
+        let tip = "SmartLife & Tuya Desktop";
+        for (i, ch) in tip.encode_utf16().enumerate() {
+            if i + 1 < nid.szTip.len() {
+                nid.szTip[i] = ch;
+            }
+        }
+        let title = "SmartLife & Tuya Desktop";
+        for (i, ch) in title.encode_utf16().enumerate() {
+            if i + 1 < nid.szInfoTitle.len() {
+                nid.szInfoTitle[i] = ch;
+            }
+        }
+        let msg = "SmartLife & Tuya Desktop is still running in the system tray — right-click its icon to quit.";
+        for (i, ch) in msg.encode_utf16().enumerate() {
+            if i + 1 < nid.szInfo.len() {
+                nid.szInfo[i] = ch;
+            }
+        }
+        nid.dwInfoFlags = NIIF_INFO;
+        if Shell_NotifyIconW(NIM_ADD, &nid) != 0 {
+            std::thread::sleep(Duration::from_secs(6));
+            let mut bye: NOTIFYICONDATAW = std::mem::zeroed();
+            bye.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            bye.hWnd = hwnd as HWND;
+            bye.uID = BALLOON_UID;
+            Shell_NotifyIconW(NIM_DELETE, &bye);
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_tray_balloon(_hwnd: isize) {}
 
 /// VLC's well-known install folders: its installer registers App
 /// Paths but does NOT add itself to PATH (the v1.1.0 "vlc: program
@@ -920,6 +1472,50 @@ enum PumpState {
 enum FrameMsg {
     Frame(Vec<u8>),
     Ended,
+}
+
+/// Painted play/pause overlay chip for camera video (v1.2.1
+/// cosmetic fix): the previous ⏸/▶ FONT-GLYPH button rendered as a
+/// big chunky dark square with two white blobs in the symbol font.
+/// The icon is drawn with the painter instead — two rounded bars
+/// for pause, a triangle for play — inside a 28×28 rounded chip
+/// with a translucent dark fill and a subtle light border, matching
+/// the web edition's CSS chip. Registered after the video area, so
+/// it keeps click priority in its corner.
+fn play_pause_chip(ui: &mut Ui, id: &str, rect: egui::Rect, paused: bool) -> egui::Response {
+    let resp = ui.interact(rect, egui::Id::new(("cam-chip", id)), Sense::click());
+    let painter = ui.painter();
+    let fill = if resp.hovered() {
+        Color32::from_black_alpha(195)
+    } else {
+        Color32::from_black_alpha(150)
+    };
+    painter.rect_filled(rect, Rounding::same(9.0), fill);
+    painter.rect_stroke(
+        rect,
+        Rounding::same(9.0),
+        Stroke::new(1.0, Color32::from_white_alpha(60)),
+    );
+    let c = rect.center();
+    if paused {
+        // Play: a filled triangle, optically centred.
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                pos2(c.x - 3.4, c.y - 6.0),
+                pos2(c.x - 3.4, c.y + 6.0),
+                pos2(c.x + 5.4, c.y),
+            ],
+            Color32::WHITE,
+            Stroke::NONE,
+        ));
+    } else {
+        // Pause: two rounded bars.
+        for dx in [-3.7, 3.7] {
+            let bar = egui::Rect::from_center_size(pos2(c.x + dx, c.y), vec2(3.6, 12.0));
+            painter.rect_filled(bar, Rounding::same(1.8), Color32::WHITE);
+        }
+    }
+    resp
 }
 
 /// Identity of one pump's feed — when it changes (camera edited,
@@ -1405,6 +2001,116 @@ fn filter_entries<'a>(entries: &'a [CardEntry], layout: &LayoutCfg, query: &str)
         .collect()
 }
 
+/// The sections' DEFAULT order (v1.2.1): Cameras first, then Pinned,
+/// Lighting, user groups (creation order, expanded in place),
+/// Ungrouped, Scenes. Expressed over a built section list so groups
+/// land exactly where they were created relative to each other.
+fn default_section_seq(sections: &[Section]) -> Vec<String> {
+    fn slot(s: &Section) -> usize {
+        match s.kind {
+            SectionKind::Cameras => 0,
+            SectionKind::Pinned => 1,
+            SectionKind::Lighting => 2,
+            SectionKind::Group => 3,
+            SectionKind::Ungrouped => 4,
+            SectionKind::Scenes => 5,
+        }
+    }
+    let mut idx: Vec<usize> = (0..sections.len()).collect();
+    idx.sort_by_key(|&i| slot(&sections[i])); // stable sort: groups keep creation order
+    idx.iter().map(|&i| sections[i].order_key.clone()).collect()
+}
+
+/// The EFFECTIVE section sequence: the stored user order (filtered
+/// to sections that exist) wins; any section missing from the stored
+/// list (a new group, a newly-appearing built-in) slots in right
+/// after its nearest already-placed default-order predecessor — or
+/// at the front when it has none.
+fn effective_section_seq(sections: &[Section], stored: &[String]) -> Vec<String> {
+    let present: HashSet<&str> = sections.iter().map(|s| s.order_key.as_str()).collect();
+    let mut eff: Vec<String> = stored
+        .iter()
+        .filter(|k| present.contains(k.as_str()))
+        .cloned()
+        .collect();
+    let default = default_section_seq(sections);
+    for (i, key) in default.iter().enumerate() {
+        if eff.contains(key) {
+            continue;
+        }
+        let mut at = 0;
+        for prev in default[..i].iter().rev() {
+            if let Some(p) = eff.iter().position(|k| k == prev) {
+                at = p + 1;
+                break;
+            }
+        }
+        eff.insert(at, key.clone());
+    }
+    eff
+}
+
+/// Sort a built section list into the effective sequence.
+fn order_sections(sections: &mut [Section], stored: &[String]) {
+    let eff = effective_section_seq(sections, stored);
+    let rank: HashMap<&str, usize> =
+        eff.iter().enumerate().map(|(i, k)| (k.as_str(), i)).collect();
+    sections.sort_by_key(|s| rank[s.order_key.as_str()]);
+}
+
+/// The stored sequence after moving `key` one step: start from the
+/// effective sequence of the RENDERED sections, swap with the
+/// neighbour, then re-append any stored keys for sections that
+/// aren't currently rendered (in their stored relative order) so a
+/// move never forgets a hidden section's place.
+fn moved_section_seq(
+    stored: &[String],
+    rendered: &[Section],
+    key: &str,
+    dir: i32,
+) -> Vec<String> {
+    let mut seq = effective_section_seq(rendered, stored);
+    if let Some(i) = seq.iter().position(|k| k == key) {
+        let j = i as i32 + dir;
+        if j >= 0 && (j as usize) < seq.len() {
+            seq.swap(i, j as usize);
+        }
+    }
+    for k in stored {
+        if !seq.contains(k) {
+            seq.push(k.clone());
+        }
+    }
+    seq
+}
+
+/// Greedy row packing for the dashboard grid (v1.2.1): walk the
+/// items in order, filling each row left to right; an item that
+/// doesn't fit in the row's remaining columns starts a new row.
+/// Spans are camera card sizes (1 = Normal, 2 = Large, `cols` =
+/// Wide); devices, scenes and the drag gap pass their own span.
+/// Mirrors what the web edition's CSS grid does with
+/// `grid-column: span N`.
+fn pack_rows<T: Clone>(items: &[T], spans: &[usize], cols: usize) -> Vec<Vec<(T, usize)>> {
+    let cols = cols.max(1);
+    let mut rows: Vec<Vec<(T, usize)>> = Vec::new();
+    let mut cur: Vec<(T, usize)> = Vec::new();
+    let mut used = 0usize;
+    for (i, item) in items.iter().enumerate() {
+        let span = spans.get(i).copied().unwrap_or(1).max(1).min(cols);
+        if !cur.is_empty() && used + span > cols {
+            rows.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        cur.push((item.clone(), span));
+        used += span;
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
 fn build_sections(
     entries: &[CardEntry],
     layout: &LayoutCfg,
@@ -1428,33 +2134,11 @@ fn build_sections(
             None => false,
         }
     };
-    let pinned: Vec<&CardEntry> = normal.iter().filter(|d| pin_set.contains(d.id.as_str())).cloned().collect();
-    if !pinned.is_empty() {
-        sections.push(Section {
-            key: "pinned".into(),
-            order_key: "pinned".into(),
-            title: "Pinned".into(),
-            kind: SectionKind::Pinned,
-            group_id: None,
-            ids: order_section_items(&pinned, so.get("pinned"), layout),
-        });
-    }
-    // Built-in automatic sections (Pinned → Lighting → Cameras →
-    // groups → Ungrouped → Scenes): an explicit group assignment wins;
-    // unassigned lights land in Lighting, unassigned cameras in Cameras.
-    let lighting: Vec<&CardEntry> = normal
-        .iter()
-        .filter(|d| !assigned(d) && d.light)
-        .cloned()
-        .collect();
-    sections.push(Section {
-        key: "lighting".into(),
-        order_key: "lighting".into(),
-        title: "Lighting".into(),
-        kind: SectionKind::Lighting,
-        group_id: None,
-        ids: order_section_items(&lighting, so.get("lighting"), layout),
-    });
+    // Sections are CONSTRUCTED in the default order (v1.2.1: Cameras
+    // → Pinned → Lighting → groups → Ungrouped → Scenes) and then
+    // re-sorted by the user's stored section sequence below. An
+    // explicit group assignment always wins; unassigned lights land
+    // in Lighting, unassigned cameras in Cameras.
     let cameras_sec: Vec<&CardEntry> = normal
         .iter()
         .filter(|d| !assigned(d) && d.camera)
@@ -1467,6 +2151,30 @@ fn build_sections(
         kind: SectionKind::Cameras,
         group_id: None,
         ids: order_section_items(&cameras_sec, so.get("cameras"), layout),
+    });
+    let pinned: Vec<&CardEntry> = normal.iter().filter(|d| pin_set.contains(d.id.as_str())).cloned().collect();
+    if !pinned.is_empty() {
+        sections.push(Section {
+            key: "pinned".into(),
+            order_key: "pinned".into(),
+            title: "Pinned".into(),
+            kind: SectionKind::Pinned,
+            group_id: None,
+            ids: order_section_items(&pinned, so.get("pinned"), layout),
+        });
+    }
+    let lighting: Vec<&CardEntry> = normal
+        .iter()
+        .filter(|d| !assigned(d) && d.light)
+        .cloned()
+        .collect();
+    sections.push(Section {
+        key: "lighting".into(),
+        order_key: "lighting".into(),
+        title: "Lighting".into(),
+        kind: SectionKind::Lighting,
+        group_id: None,
+        ids: order_section_items(&lighting, so.get("lighting"), layout),
     });
     for g in &layout.groups {
         let devs: Vec<&CardEntry> = normal
@@ -1507,6 +2215,7 @@ fn build_sections(
             ids: order_section_items(&scenes, so.get("scenes"), layout),
         });
     }
+    order_sections(&mut sections, &layout.section_seq);
     sections.retain(|s| {
         !s.ids.is_empty()
             || (editing
@@ -2037,6 +2746,17 @@ struct App {
     section_rects: Vec<(String, egui::Rect)>,
     sections_cache: Vec<Section>,
     drag: Option<DragState>,
+    /// A press that hasn't yet earned drag status (see PendingDrag).
+    drag_pending: Option<PendingDrag>,
+    // startup & tray (v1.2.1, Windows only): the tray icon once
+    // created (stays for the session), whether the window is
+    // currently hidden in the tray, whether a real Quit is in
+    // flight (bypasses close-to-tray), and the launch mode the
+    // process was started with.
+    tray: Option<TrayState>,
+    window_hidden: bool,
+    quitting: bool,
+    arg_launch_mode: LaunchMode,
     // rate-limit backoff (v1.2.0): while set, autorefresh skips
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
@@ -2114,6 +2834,38 @@ struct DragState {
     target: Option<(String, usize)>,
 }
 
+/// A press on a card that MIGHT become a drag (v1.2.1). egui starts
+/// a `Sense::drag()` widget's drag the moment the pointer is down —
+/// before any movement — and the previous code promoted that
+/// straight into `App.drag`, which made `display_ids` remove the
+/// card from its section on the very next frame. A click on any
+/// in-card control (a camera's Edit/Delete buttons, say) spans the
+/// press frame and the release frame, so the control vanished
+/// mid-click and `clicked()` never fired: buttons rendered fine and
+/// did nothing. A press is therefore held as PENDING — the layout
+/// does not change — until the pointer has genuinely travelled;
+/// only then does it become a real drag. A release before that
+/// point leaves the click to the control under the pointer.
+struct PendingDrag {
+    id: String,
+    is_scene: bool,
+    from_section: String,
+    size: egui::Vec2,
+    grab_offset: egui::Vec2,
+    start_idx: usize,
+    press_pos: egui::Pos2,
+}
+
+/// How far the pointer must travel from the press point before a
+/// pending press turns into a drag — comfortably beyond the jitter
+/// of an ordinary click (a few px), small enough that a deliberate
+/// drag feels immediate.
+const DRAG_PROMOTE_PX: f32 = 8.0;
+
+fn drag_should_promote(press: egui::Pos2, cur: egui::Pos2) -> bool {
+    press.distance(cur) >= DRAG_PROMOTE_PX
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
@@ -2158,6 +2910,11 @@ impl App {
             section_rects: Vec::new(),
             sections_cache: Vec::new(),
             drag: None,
+            drag_pending: None,
+            tray: None,
+            window_hidden: false,
+            quitting: false,
+            arg_launch_mode: LaunchMode::Normal,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -2178,6 +2935,19 @@ impl App {
         }
         let saved_session = cfg.session.clone();
         app.cfg = cfg;
+        // Startup & tray (v1.2.1): record how we were launched, let
+        // the registry correct the Start-with-Windows prefs, and
+        // create the tray icon when this session needs one — the
+        // app started minimized (its ONLY way back is the tray) or
+        // close-to-tray is on. Once created it stays for the
+        // session (see the Settings help text).
+        app.arg_launch_mode =
+            launch_mode_from_args(&std::env::args().collect::<Vec<String>>());
+        reconcile_autostart(&mut app.cfg);
+        app.window_hidden = app.arg_launch_mode == LaunchMode::Minimized;
+        if app.window_hidden || app.cfg.prefs.close_to_tray {
+            app.ensure_tray();
+        }
         app.apply_style(&cc.egui_ctx);
         // Silent auto-update check, throttled to once per 24 h
         // (attempt-based, like the web edition).
@@ -2471,6 +3241,15 @@ impl App {
         lay.hidden.retain(|id| ids.contains(id.as_str()));
         lay.assign.retain(|id, _| ids.contains(id.as_str()));
         lay.alias.retain(|id, _| ids.contains(id.as_str()));
+        lay.cam_sizes.retain(|id, _| ids.contains(id.as_str()));
+        // Drop section-sequence entries for groups that no longer
+        // exist; built-ins stay (their sections come and go — e.g.
+        // Pinned — and the user's place for them must survive).
+        let group_keys: HashSet<String> =
+            lay.groups.iter().map(|g| format!("group:{}", g.id)).collect();
+        lay.section_seq.retain(|k| {
+            !k.starts_with("group:") || group_keys.contains(k)
+        });
         for list in lay.section_order.values_mut() {
             list.retain(|id| ids.contains(id.as_str()));
         }
@@ -2509,6 +3288,12 @@ impl App {
                 });
                 return;
             }
+            // NEVER fall through to a blank "Add camera" form here:
+            // the user clicked Edit on a specific card, and quietly
+            // opening an Add form reads as "Edit doesn't work" (and a
+            // Save would duplicate instead of updating). Say so.
+            self.toast("Couldn't find that camera — it may already have been deleted.", true);
+            return;
         }
         self.cam_form = Some(CameraForm {
             id: None,
@@ -2524,8 +3309,13 @@ impl App {
     }
 
     fn delete_camera(&mut self, item_id: &str) {
-        if let Some(ci) = self.camera_index(item_id) {
-            self.cfg.cameras.remove(ci);
+        // Only claim success when a record actually went away —
+        // previously this toasted "Camera deleted" even when the id
+        // matched nothing, so a failed delete looked identical to a
+        // successful one.
+        if remove_camera_record(&mut self.cfg.cameras, &mut self.cfg.layout, item_id).is_none() {
+            self.toast("Couldn't find that camera — it may already have been deleted.", true);
+            return;
         }
         // Its pumps stop on the next sync_pumps pass (no longer
         // desired); close the player if it was showing this camera.
@@ -2533,15 +3323,6 @@ impl App {
             self.player_for = None;
         }
         self.paused_cams.remove(item_id);
-        let lay = &mut self.cfg.layout;
-        lay.pins.retain(|x| x != item_id);
-        lay.hidden.retain(|x| x != item_id);
-        lay.assign.remove(item_id);
-        lay.alias.remove(item_id);
-        for list in lay.section_order.values_mut() {
-            list.retain(|x| x != item_id);
-        }
-        lay.section_order.retain(|_, list| !list.is_empty());
         self.save();
         self.toast("Camera deleted", false);
     }
@@ -2598,9 +3379,14 @@ impl App {
                     {
                         continue;
                     }
-                    let url = tile_rtsp_url(cam);
-                    desired.insert(item.clone(), pump_source_key(ffp, &url, TILE_W, TILE_H));
-                    specs.insert(item, (url, TILE_W, TILE_H));
+                    // The tile pump follows the card's size (v1.2.1):
+                    // Normal 480×270 SD, Large 960×540 SD, Wide
+                    // 960×540 at the card's selected quality. The
+                    // source key includes url+w+h, so a resize
+                    // restarts the pump at the new spec on its own.
+                    let (url, w, h) = tile_feed(cam, cam_size_of(&self.cfg.layout, &item));
+                    desired.insert(item.clone(), pump_source_key(ffp, &url, w, h));
+                    specs.insert(item, (url, w, h));
                 }
             }
             if let Some(item) = &self.player_for {
@@ -2826,7 +3612,29 @@ impl App {
         });
         if escaped {
             self.drag = None;
+            self.drag_pending = None;
             return;
+        }
+        // Pending press (v1.2.1): promote only after real travel;
+        // a release first means it was a click on a card control —
+        // drop the candidate WITHOUT touching the layout, which is
+        // exactly what lets the control's own click land.
+        if let Some(p) = &self.drag_pending {
+            if released {
+                self.drag_pending = None;
+            } else if let Some(cur) = pos {
+                if drag_should_promote(p.press_pos, cur) {
+                    let p = self.drag_pending.take().unwrap();
+                    self.drag = Some(DragState {
+                        id: p.id.clone(),
+                        is_scene: p.is_scene,
+                        from_section: p.from_section.clone(),
+                        size: p.size,
+                        grab_offset: p.grab_offset,
+                        target: Some((p.from_section.clone(), p.start_idx)),
+                    });
+                }
+            }
         }
         if let (Some(d), Some(p)) = (self.drag.as_ref(), pos) {
             let (id, is_scene) = (d.id.clone(), d.is_scene);
@@ -2837,6 +3645,68 @@ impl App {
         }
         if released {
             self.commit_drag();
+        }
+    }
+
+    /// Create the tray icon if this session should have one and
+    /// doesn't yet. Once created it stays until the app exits —
+    /// the least surprising rule, and the one the Settings panel
+    /// documents.
+    fn ensure_tray(&mut self) {
+        if self.tray.is_none() {
+            self.tray = build_tray();
+        }
+    }
+
+    /// Tray events + window-close behaviour (v1.2.1), run every
+    /// frame before rendering:
+    ///  - tray "Open" / icon left-click → show + focus the window;
+    ///  - tray "Quit" → stop the pumps, save, and REALLY exit
+    ///    (the quitting flag keeps close-to-tray from swallowing
+    ///    the close, as does an installer launch);
+    ///  - a window close with close-to-tray on → cancel the close
+    ///    and hide instead, with the one-time balloon.
+    /// While hidden, a slow heartbeat keeps frames coming so tray
+    /// events are polled even if the OS stops waking the loop.
+    fn handle_window_chrome(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if let Some(tray) = &self.tray {
+            for action in drain_tray_events(tray) {
+                match action {
+                    TrayAction::Show => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.window_hidden = false;
+                    }
+                    TrayAction::Quit => {
+                        self.quitting = true;
+                        for p in self.pumps.values() {
+                            p.stop();
+                        }
+                        self.save();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if close_action(self.cfg.prefs.close_to_tray, self.quitting)
+                == CloseAction::HideToTray
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.window_hidden = true;
+                self.ensure_tray();
+                if !self.cfg.prefs.tray_notice_shown {
+                    self.cfg.prefs.tray_notice_shown = true;
+                    self.save();
+                    if let Some(hwnd) = main_hwnd(frame) {
+                        show_tray_balloon(hwnd);
+                    }
+                }
+            }
+        }
+        if self.window_hidden {
+            ctx.request_repaint_after(Duration::from_millis(400));
         }
     }
 
@@ -3855,6 +4725,16 @@ impl App {
         let sec_top = ui.cursor().top();
         let sec_left = ui.cursor().left();
         let collapsed = self.cfg.layout.collapsed.get(&sec.key).copied().unwrap_or(false);
+        // This section's place among the rendered ones — drives the
+        // Edit-mode section move buttons (disabled at the ends).
+        let (sec_idx, sec_total) = {
+            let pos = self
+                .sections_cache
+                .iter()
+                .position(|s| s.key == sec.key)
+                .unwrap_or(0);
+            (pos, self.sections_cache.len().max(1))
+        };
         // ---- header ----
         ui.horizontal(|ui| {
             let chev = if collapsed { "▸" } else { "▾" };
@@ -3910,6 +4790,27 @@ impl App {
                         self.toast(format!("“{}” is back to name order", sec.title), false);
                     }
                 }
+                if self.editing {
+                    // Section reordering (v1.2.1): every section —
+                    // built-ins included — can move; the resulting
+                    // order persists in layout.section_seq. Added
+                    // down-then-up so the pair reads ↑ ↓ left-to-right
+                    // in this right-to-left layout.
+                    if ui
+                        .add_enabled(sec_idx + 1 < sec_total, Button::new("↓").small())
+                        .on_hover_text("Move section down")
+                        .clicked()
+                    {
+                        self.move_section(&sec.order_key, 1);
+                    }
+                    if ui
+                        .add_enabled(sec_idx > 0, Button::new("↑").small())
+                        .on_hover_text("Move section up")
+                        .clicked()
+                    {
+                        self.move_section(&sec.order_key, -1);
+                    }
+                }
             });
         });
         ui.add_space(8.0);
@@ -3943,17 +4844,40 @@ impl App {
                 )));
             return;
         }
-        let rows = display.len().div_ceil(cols);
-        for (row_idx, chunk) in display.chunks(cols).enumerate() {
-            let sig = self.row_signature(sec, row_idx, chunk, card_w);
+        // Column spans (v1.2.1): camera cards can be Large (2
+        // columns) or Wide (the full row); everything else — and the
+        // drag gap, which inherits the dragged card's span so the
+        // row doesn't jump around mid-drag — packs by pack_rows.
+        let drag_span = self.drag.as_ref().and_then(|d| {
+            if self.camera_index(&d.id).is_some() {
+                Some(cam_size_of(&self.cfg.layout, &d.id).span(cols))
+            } else {
+                None
+            }
+        });
+        let spans: Vec<usize> = display
+            .iter()
+            .map(|item| match item {
+                Some(id) if self.camera_index(id).is_some() => {
+                    cam_size_of(&self.cfg.layout, id).span(cols)
+                }
+                Some(_) => 1,
+                None => drag_span.unwrap_or(1),
+            })
+            .collect();
+        let packed = pack_rows(&display, &spans, cols);
+        let rows = packed.len();
+        for (row_idx, row) in packed.iter().enumerate() {
+            let sig = self.row_signature(sec, row_idx, row, card_w);
             let row_h = self.row_heights.get(&sig).copied().unwrap_or(0.0);
             let mut actual_h = 0.0f32;
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
-                for item in chunk {
+                for (item, span) in row {
                     let item_owned = item.clone();
+                    let cell_w = *span as f32 * card_w + (*span as f32 - 1.0) * gap;
                     let alloc = ui.allocate_ui_with_layout(
-                        vec2(card_w, row_h),
+                        vec2(cell_w, row_h),
                         Layout::top_down(Align::Min),
                         |ui| match &item_owned {
                             Some(id) => {
@@ -3964,7 +4888,12 @@ impl App {
                                 // sliders and fields keep priority in
                                 // their own areas — like the web edition,
                                 // where you drag a card by its body.
-                                if self.editing && self.drag.is_none() {
+                                // v1.2.1: drag_started() only records a
+                                // PENDING drag (see PendingDrag) — the
+                                // card stays in the layout until the
+                                // pointer has really moved, so clicks
+                                // on the card's controls always land.
+                                if self.editing && self.drag.is_none() && self.drag_pending.is_none() {
                                     let cell_rect = ui.max_rect();
                                     let resp = ui.interact(
                                         cell_rect,
@@ -3978,21 +4907,22 @@ impl App {
                                                 .iter()
                                                 .position(|x| x == &id)
                                                 .unwrap_or(0);
-                                            self.drag = Some(DragState {
+                                            self.drag_pending = Some(PendingDrag {
                                                 id: id.clone(),
                                                 is_scene: sec.kind == SectionKind::Scenes,
                                                 from_section: sec.key.clone(),
                                                 size: cell_rect.size(),
                                                 grab_offset: p - cell_rect.min,
-                                                target: Some((sec.key.clone(), start_idx)),
+                                                start_idx,
+                                                press_pos: p,
                                             });
                                         }
                                     }
                                 }
                                 if self.camera_index(&id).is_some() {
-                                    self.camera_card(ui, &id, sec, card_w, row_h);
+                                    self.camera_card(ui, &id, sec, cell_w, row_h);
                                 } else {
-                                    self.device_card(ui, &id, sec, card_w, row_h);
+                                    self.device_card(ui, &id, sec, cell_w, row_h);
                                 }
                             }
                             None => {
@@ -4032,13 +4962,15 @@ impl App {
     fn card_shape(&self, id: &str) -> String {
         if let Some(ci) = self.camera_index(id) {
             // The live-preview video area adds a fixed 16:9 block, so
-            // preview state is part of the shape (v1.2.0).
+            // preview state is part of the shape (v1.2.0) — and so is
+            // the card size (v1.2.1): a wider card's video is taller.
             let video = self.cfg.prefs.previews && self.ffmpeg_cached().is_some();
             format!(
-                "cam:{}:{}:{}",
+                "cam:{}:{}:{}:{}",
                 self.cfg.cameras[ci].template,
                 video,
-                self.paused_cams.contains(id)
+                self.paused_cams.contains(id),
+                cam_size_of(&self.cfg.layout, id).as_str()
             )
         } else if let Some(di) = self.device_index(id) {
             let d = &self.devices[di];
@@ -4060,7 +4992,7 @@ impl App {
         &self,
         sec: &Section,
         row_idx: usize,
-        chunk: &[Option<String>],
+        row: &[(Option<String>, usize)],
         card_w: f32,
     ) -> String {
         let mut s = format!(
@@ -4071,7 +5003,7 @@ impl App {
             self.compact(),
             card_w as i32
         );
-        for item in chunk {
+        for (item, span) in row {
             s.push('|');
             s.push_str(
                 &item
@@ -4079,6 +5011,8 @@ impl App {
                     .map(|id| self.card_shape(id))
                     .unwrap_or_else(|| "gap".to_string()),
             );
+            s.push('#');
+            s.push_str(&span.to_string());
         }
         s
     }
@@ -4127,6 +5061,15 @@ impl App {
                         });
                     });
             });
+    }
+
+    /// Move a whole section up/down (Edit mode, v1.2.1) and persist
+    /// the resulting section sequence.
+    fn move_section(&mut self, order_key: &str, dir: i32) {
+        let rendered = self.sections_cache.clone();
+        self.cfg.layout.section_seq =
+            moved_section_seq(&self.cfg.layout.section_seq, &rendered, order_key, dir);
+        self.save();
     }
 
     fn move_in_section(&mut self, sec: &Section, id: &str, dir: i32) {
@@ -4534,21 +5477,20 @@ impl App {
                         self.player_for = Some(id.to_string());
                     }
                     resp.on_hover_text("Open the big player");
-                    // Pause / resume the tile preview, top-right.
-                    let btn_rect = egui::Rect::from_min_size(
-                        pos2(rect.right() - 36.0, rect.top() + 5.0),
-                        vec2(30.0, 24.0),
+                    // Pause / resume the tile preview, top-right —
+                    // a PAINTED chip (v1.2.1), clear of the LIVE
+                    // badge at the top-left.
+                    let chip_rect = egui::Rect::from_min_size(
+                        pos2(rect.right() - 33.0, rect.top() + 5.0),
+                        vec2(28.0, 28.0),
                     );
-                    let pbtn = ui
-                        .put(
-                            btn_rect,
-                            Button::new(if paused { "▶" } else { "▮▮" }).small(),
-                        )
-                        .on_hover_text(if paused {
+                    let pbtn = play_pause_chip(ui, id, chip_rect, paused).on_hover_text(
+                        if paused {
                             "Resume preview"
                         } else {
                             "Pause preview"
-                        });
+                        },
+                    );
                     if pbtn.clicked() {
                         if paused {
                             self.paused_cams.remove(id);
@@ -4749,6 +5691,37 @@ impl App {
                         }
                         if ui.add(Button::new("↓ Move down").small()).clicked() {
                             self.move_in_section(sec, id, 1);
+                        }
+                    });
+                    // Card size (v1.2.1): Normal / Large / Wide —
+                    // segmented like the quality switch above.
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Size").size(12.5).color(pal.dim));
+                        let cur_size = cam_size_of(&self.cfg.layout, id);
+                        for (sz, label) in [
+                            (CamSize::Normal, "Normal"),
+                            (CamSize::Large, "Large"),
+                            (CamSize::Wide, "Wide"),
+                        ] {
+                            let active = cur_size == sz;
+                            let btn = if active {
+                                Button::new(RichText::new(label).color(Color32::WHITE))
+                                    .fill(accent)
+                                    .small()
+                            } else {
+                                Button::new(label).small()
+                            };
+                            if ui.add(btn).clicked() && !active {
+                                if sz == CamSize::Normal {
+                                    self.cfg.layout.cam_sizes.remove(id);
+                                } else {
+                                    self.cfg.layout
+                                        .cam_sizes
+                                        .insert(id.to_string(), sz.as_str().to_string());
+                                }
+                                self.save();
+                            }
                         }
                     });
                 }
@@ -4984,6 +5957,96 @@ impl App {
                             }
                             _ => {}
                         }
+                        // ---- Startup & background (Windows only) ----
+                        let mut start_act: Option<(&'static str, String)> = None;
+                        Self::settings_panel(ui, &pal, "Startup & background", |ui| {
+                            let mut on = self.cfg.prefs.start_with_windows;
+                            if ui.checkbox(&mut on, "Start with Windows").changed() {
+                                start_act = Some(("toggle", on.to_string()));
+                            }
+                            if on {
+                                ui.add_space(6.0);
+                                Self::field_label(ui, &pal, "Launch as");
+                                let cur = LaunchMode::parse(&self.cfg.prefs.launch_mode);
+                                ui.horizontal(|ui| {
+                                    for (m, label) in [
+                                        (LaunchMode::Normal, "Normal window"),
+                                        (LaunchMode::Minimized, "Minimized (to tray)"),
+                                        (LaunchMode::Maximized, "Maximized"),
+                                    ] {
+                                        let active = cur == m;
+                                        let btn = if active {
+                                            Button::new(
+                                                RichText::new(label).color(Color32::WHITE),
+                                            )
+                                            .fill(accent)
+                                        } else {
+                                            Button::new(label)
+                                        };
+                                        if ui.add(btn).clicked() && !active {
+                                            start_act =
+                                                Some(("mode", m.as_str().to_string()));
+                                        }
+                                    }
+                                });
+                            }
+                            ui.add_space(10.0);
+                            let mut ctt = self.cfg.prefs.close_to_tray;
+                            if ui
+                                .checkbox(
+                                    &mut ctt,
+                                    "Keep running in the system tray when the window is closed",
+                                )
+                                .changed()
+                            {
+                                start_act = Some(("tray", ctt.to_string()));
+                            }
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new("Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a Windows-app feature; the web edition has no equivalent.")
+                                    .size(12.5)
+                                    .color(pal.dim),
+                            );
+                        });
+                        match start_act {
+                            Some(("toggle", v)) => {
+                                self.cfg.prefs.start_with_windows = v == "true";
+                                if apply_autostart(&self.cfg.prefs) {
+                                    self.toast(
+                                        if self.cfg.prefs.start_with_windows {
+                                            "Start with Windows: on"
+                                        } else {
+                                            "Start with Windows: off"
+                                        },
+                                        false,
+                                    );
+                                } else {
+                                    // Show the registry truth, not the wish.
+                                    self.cfg.prefs.start_with_windows =
+                                        reg_run_value().is_some();
+                                    self.toast(
+                                        "Couldn't update the Windows startup entry.",
+                                        true,
+                                    );
+                                }
+                                self.save();
+                            }
+                            Some(("mode", m)) => {
+                                self.cfg.prefs.launch_mode = m;
+                                if self.cfg.prefs.start_with_windows {
+                                    apply_autostart(&self.cfg.prefs);
+                                }
+                                self.save();
+                            }
+                            Some(("tray", v)) => {
+                                self.cfg.prefs.close_to_tray = v == "true";
+                                if self.cfg.prefs.close_to_tray {
+                                    self.ensure_tray();
+                                }
+                                self.save();
+                            }
+                            _ => {}
+                        }
                         // ---- Connection ----
                         Self::settings_panel(ui, &pal, "Connection", |ui| {
                             ui.label(
@@ -5160,10 +6223,10 @@ impl App {
                                 "How login works. This app signs in to Tuya's cloud with the same account you use in the Smart Life (or Tuya Smart) app, then asks Tuya for your device list and sends control commands — the same approach as the classic Smart Life web dashboards. Pick the region where your account was registered; the wrong region is the most common cause of “login failed”.",
                                 "Your credentials. Your username and password go directly to Tuya's servers (px1.tuya*.com) over HTTPS. If you tick “Keep me logged in”, they are kept in this app's config file (in your user profile, under SmartLifeTuyaDesktop\\config.json) so the app can silently sign back in when the session token expires — use it only on your own devices, and use “Forget saved login” above to erase them.",
                                 "The proxy. Some networks block direct calls to Tuya's endpoints. In “Auto” mode, China-region traffic is routed through a community CORS proxy (cors.smartathome.co.uk); US and EU traffic goes direct. Note a proxy can see the requests it forwards (they contain a session token, never your password after sign-in — the sign-in request itself does contain your password, so only use proxies you trust for CN logins).",
-                                "Customising. Sections sort A–Z by name by default. Use ✎ Edit to drag cards into your own order inside a section — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section at the top — the device also stays in its group below. Scenes always live in their own Scenes section.",
+                                "Customising. Sections appear as Cameras, Pinned, Lighting, your groups, Ungrouped, Scenes by default — and in ✎ Edit mode every section header has ↑/↓ buttons to move the section itself; your order sticks. Inside a section, cards sort A–Z by name by default: drag cards into your own order — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section — the device also stays in its group below. Scenes always live in their own Scenes section.",
                                 "Lighting & group controls. Lights organise themselves: any bulb or strip that isn't assigned to one of your groups lives in the built-in Lighting section, and cameras get their own built-in Cameras section the same way — assigning a device to a group always wins over the automatic sections. The Lighting header (and the header of any group containing a light) has group controls: a master switch (on if any member is on; clicking turns the whole group on or off), brightness and colour-temperature sliders showing the members' average, and colour swatches. Group controls broadcast — they send the command to each member in turn, and changing a single light afterwards simply overrides it for that light. Nothing about the group itself is stored.",
-                                "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way; unassigned cameras live in the built-in Cameras section until you assign them to a group of your own.",
-                                "Watching a stream. This app plays RTSP streams in place: a bundled copy of ffmpeg decodes the feed for the live tile previews (Tapo Stream 2, the standard-quality stream, to keep tiles light) and for the big ▶ Watch player, which uses the quality picked on the card. Tile previews can be turned off in Settings → Stream gateway & cameras, where you can also point the app at a different ffmpeg. If ffmpeg can't be found, previews switch off and ▶ Watch falls back to the external player app named in Settings (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. If a stream gateway (go2rtc / MediaMTX) is configured instead, ▶ Watch opens the gateway's watch page in your browser. (The web edition of this app can't decode RTSP itself: with a gateway configured, its tiles embed the gateway's feed; without one, its Watch hands the stream to a player app.)",
+                                "Cameras (RTSP). Tapo cameras: in the Tapo app, open the camera → Settings → Advanced Settings → Camera Account and create a camera account, and make sure RTSP is enabled for the camera. The username and password you add here are that camera account — not your TP-Link cloud account. Then use ✎ Edit → + Add camera and enter the camera's IP address (a fixed or DHCP-reserved IP works best, so the address doesn't change). The app builds the stream address for you: rtsp://user:pass@IP:554/stream1 (high quality) or /stream2 (standard) — or pick “Custom path” for other RTSP cameras. Camera cards live alongside your devices and can be pinned, grouped and reordered the same way; unassigned cameras live in the built-in Cameras section (the first section by default) until you assign them to a group of your own. In Edit mode a camera card can also be resized — Normal (one grid cell), Large (two columns) or Wide (the full row).",
+                                "Watching a stream. This app plays RTSP streams in place: a bundled copy of ffmpeg decodes the feed for the live tile previews (Tapo Stream 2, the standard-quality stream, to keep tiles light — Large tiles decode it bigger, and a Wide tile uses the quality picked on the card) and for the big ▶ Watch player, which uses the quality picked on the card. Tile previews can be turned off in Settings → Stream gateway & cameras, where you can also point the app at a different ffmpeg. If ffmpeg can't be found, previews switch off and ▶ Watch falls back to the external player app named in Settings (VLC by default) — or use Copy URL and paste the address into VLC's “Open Network Stream”. If a stream gateway (go2rtc / MediaMTX) is configured instead, ▶ Watch opens the gateway's watch page in your browser. (The web edition of this app can't decode RTSP itself: with a gateway configured, its tiles embed the gateway's feed; without one, its Watch hands the stream to a player app.)",
                                 "Limits. Tuya rate-limits how often the device list can be fetched and how fast commands can be sent. When that happens the app quietly keeps showing the last known states, retries commands a moment later, and stretches its refresh interval until Tuya is happy again — no action needed. Autorefresh every 30s or slower is comfortable.",
                             ];
                             for p in paras {
@@ -5397,7 +6460,16 @@ impl App {
                         .id
                         .as_ref()
                         .map(|eid| eid.trim_start_matches("cam:").to_string())
-                        .unwrap_or_else(|| format!("{}", now_ms())),
+                        .unwrap_or_else(|| {
+                            // Fresh id, verified unused (v1.2.1 —
+                            // a bare millisecond timestamp could tie
+                            // with an existing camera and share it).
+                            let mut id = new_camera_id();
+                            while self.cfg.cameras.iter().any(|c| c.id == id) {
+                                id = new_camera_id();
+                            }
+                            id
+                        }),
                     name,
                     user: form.user.trim().to_string(),
                     password: obfuscate(&form.pass),
@@ -5407,8 +6479,21 @@ impl App {
                     path: form.path.trim().to_string(),
                 };
                 if let Some(eid) = &form.id {
-                    if let Some(ci) = self.camera_index(eid) {
-                        self.cfg.cameras[ci] = cam;
+                    match self.camera_index(eid) {
+                        Some(ci) => {
+                            self.cfg.cameras[ci] = cam;
+                        }
+                        None => {
+                            // The camera being edited is gone —
+                            // keep the form open with the reason
+                            // instead of silently discarding the
+                            // edit behind a "Camera saved" toast.
+                            form.error = Some(
+                                "That camera no longer exists — it may have been deleted.".to_string(),
+                            );
+                            self.cam_form = Some(form);
+                            return;
+                        }
                     }
                 } else {
                     self.cfg.cameras.push(cam);
@@ -5520,20 +6605,28 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_style(ctx);
         self.poll_net();
+        // Tray + close behaviour (v1.2.1): poll tray events, turn a
+        // close into a hide when close-to-tray is on.
+        self.handle_window_chrome(ctx, frame);
         // Live previews (v1.2.0): reconcile pumps and upload the
         // latest frames as textures before anything renders.
         self.sync_pumps(ctx);
         // Drag & drop bookkeeping runs BEFORE rendering, hit-testing
-        // against last frame's card geometry.
-        if self.drag.is_some() {
+        // against last frame's card geometry. It also runs while a
+        // press is merely PENDING (v1.2.1), which is when promotion
+        // (or quiet cancellation) happens.
+        if self.drag.is_some() || self.drag_pending.is_some() {
             self.update_drag(ctx);
         }
         // A verified installer download: run it, then exit so the
         // per-user installer can replace this app while it isn't running.
         if let Some(path) = self.update_launch.take() {
+            // An installer exit is a real exit — close-to-tray must
+            // not turn it into a hide.
+            self.quitting = true;
             match Command::new(&path).spawn() {
                 Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(e) => {
@@ -5624,11 +6717,22 @@ impl Drop for App {
 }
 
 fn main() -> eframe::Result<()> {
+    // Launch flags (v1.2.1): the autostart Run command carries
+    // --minimized / --maximized per the Settings launch mode, and
+    // the same flags work for manual (shortcut) launches.
+    let launch = launch_mode_from_args(&std::env::args().collect::<Vec<String>>());
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("SmartLife & Tuya Desktop")
+        .with_inner_size([1120.0, 780.0])
+        .with_min_inner_size([720.0, 520.0]);
+    match launch {
+        // Minimized = hidden in the tray from the very first frame.
+        LaunchMode::Minimized => viewport = viewport.with_visible(false),
+        LaunchMode::Maximized => viewport = viewport.with_maximized(true),
+        LaunchMode::Normal => {}
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("SmartLife & Tuya Desktop")
-            .with_inner_size([1120.0, 780.0])
-            .with_min_inner_size([720.0, 520.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -5723,9 +6827,10 @@ mod tests {
         let c = cam("tapo1", "");
         let entries = vec![device_entry(&b), device_entry(&plug), camera_entry(&c)];
         let secs = build_sections(&entries, &LayoutCfg::default(), false, "");
-        assert_eq!(keys(&secs), vec!["lighting", "cameras", "ungrouped"]);
-        assert_eq!(secs[0].ids, vec!["lb".to_string()]);
-        assert_eq!(secs[1].ids, vec!["cam:1".to_string()]);
+        // v1.2.1 default section order: Cameras first.
+        assert_eq!(keys(&secs), vec!["cameras", "lighting", "ungrouped"]);
+        assert_eq!(secs[0].ids, vec!["cam:1".to_string()]);
+        assert_eq!(secs[1].ids, vec!["lb".to_string()]);
         assert_eq!(secs[2].ids, vec!["p1".to_string()]);
         assert!(device_is_light(&b));
         assert!(!device_is_light(&plug));
@@ -5791,7 +6896,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.2.0");
+        assert_eq!(APP_VERSION, "1.2.1");
     }
 
     #[test]
@@ -5970,5 +7075,348 @@ mod tests {
             expected_installer_name(&info.version)
         );
         assert!(parse_release(&json!({ "tag_name": "v1.2.0", "html_url": "x", "assets": [] })).is_none());
+    }
+
+    // ---------------- v1.2.1: section order ----------------
+
+    fn full_entry_set() -> Vec<CardEntry> {
+        // bulb (Lighting + pinnable), plug p1 (the group's member),
+        // plug p2 (stays Ungrouped), a camera, a scene — so every
+        // section kind has a member (empty sections are retained
+        // out of the non-editing model).
+        let b = bulb("lb", "Bright bulb");
+        let p1 = dev("p1", "Plug one", json!({ "state": false }));
+        let p2 = dev("p2", "Plug two", json!({ "state": false }));
+        let c = cam("tapo1", "");
+        let mut sc = dev("s1", "Movie night", json!({ "state": false }));
+        sc.is_scene = true;
+        vec![
+            device_entry(&b),
+            device_entry(&p1),
+            device_entry(&p2),
+            camera_entry(&c),
+            device_entry(&sc),
+        ]
+    }
+
+    fn grouped_layout() -> LayoutCfg {
+        let mut layout = layout_with_group();
+        layout.pins.push("lb".into());
+        layout.assign.insert("p1".into(), "g1".into());
+        layout
+    }
+
+    #[test]
+    fn section_order_default_cameras_first() {
+        let layout = grouped_layout();
+        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        assert_eq!(
+            keys(&secs),
+            vec!["cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
+        );
+        // And default_section_seq over the same list agrees.
+        assert_eq!(
+            default_section_seq(&secs),
+            vec!["cameras", "pinned", "lighting", "group:g1", "ungrouped", "scenes"]
+        );
+    }
+
+    #[test]
+    fn section_order_stored_wins() {
+        let mut layout = LayoutCfg::default();
+        layout.section_seq = vec![
+            "scenes".into(),
+            "ungrouped".into(),
+            "lighting".into(),
+            "cameras".into(),
+        ];
+        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        assert_eq!(keys(&secs), vec!["scenes", "ungrouped", "lighting", "cameras"]);
+    }
+
+    #[test]
+    fn section_order_new_sections_slot_by_default() {
+        // Stored order knows only Scenes + Lighting (say it was saved
+        // before any camera/pin/group existed). Everything missing
+        // slots in by the default order around them.
+        let mut layout = grouped_layout();
+        layout.section_seq = vec!["scenes".into(), "lighting".into()];
+        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        // cameras (front, no predecessor) → pinned (after cameras) →
+        // scenes → lighting (stored relative order) → group (after
+        // lighting) → ungrouped (after the group).
+        assert_eq!(
+            keys(&secs),
+            vec!["cameras", "pinned", "scenes", "lighting", "g1", "ungrouped"]
+        );
+    }
+
+    #[test]
+    fn section_move_and_layout_persistence_roundtrip() {
+        // Moving within the RENDERED list, ends are no-ops, and the
+        // result survives a serde round-trip of the whole layout.
+        let mut layout = grouped_layout();
+        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        assert_eq!(
+            keys(&secs),
+            vec!["cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
+        );
+        // Move Ungrouped up one: it swaps with the group.
+        let seq = moved_section_seq(&layout.section_seq, &secs, "ungrouped", -1);
+        assert_eq!(
+            seq,
+            vec!["cameras", "pinned", "lighting", "ungrouped", "group:g1", "scenes"]
+        );
+        let seq2 = moved_section_seq(&seq, &secs, "cameras", -1);
+        assert_eq!(seq2, seq); // already first: no-op
+        let seq3 = moved_section_seq(&seq, &secs, "scenes", 1);
+        assert_eq!(seq3, seq); // already last: no-op
+        // Stored keys for sections that aren't rendered right now
+        // are re-appended, not forgotten.
+        let mut layout2 = LayoutCfg::default();
+        layout2.assign.insert("p1".into(), "g1".into());
+        layout2.groups.push(Group { id: "g1".into(), name: "Kitchen".into() });
+        let secs_no_pins = build_sections(&full_entry_set(), &layout2, false, "");
+        let with_extra = vec!["pinned".to_string()];
+        let seq4 = moved_section_seq(&with_extra, &secs_no_pins, "cameras", 1);
+        assert_eq!(seq4.last().map(|s| s.as_str()), Some("pinned"));
+
+        layout.section_seq = seq.clone();
+        layout.cam_sizes.insert("cam:1".into(), "wide".into());
+        let text = serde_json::to_string(&layout).unwrap();
+        let back: LayoutCfg = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.section_seq, layout.section_seq);
+        assert_eq!(back.cam_sizes.get("cam:1").map(|s| s.as_str()), Some("wide"));
+        // And a rebuild with the round-tripped layout honours it:
+        // pinned has moved with the bulb, ungrouped sits above g1.
+        let secs2 = build_sections(&full_entry_set(), &back, false, "");
+        assert_eq!(
+            keys(&secs2),
+            vec!["cameras", "pinned", "lighting", "ungrouped", "g1", "scenes"]
+        );
+    }
+
+    // ---------------- v1.2.1: camera ids, edit/delete ----------------
+
+    #[test]
+    fn camera_ids_generated_unique() {
+        let mut seen = HashSet::new();
+        for _ in 0..2000 {
+            assert!(seen.insert(new_camera_id()), "id collision");
+        }
+    }
+
+    #[test]
+    fn camera_repair_and_targeted_delete() {
+        // The reported failure, at the model layer: two cameras
+        // sharing ONE timestamp id (as pre-1.2.1 builds could store)
+        // and identical display names.
+        let mk = |id: &str, host: &str| Camera {
+            id: id.into(),
+            name: "Parking Lot".into(),
+            user: "u".into(),
+            password: obfuscate("p"),
+            host: host.into(),
+            port: 554,
+            template: "tapo1".into(),
+            path: String::new(),
+        };
+        let mut cams = vec![mk("1699999999999", "10.0.0.1"), mk("1699999999999", "10.0.0.2"), mk("42", "10.0.0.3")];
+        let mut layout = LayoutCfg::default();
+        layout.pins.push("cam:1699999999999".into());
+        let mut n = 0;
+        let mut gen = || {
+            n += 1;
+            format!("fresh-{}", n)
+        };
+        assert!(repair_camera_ids(&mut cams, &layout, &mut gen));
+        // First keeps the shared id (and the layout entries pinned
+        // to it); the duplicate gets a fresh one; unique ids stay.
+        assert_eq!(cams[0].id, "1699999999999");
+        assert_eq!(cams[1].id, "fresh-1");
+        assert_eq!(cams[2].id, "42");
+        assert_eq!(layout.pins, vec!["cam:1699999999999".to_string()]);
+        // Repair is idempotent.
+        let mut gen2 = || "unused".to_string();
+        assert!(!repair_camera_ids(&mut cams, &layout, &mut gen2));
+        // Edit targeting: resolving the second camera by ITS item id
+        // reaches the second record (10.0.0.2), never the first.
+        let idx = cams
+            .iter()
+            .position(|c| format!("cam:{}", c.id) == "cam:fresh-1")
+            .unwrap();
+        assert_eq!(cams[idx].host, "10.0.0.2");
+        // A missing/blank id is repaired too.
+        let mut cams2 = vec![mk("", "10.0.0.9")];
+        let mut gen3 = || "fresh-x".to_string();
+        assert!(repair_camera_ids(&mut cams2, &layout, &mut gen3));
+        assert_eq!(cams2[0].id, "fresh-x");
+
+        // Delete: only the targeted camera goes, and its layout
+        // entries (including size) are cleaned.
+        layout.cam_sizes.insert("cam:fresh-1".into(), "large".into());
+        layout.hidden.push("cam:fresh-1".into());
+        let removed = remove_camera_record(&mut cams, &mut layout, "cam:fresh-1");
+        assert_eq!(removed.unwrap().host, "10.0.0.2");
+        assert_eq!(cams.len(), 2);
+        assert!(cams.iter().all(|c| c.host != "10.0.0.2"));
+        assert!(!layout.cam_sizes.contains_key("cam:fresh-1"));
+        assert!(!layout.hidden.contains(&"cam:fresh-1".to_string()));
+        // Deleting an unknown id removes nothing and says so (None).
+        assert!(remove_camera_record(&mut cams, &mut layout, "cam:nope").is_none());
+        assert_eq!(cams.len(), 2);
+        // The first camera survived with its pin intact.
+        assert_eq!(cams[0].host, "10.0.0.1");
+        assert_eq!(layout.pins, vec!["cam:1699999999999".to_string()]);
+    }
+
+    // ---------------- v1.2.1: camera sizes ----------------
+
+    #[test]
+    fn cam_size_span_and_tile_feed() {
+        assert_eq!(CamSize::Normal.span(4), 1);
+        assert_eq!(CamSize::Large.span(4), 2);
+        assert_eq!(CamSize::Wide.span(4), 4);
+        assert_eq!(CamSize::Large.span(1), 1); // clamped to the grid
+        assert_eq!(CamSize::Wide.span(1), 1);
+        assert_eq!(CamSize::parse(Some(&"large".to_string())), CamSize::Large);
+        assert_eq!(CamSize::parse(Some(&"wide".to_string())), CamSize::Wide);
+        assert_eq!(CamSize::parse(Some(&"huge".to_string())), CamSize::Normal);
+        assert_eq!(CamSize::parse(None), CamSize::Normal);
+
+        // Normal: SD stream at 480×270. Large: same SD source, bigger
+        // pump. Wide: the card's selected quality at 960×540.
+        let (u, w, h) = tile_feed(&cam("tapo1", ""), CamSize::Normal);
+        assert!(u.ends_with("/stream2"));
+        assert_eq!((w, h), (480, 270));
+        let (u, w, h) = tile_feed(&cam("tapo1", ""), CamSize::Large);
+        assert!(u.ends_with("/stream2"));
+        assert_eq!((w, h), (960, 540));
+        let (u, w, h) = tile_feed(&cam("tapo1", ""), CamSize::Wide);
+        assert!(u.ends_with("/stream1"));
+        assert_eq!((w, h), (960, 540));
+        let (u, _, _) = tile_feed(&cam("tapo2", ""), CamSize::Wide);
+        assert!(u.ends_with("/stream2"));
+        let (u, w, h) = tile_feed(&cam("custom", "live/ch1"), CamSize::Normal);
+        assert!(u.ends_with("/live/ch1"));
+        assert_eq!((w, h), (480, 270));
+    }
+
+    #[test]
+    fn pack_rows_with_spans() {
+        let items = vec!["a", "b", "c"];
+        // 1-wide, 2-wide, 1-wide in 4 columns: b doesn't fit after
+        // a+b = 3? It does: a(1)+b(2)=3, c would make 4 — fits.
+        let rows = pack_rows(&items, &[1, 2, 1], 4);
+        assert_eq!(rows.len(), 1);
+        // A wide (full-row) item after a normal one starts a new row.
+        let rows = pack_rows(&items, &[1, 3, 1], 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1], vec![("b", 3)]);
+        // Two larges in 3 columns: second wraps.
+        let rows = pack_rows(&items, &[2, 2, 1], 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[1].len(), 2);
+        // Span clamped to the grid width.
+        let rows = pack_rows(&items, &[9, 1, 1], 2);
+        assert_eq!(rows[0], vec![("a", 2)]);
+    }
+
+    #[test]
+    fn drag_promotion_threshold() {
+        let press = egui::Pos2::new(100.0, 100.0);
+        // Click jitter (a few px) must NOT promote — the card stays
+        // in the layout and the click lands on its controls.
+        assert!(!drag_should_promote(press, egui::Pos2::new(102.0, 101.0)));
+        assert!(!drag_should_promote(press, egui::Pos2::new(100.0, 107.9)));
+        // A deliberate drag promotes.
+        assert!(drag_should_promote(press, egui::Pos2::new(100.0, 108.0)));
+        assert!(drag_should_promote(press, egui::Pos2::new(140.0, 100.0)));
+    }
+
+    // ---------------- v1.2.1: startup & tray (pure parts) ----------------
+
+    #[test]
+    fn autostart_command_all_modes_and_off() {
+        let exe = Path::new("C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe");
+        assert_eq!(
+            autostart_command(exe, LaunchMode::Normal),
+            "\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\""
+        );
+        assert_eq!(
+            autostart_command(exe, LaunchMode::Minimized),
+            "\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\" --minimized"
+        );
+        assert_eq!(
+            autostart_command(exe, LaunchMode::Maximized),
+            "\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\" --maximized"
+        );
+        // OFF = no entry at all (None), whatever the mode says.
+        let mut prefs = Prefs::default();
+        assert_eq!(desired_autostart(&prefs, exe), None);
+        prefs.start_with_windows = true;
+        prefs.launch_mode = "minimized".into();
+        assert_eq!(
+            desired_autostart(&prefs, exe).as_deref(),
+            Some("\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\" --minimized")
+        );
+        prefs.launch_mode = "maximized".into();
+        assert!(desired_autostart(&prefs, exe).unwrap().ends_with("--maximized"));
+        prefs.launch_mode = "normal".into();
+        assert!(!desired_autostart(&prefs, exe).unwrap().contains("--"));
+        // Round-trips: mode survives command construction + parsing.
+        for m in [LaunchMode::Normal, LaunchMode::Minimized, LaunchMode::Maximized] {
+            assert_eq!(launch_mode_from_command(&autostart_command(exe, m)), m);
+            assert_eq!(LaunchMode::parse(m.as_str()), m);
+        }
+    }
+
+    #[test]
+    fn launch_flag_parsing() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(launch_mode_from_args(&args(&["app.exe"])), LaunchMode::Normal);
+        assert_eq!(
+            launch_mode_from_args(&args(&["app.exe", "--minimized"])),
+            LaunchMode::Minimized
+        );
+        assert_eq!(
+            launch_mode_from_args(&args(&["app.exe", "--maximized"])),
+            LaunchMode::Maximized
+        );
+        assert_eq!(
+            launch_mode_from_args(&args(&["app.exe", "--maximized", "--minimized"])),
+            LaunchMode::Minimized // minimized wins ties
+        );
+        assert_eq!(
+            launch_mode_from_args(&args(&["app.exe", "--something-else"])),
+            LaunchMode::Normal
+        );
+    }
+
+    #[test]
+    fn reg_named_value_parsing() {
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    SmartLifeTuyaDesktop    REG_SZ    \"C:\\Users\\Shawn\\app.exe\" --minimized\r\n    OtherApp    REG_SZ    C:\\other.exe\r\n\r\n";
+        assert_eq!(
+            parse_reg_named_value(out, "SmartLifeTuyaDesktop").as_deref(),
+            Some("\"C:\\Users\\Shawn\\app.exe\" --minimized")
+        );
+        assert_eq!(
+            parse_reg_named_value(out, "OtherApp").as_deref(),
+            Some("C:\\other.exe")
+        );
+        assert_eq!(parse_reg_named_value(out, "Missing"), None);
+        assert_eq!(parse_reg_named_value("ERROR: not found", "SmartLifeTuyaDesktop"), None);
+        assert_eq!(parse_reg_named_value("", "SmartLifeTuyaDesktop"), None);
+    }
+
+    #[test]
+    fn close_action_logic() {
+        assert_eq!(close_action(false, false), CloseAction::Quit);
+        assert_eq!(close_action(true, false), CloseAction::HideToTray);
+        // A real Quit (tray menu / installer) always wins over
+        // close-to-tray.
+        assert_eq!(close_action(true, true), CloseAction::Quit);
+        assert_eq!(close_action(false, true), CloseAction::Quit);
     }
 }

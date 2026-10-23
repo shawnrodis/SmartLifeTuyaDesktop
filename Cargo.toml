@@ -1,6 +1,6 @@
 [package]
 name = "smartlife-tuya-desktop"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "SmartLife & Tuya Desktop - a clean dashboard for Smart Life / Tuya devices (Windows edition)"
@@ -16,6 +16,23 @@ chrono = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# System-tray icon + menu for the Windows startup/tray behaviour —
+# a Windows-only feature, so the dependency is Windows-only too
+# (on Linux it would drag in GTK system libraries for nothing; its
+# Windows transitive deps are muda + windows-sys bindings only).
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.19"
+# HWND extraction (eframe already pulls this crate in; naming it
+# makes the type usable) and the Shell_NotifyIcon bindings for the
+# one-time tray balloon (same windows-sys muda already brings in).
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 opt-level = 3
