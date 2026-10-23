@@ -31,6 +31,11 @@ customisable interface they always deserved.
   <br><em>The dashboard itself — Cameras, the Lighting section with group-wide controls, and the device cards. (Camera feed blurred for privacy.)</em>
 </p>
 
+<p align="center">
+  <img src="docs/camera-tile-wide.jpg" alt="The camera tile resized to full-row Wide on a portrait monitor, above the Lighting section" width="560">
+  <br><em>Camera tiles resize — Normal, Large, or full-row Wide, as here. The feed watches the lot while the lights wait below. (Feed blurred for privacy.)</em>
+</p>
+
 ## Download (Windows)
 
 Grab `SmartLifeTuyaDesktop-Setup-v1.2.1.exe` from
