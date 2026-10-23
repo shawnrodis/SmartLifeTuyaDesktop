@@ -88,6 +88,37 @@ instructions below.)
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.2.2
+
+- **Fixed: system tray (Windows app).** Launching the app while it was
+  already running hidden in the tray no longer starts a second copy —
+  the app is single-instance now: a repeat launch just brings the
+  running window back (visible, un-minimized, focused) and exits.
+  That also ends the multiplying tray icons, and the tray's Open /
+  Quit and left-click restore work reliably (tray events are pumped
+  on a short heartbeat while the window is hidden, and Quit removes
+  the icon before exiting).
+- **Fixed: camera tiles stuck on "Feed unavailable".** A tile whose
+  camera address changed (e.g. DHCP gave it a new IP) restarts its
+  stream from the current settings immediately; retries back off
+  2s → 4s → 8s at most (was up to 15s) and reset the moment the
+  window is focused again, you click the tile or Watch, or the big
+  player connects. "Feed unavailable" is now a **Retry** button, and
+  after repeated failures the tile shows why in small print (e.g.
+  "Connection refused", "401 Unauthorized"). Opening the big player
+  also pauses that camera's tile stream — Tapo cameras only allow
+  about two concurrent streams — and the tile resumes when it closes.
+- **Fixed: brightness slider vanishing from light cards (both
+  editions).** A refresh payload that reports placeholder values
+  (brightness missing, colour temperature 0) no longer wipes the
+  controls: sliders follow what a light *can* do, values keep their
+  last-known readings through thin refreshes, lights no longer all
+  snap to 2700K, and the Lighting header keeps both sliders too.
+- **Fixed: names truncating on wide cards (Windows app).** Device,
+  camera and scene names now lay out against the card's real width —
+  the space reserved for the pin/toggle/hide buttons was over-counted
+  — so wide cards show full names again.
+
 ## What's new in 1.2.1
 
 - **Fixed: camera Edit/Delete buttons that didn't respond in Edit mode**

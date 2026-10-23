@@ -107,7 +107,14 @@ column max width: 760px.
   every cell is allocated the full width × row height and the card frame
   fills the cell, content top-aligned. Card headers reserve a fixed
   trailing width for pin/toggle/hide so names truncate with an ellipsis
-  and never overlap the controls.
+  and never overlap the controls. (v1.2.2: the reserves are the
+  MEASURED footprints of those controls under the app's styles —
+  device 104px, camera 48px, scene 24px including the gap before
+  them; the earlier hand-set reserves over-counted by ~15–23px and,
+  against the 40px budget floor, truncated names to "De…" on
+  ordinary-width cards. The budget is a pure function of the cell's
+  real remaining width, so wider cells widen names 1:1. The web
+  edition needs no equivalent: CSS ellipsis at true overflow.)
 - **Camera card sizes (v1.2.1).** A per-camera size (stored in the
   layout, keyed by camera id): **Normal** = one grid cell, **Large** =
   2 columns, **Wide** = the full row; everything else is not
@@ -149,6 +156,26 @@ column max width: 760px.
   tile's pause/play overlay is a PAINTED icon — two rounded bars or a
   triangle inside a small (~28px) translucent rounded chip — never a
   font glyph (the ⏸ symbol-font rendering was a chunky blob).
+- **Pump recovery (v1.2.2).** A tile/player pump's stream URL is
+  derived from the CURRENT camera record on every reconcile, and the
+  reconcile key includes a per-camera edit generation: saving a
+  camera (host, port, template, quality, credentials — even with the
+  id unchanged) restarts its pump immediately with backoff reset.
+  Failures back off 2s → 4s → 8s cap; the backoff resets to an
+  immediate retry when the window is shown/focused again, the user
+  clicks the tile or Watch, a player connection for that camera
+  succeeds, or the record changes. The "Feed unavailable" state is a
+  clickable **Retry** button (tile and player); after repeated
+  failures the last ffmpeg failure reason (mapped from its stderr:
+  "Connection refused", "401 Unauthorized", "Connection timed out",
+  "Host not found", "Stream path not found (404)", "Connection
+  reset by camera") shows as small sub-text. **Session contention:**
+  Tapo cameras allow only ~2 concurrent RTSP sessions, so while the
+  in-app player shows a camera, that camera's tile pump stands down
+  (its last frame is held on the tile) and resumes when the player
+  closes; external-player hand-offs leave the tile alone. Duplicate
+  app processes used to hog those sessions invisibly — the
+  single-instance guard below removes that whole class.
 - **Rate limiting (v1.2.0).** Rate-limit responses
   (`FrequentlyInvoke`) are NEVER shown to the user — no toast, banner
   or status line, in either edition. Discovery falls back to the
@@ -160,6 +187,21 @@ column max width: 760px.
   retry for extra spacing, and their summary toast names only genuine
   failures. Genuine errors (offline, rejected) are still reported
   exactly as before.
+- **Discovery merging & control capability (v1.2.2, both editions).**
+  Whether a card or group header shows a brightness / colour-temp
+  slider follows the device's parse-time CAPABILITY flags (field
+  presence in the merged record), never the current value. Merging a
+  fresh discovery onto the previous list keeps the last-known value
+  for any field the fresh payload omits OR reports as a placeholder
+  (JSON null; brightness / colour temp of 0 — some Tuya payloads
+  carry those stubs while the real reading is unknown, and `0` used
+  to parse as the 2700K slider floor). A capable control with no
+  known value renders at a neutral default (brightness 100%, temp
+  slider 5500 ≈ 4600K); group headers average members that have
+  readings and fall back to the same neutrals. Every discovery is
+  merged — including the post-login one (v1.2.1 ran it against an
+  empty previous list, so a thin payload could replace the full
+  state wholesale and become the new merge anchor).
 - A pinned device shows as a full working card in Pinned **and** stays in
   its normal section. Scenes can't be pinned or grouped; they always live
   in Scenes.
@@ -193,6 +235,27 @@ column max width: 760px.
   the window; the right-click menu offers Open and Quit (Quit stops
   the pumps, saves and truly exits, as does the updater's installer
   hand-off). Logging out does not quit the app.
+- **Single instance & tray event pumping (v1.2.2) — Windows.** The
+  app is single-instance: the first process holds the named mutex
+  `SmartLifeTuyaDesktop.SingleInstance` for its lifetime. A later
+  launch creates neither window nor tray icon: it sets the named
+  auto-reset event `SmartLifeTuyaDesktop.ShowWindow`, which the
+  primary's waiter thread turns into an atomic flag + a repaint
+  poke, and exits immediately. The primary consumes the flag through
+  the same restore path as tray Open: `Visible(true)` +
+  `Minimized(false)` + `Focus` (v1.2.1 omitted `Minimized(false)`,
+  so a taskbar-minimized window stayed minimized). Stale guards are
+  impossible — the kernel releases the mutex when the owner process
+  dies. Tray and menu events arrive on process-global channels and
+  are drained at the top of every frame; while the window is hidden
+  a 200 ms repaint heartbeat keeps frames coming so Open/Quit and
+  the ShowWindow flag are handled promptly (a hidden window gets no
+  paint-driven frames of its own). Exactly one tray icon exists per
+  process — created once, never re-created on hide/show/toggle
+  cycles — and Quit drops it explicitly before exiting so no
+  phantom icon remains. v1.2.1 had none of this: each Start Menu
+  launch while hidden spawned another process + icon, and the
+  hidden original's tray events sat unread.
 - **Auto-update.** Both editions share one version number and check
   `api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest`
   on launch, at most once per 24h (attempt-based, stored locally:
