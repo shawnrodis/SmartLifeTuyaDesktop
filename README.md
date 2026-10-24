@@ -105,6 +105,27 @@ instructions below.)
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.3.2
+
+- **Fixed: the Lighting header's colour-temperature slider
+  sent 2700K to every light.** The header slider still spoke
+  pre-1.3.1 units in two places: touching it collapsed its
+  value to the first stop (so the readout snapped to 2700K
+  mid-drag), and releasing it broadcast the raw stop *index*
+  where the fan-out expects the API-scale value — which
+  clamped to the minimum, 2700K, whatever stop you'd actually
+  picked. It now converts the chosen stop exactly like the
+  card sliders do, so a header drag sets every light to the
+  stop you chose (2700 / 3000 / 4000 / 5000 / 6500K).
+- **The header brightness slider was audited end-to-end** and
+  already dispatched correctly (the dragged percent reaches
+  every bulb, device-mapped exactly once). Both header
+  sliders are now covered by tests that drive the real header
+  with simulated drags — in both editions — so the wiring
+  can't silently break again. (The web edition's header
+  wiring was verified by the same drive test; it was not
+  affected.)
+
 ## What's new in 1.3.1
 
 - **Fixed: Snap to monitor didn't move the window.** On

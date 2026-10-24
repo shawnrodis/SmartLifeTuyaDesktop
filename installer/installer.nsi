@@ -4,7 +4,7 @@
 ; Add/Remove Programs entry.
 
 !define APP_NAME "SmartLife & Tuya Desktop"
-!define APP_VERSION "1.3.1"
+!define APP_VERSION "1.3.2"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/SmartLifeTuyaDesktop"
 
