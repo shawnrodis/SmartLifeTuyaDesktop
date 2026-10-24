@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="black">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.2.4">
+<meta name="version" content="1.3.0">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -150,6 +150,20 @@
   .group-controls .gc-slider{min-width:190px; flex:1 1 190px; max-width:300px}
   .group-controls .ctl{margin-top:0}
   .group-controls .swatches{margin-top:6px}
+  /* Snap-to-monitor popup (v1.3.0): lists the OS screens (Window
+     Management API); mirrors the Windows edition's header menu. */
+  #snap-menu{
+    position:fixed; z-index:60; width:300px; padding:6px;
+    background:var(--card); border:1px solid var(--card-border); border-radius:14px;
+  }
+  .snap-item{
+    display:block; width:100%; text-align:left; background:transparent; border:none;
+    padding:8px 10px; border-radius:9px; cursor:pointer; color:var(--text); font:inherit;
+  }
+  .snap-item:hover{background:var(--accent-soft)}
+  .snap-name{font-weight:700; font-size:13.5px}
+  .snap-meta{font-size:12px; color:var(--text-dim); margin-top:2px}
+  .snap-empty{padding:8px 10px; font-size:12.5px; color:var(--text-dim)}
   /* Update banner (dashboard, dismissible per version) */
   #update-banner{
     display:flex; align-items:center; gap:10px; flex-wrap:wrap;
@@ -406,11 +420,13 @@
           <option value="120">2 min</option>
         </select>
         <button class="btn" id="btn-refresh">↻ Refresh</button>
+        <button class="btn hidden" id="btn-monitor">🖥 Monitor</button>
         <button class="btn" id="btn-edit">✎ Edit</button>
         <button class="btn" id="btn-settings">⚙ Settings</button>
         <button class="btn" id="btn-logout">Log out</button>
       </div>
     </header>
+    <div id="snap-menu" class="hidden" role="menu"></div>
     <div id="editbar" class="hidden">
       <span>✎ <b>Edit mode</b> — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.</span>
       <button class="btn small" id="btn-addgroup">＋ New group</button>
@@ -471,7 +487,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.2.4</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.3.0</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -854,7 +870,10 @@ function parseDevice(raw) {
     iconKind: TYPE_ICONS[iconKind] ? iconKind : (TYPE_ICONS[devType] ? devType : "default"),
     isScene: isScene,
     online: data.online !== false,
-    state: data.state === true,
+    /* v1.3.0 (Fix A): lights report state as the STRING "true"/"false"
+       (switches use a real bool) — demanding === true read every
+       light as Off. Accept both wire formats. */
+    state: data.state === true || data.state === "true",
     hasBrightness: hasBrightness,
     hasTemp: hasTemp,
     hasColor: hasColor,
@@ -919,7 +938,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.2.4";
+var APP_VERSION = "1.3.0";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1073,15 +1092,16 @@ function filterDevices(devices, layout, query) {
 function isLightCapable(d) {
   return !!(!d.isCamera && !d.isScene && (d.hasBrightness || d.hasTemp || d.hasColor));
 }
-/* Brightness CONTROL capability (v1.2.3): a device can be dimmed
-   when it reports a standalone brightness field OR when it takes
-   colour — a colour device's brightness is the V of the HSV colour
-   it already accepts via colorSet. RGB strips report hue/saturation
-   but no standalone brightness (and no colour_temp), so gating the
-   slider on hasBrightness alone left them colour-only; colour
-   temperature stays genuinely unsupported for them via this API. */
+/* Brightness capability (v1.3.0 — reversal of the v1.2.3
+   synthesis): a device can be dimmed only when the API natively
+   reports a brightness field. A colour-only strip (hue/saturation
+   but no brightness, no color_temp) gets NO brightness slider and
+   is never sent a brightness command: the legacy API surfaces
+   on/off + colour only for it, exactly as the reference shows.
+   (The strip hardware can dim via other channels; this API
+   doesn't expose it. See DESIGN.md.) */
 function hasBrightnessControl(d) {
-  return !!(d.hasBrightness || d.hasColor);
+  return !!d.hasBrightness;
 }
 /* The "no explicit group" label for an item: light-capable devices
    live in the automatic Lighting section, cameras in the automatic
@@ -1237,26 +1257,16 @@ function groupAverage(members, pick) {
   });
   return n ? sum / n : null;
 }
-/* What a brightness move sends for this device (v1.2.3):
-   brightnessSet for a real brightness field; for a colour-only
-   device a colorSet preserving its CURRENT hue/saturation with the
-   new percent as the HSV brightness — its only brightness
-   dimension. Shared by the card slider (doBrightness) and the group
-   fan-out (groupPlan) so the two can never drift apart. */
+/* What a brightness move sends (v1.3.0): always a plain
+   brightnessSet — the colour-route synthesis of v1.2.3 is gone,
+   and callers only reach here for devices with a native
+   brightness field. Shared by the card slider (doBrightness) and
+   the group fan-out (groupPlan) so the two can never drift apart.
+   Brightness floor is 1% (v1.2.3): the old 11% floor came from
+   the reference implementation's slider, not from the devices. */
 function brightnessCommand(device, pct) {
-  /* Brightness floor is 1% (v1.2.3): the old 11% floor came from
-     the reference implementation's slider, not from the devices. */
   pct = clamp(Math.round(pct), 1, 100);
-  if (device.hasBrightness) return { action: "brightnessSet", value: pct };
-  return {
-    action: "colorSet",
-    value: {
-      hue: device.hue !== null && device.hue !== undefined ? device.hue : 0,
-      saturation: device.saturation !== null && device.saturation !== undefined
-        ? Math.round(device.saturation * 100) / 100 : 0,
-      brightness: pct
-    }
-  };
+  return { action: "brightnessSet", value: pct };
 }
 
 /* The fan-out plan for one group action. kind: "toggle" | "brightness"
@@ -1271,9 +1281,9 @@ function groupPlan(members, kind, value) {
     devs.forEach(function (d) { plan.push({ id: d.id, action: "turnOnOff", value: target }); });
   } else if (kind === "brightness") {
     var pct = clamp(Math.round(value), 1, 100);
-    // Every dimmable member takes part (v1.2.3): field devices get
-    // brightnessSet, colour-only members get a hue-preserving
-    // colorSet at the same percent.
+    // Only members with a native brightness field take part
+    // (v1.3.0): a colour-only strip is excluded here — it still
+    // joins toggle and color broadcasts.
     devs.filter(function (d) { return hasBrightnessControl(d); })
       .forEach(function (d) {
         var cmd = brightnessCommand(d, pct);
@@ -1428,7 +1438,9 @@ var S = {
 
 function defaultPrefs() {
   return {
-    theme: "dark", accent: "#6366f1", density: "comfortable",
+    /* Fresh-install default theme is Black (v1.3.0); a stored
+       preference overrides this in loadPrefs. */
+    theme: "black", accent: "#6366f1", density: "comfortable",
     autorefresh: true, interval: 30,
     proxyPreset: "auto", proxyCustom: "",
     gatewayUrl: "", gatewayType: "go2rtc",
@@ -1694,13 +1706,11 @@ function applyOptimistic(device, action, value) {
     device.colorMode = "white"; data.color_mode = "white";
   } else if (action === "colorSet") {
     device.hue = value.hue; device.saturation = value.saturation;
-    // A colorSet always carries the HSV brightness it set
-    // (v1.2.3): record it as the last-known brightness so a
-    // colour-only device's slider — and the group average —
-    // reflect it. Deliberately NOT written into raw data: the
-    // device never reported a standalone brightness field, and
-    // inventing one would corrupt the capability model on re-parse.
-    if (value.brightness !== null && value.brightness !== undefined) device.brightnessPct = value.brightness;
+    // The colorSet payload carries an HSV brightness component
+    // (the API requires the field), but it is NOT recorded as a
+    // brightness reading (v1.3.0): a colour-only device has no
+    // brightness state in this app — no slider, no group average —
+    // because the API never reports one back.
     device.state = true; data.state = true;
     device.colorMode = "colour"; data.color_mode = "colour";
     data.hue = value.hue; data.saturation = value.saturation;
@@ -1733,6 +1743,64 @@ async function runGroupAction(sec, kind, value) {
     toast(sec.title + ": " + okCount + " of " + plan.length + " updated — " + failedNames.join(", ") + " didn't respond", true);
   }
   fetchDevices(true);
+}
+
+/* ---------------- Snap to monitor (v1.3.0, web edition) ---------
+   A page cannot move its window across monitors. Where the Window
+   Management API exists (Chrome/Edge: window.getScreenDetails),
+   the 🖥 Monitor button lists the screens and choosing one
+   requests fullscreen on that screen — the closest a page can
+   get. Where the API is absent, the button stays hidden. (Stated
+   deviation from the Windows edition's true move+maximize; see
+   DESIGN.md.) Nothing is persisted; the choice is click-time only. */
+function snapSupported() { return typeof window.getScreenDetails === "function"; }
+var snapScreens = null;
+async function openSnapMenu() {
+  var menu = $("snap-menu");
+  if (!menu.classList.contains("hidden")) { closeSnapMenu(); return; }
+  var details;
+  try {
+    details = await window.getScreenDetails();
+  } catch (e) {
+    toast("Display access was denied, so screens can't be listed", true);
+    return;
+  }
+  snapScreens = details;
+  renderSnapMenu();
+  var r = $("btn-monitor").getBoundingClientRect();
+  menu.style.left = Math.max(8, r.right - 300) + "px";
+  menu.style.top = (r.bottom + 6) + "px";
+  menu.classList.remove("hidden");
+  if (details.addEventListener) details.addEventListener("screenschange", renderSnapMenu);
+}
+function closeSnapMenu() { $("snap-menu").classList.add("hidden"); }
+function renderSnapMenu() {
+  var menu = $("snap-menu");
+  menu.innerHTML = "";
+  if (!snapScreens || !snapScreens.screens.length) {
+    menu.appendChild(el("div", "snap-empty", "No displays found"));
+    return;
+  }
+  snapScreens.screens.forEach(function (s, i) {
+    var name = s.label || ("Display " + (i + 1));
+    var meta = s.width + " × " + s.height
+      + (s.height > s.width ? " · Portrait" : " · Landscape")
+      + (s.isPrimary ? " · Primary" : "")
+      + (snapScreens.currentScreen === s ? " · This window is here" : "");
+    var item = el("button", "snap-item");
+    item.appendChild(el("div", "snap-name", name));
+    item.appendChild(el("div", "snap-meta", meta));
+    item.addEventListener("click", function () { snapToScreen(s); });
+    menu.appendChild(item);
+  });
+}
+async function snapToScreen(screen) {
+  closeSnapMenu();
+  try {
+    await document.documentElement.requestFullscreen({ screen: screen });
+  } catch (e) {
+    toast("Fullscreen on that display was denied", true);
+  }
 }
 
 /* ---------------- Auto-update runtime ---------------- */
@@ -1805,10 +1873,9 @@ function doSceneStart(device) {
   });
 }
 function doBrightness(device, pct) {
-  // brightnessSet, or a hue-preserving colorSet for colour-only
-  // devices (v1.2.3) — brightnessCommand decides, and the
-  // optimistic local mutations are exactly applyOptimistic's for
-  // the chosen action.
+  // Plain brightnessSet (v1.3.0) — only reachable from controls
+  // gated on a native brightness field. The optimistic local
+  // mutations are exactly applyOptimistic's for the action.
   var cmd = brightnessCommand(device, pct);
   sendControl(device, cmd.action, cmd.value, function () {
     applyOptimistic(device, cmd.action, cmd.value);
@@ -1966,13 +2033,12 @@ function renderGroupControls(sec) {
   sw.addEventListener("click", function () { runGroupAction(sec, "toggle"); });
   master.appendChild(sw);
   box.appendChild(master);
-  // brightness — shown when any member is CAPABLE (v1.2.2: never
-  // gated on current values); the value averages members that have
-  // a reading, falling back to a neutral 100%. Membership uses the
-  // CONTROL capability (v1.2.3): a group of nothing but colour-only
-  // strips still gets its slider; members join the average once
-  // they have a brightness value (a strip gains one after any
-  // colour/brightness command — see applyOptimistic).
+  // brightness — shown when any member natively reports the
+  // field (v1.2.2: never gated on current values); the value
+  // averages members that have a reading, falling back to a
+  // neutral 100%. Membership is the native field only (v1.3.0):
+  // a group of nothing but colour-only strips gets NO brightness
+  // slider — the API reports no brightness for them.
   var bMembers = devs.filter(function (d) { return hasBrightnessControl(d); });
   if (bMembers.length) {
     var bVals = bMembers.filter(function (d) { return d.brightnessPct !== null && d.brightnessPct > 0; });
@@ -2132,9 +2198,8 @@ function renderCard(d, sec) {
     if (hasBrightnessControl(d)) {
       // Capability-gated (v1.2.2): a missing/placeholder reading
       // renders at a neutral 100%, never removes the control.
-      // Brightness gates on the CONTROL capability (v1.2.3): a
-      // brightness field OR colour (a strip dims through its HSV
-      // value and shows the same neutral 100% until it has one).
+      // Brightness gates on the NATIVE field (v1.3.0): a
+      // colour-only strip gets colour controls only.
       var bVal = (d.brightnessPct !== null && d.brightnessPct > 0) ? d.brightnessPct : 100;
       var bs = sliderRow("Brightness", 1, 100, Math.max(1, bVal), function (v) { return Math.round(v) + "%"; });
       if (!d.online) bs.input.disabled = true;
@@ -2838,6 +2903,17 @@ function init() {
   $("set-previews").addEventListener("change", function (ev) {
     S.prefs.previews = ev.target.checked; savePrefs(); renderAll();
   });
+  /* Snap to monitor (v1.3.0): the button exists only where the
+     Window Management API does. */
+  if (snapSupported()) {
+    $("btn-monitor").classList.remove("hidden");
+    $("btn-monitor").addEventListener("click", openSnapMenu);
+    document.addEventListener("click", function (ev) {
+      var menu = $("snap-menu");
+      if (!menu.classList.contains("hidden") && !menu.contains(ev.target) && ev.target.id !== "btn-monitor") closeSnapMenu();
+    });
+    document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") closeSnapMenu(); });
+  }
   $("btn-settings").addEventListener("click", showSettings);
   $("btn-back").addEventListener("click", function () { showApp(); renderAll(); });
   $("set-theme").addEventListener("change", function (ev) { S.prefs.theme = ev.target.value; savePrefs(); applyPrefs(); });
