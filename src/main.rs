@@ -584,8 +584,9 @@ fn apply_proxy(url: &str, preset: &str, custom: &str, region: &str) -> String {
 }
 
 // Value scales (identical to the web edition):
-// - device brightness is reported 0..1000; UI % = brightness/10.
-//   brightnessSet sends the % value; its useful range is 1..100.
+// - device brightness is reported 0..1000; device % = brightness/10.
+//   brightnessSet sends a DEVICE-scale % (see the UI<->device mapping
+//   at brightness_ui_to_device: sliders show 1..100, sends run 11..100).
 // - colour temperature is SENT on a 1000..10000 scale labelled 2700K/6500K,
 //   but REPORTED stretched: reported = (sent-1000)*4.033 + 1000.
 // - colour is HSV: hue 0..360, saturation 0..1, brightness = %.
@@ -614,6 +615,46 @@ const TEMP_NEUTRAL_SLIDER: i64 = 5500;
 
 fn temp_slider_to_kelvin(slider: i64) -> i64 {
     ((2700.0 + (clampf(slider as f64, 1000.0, 10000.0) - 1000.0) * (3800.0 / 9000.0)) / 10.0).round() as i64 * 10
+}
+
+/// The five colour-temperature stops (v1.3.1), in Kelvin —
+/// the standard temps from the user's reference chart. Every
+/// colour-temperature slider in the app has exactly these
+/// detents: its value is a stop INDEX (0..=4), and anything
+/// displayed or sent is one of these five values (snapped in
+/// Kelvin space, before the API-scale conversion).
+const TEMP_STOPS_K: [i64; 5] = [2700, 3000, 4000, 5000, 6500];
+
+/// Index of the stop nearest a Kelvin value (ties go to the
+/// lower stop). A device reporting an in-between value (3080K,
+/// 3780K, 3970K...) DISPLAYS at the nearest stop — its stored
+/// reading is not rewritten until the user actually drags.
+fn temp_stop_index(kelvin: i64) -> usize {
+    let mut best = 0;
+    for (i, &s) in TEMP_STOPS_K.iter().enumerate() {
+        if (kelvin - s).abs() < (kelvin - TEMP_STOPS_K[best]).abs() {
+            best = i;
+        }
+    }
+    best
+}
+
+/// The Kelvin stop at a slider index (clamped to the range).
+fn temp_stop_kelvin(index: i64) -> i64 {
+    TEMP_STOPS_K[(index.max(0) as usize).min(TEMP_STOPS_K.len() - 1)]
+}
+
+/// Kelvin -> the API slider scale (the inverse of
+/// temp_slider_to_kelvin): what a colorTemperatureSet sends
+/// for an exact stop.
+fn temp_kelvin_to_slider(kelvin: i64) -> i64 {
+    (1000.0 + (kelvin - 2700) as f64 * 9000.0 / 3800.0).round() as i64
+}
+
+/// The Kelvin a temp reading DISPLAYS as: the nearest stop
+/// (v1.3.1) — used by the card status line.
+fn temp_display_kelvin(temp_slider: i64) -> i64 {
+    TEMP_STOPS_K[temp_stop_index(temp_slider_to_kelvin(temp_slider))]
 }
 
 fn hex_to_hsv(hex: &str) -> (f64, f64, f64) {
@@ -1044,13 +1085,33 @@ fn desired_autostart(prefs: &Prefs, exe: &Path) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Snap to monitor (v1.3.0): a header button lists the displays the
-// OS reports at that moment; choosing one moves the window onto
-// that display and maximizes it there. Click-time only, by
-// design — nothing is persisted, and startup placement is never
-// affected (the v1.2.5 placement memory stays removed). The move
-// sets exactly ONE position — a single interior point of the
-// target monitor — and then issues Maximized, after which the OS
+// Snap to monitor (v1.3.0; mechanism replaced in v1.3.1): a
+// header button lists the displays the OS reports at that
+// moment; choosing one moves the window onto that display and
+// maximizes it there. Click-time only, by design — nothing is
+// persisted, and startup placement is never affected (the
+// v1.2.5 placement memory stays removed).
+//
+// v1.3.0 moved the window with a one-frame burst of egui
+// viewport commands (Fullscreen(false) -> Maximized(false) ->
+// OuterPosition(points) -> Maximized(true)). In the field that
+// never moved the window at all: the target point was computed
+// in points with the TARGET display's scale factor, but winit
+// converts an OuterPosition using the scale factor of the
+// monitor the window is CURRENTLY on — on a mixed-DPI desk
+// (1440p landscape beside a 4K portrait at a higher scale) the
+// converted point landed back inside the SOURCE monitor, and
+// the trailing maximize raced the still-transitioning window
+// state, leaving the window un-maximized where it started.
+//
+// v1.3.1 performs the move in Win32 directly, against the app
+// window's HWND (the tray code already works that way), in
+// PHYSICAL pixels end-to-end — no points conversion anywhere:
+// a per-frame state machine (snap_next / advance_snap) leaves
+// fullscreen/maximized, SetWindowPos-es the window to a single
+// clamped interior point of the target monitor, VERIFIES
+// arrival with MonitorFromWindow (one restore+move retry),
+// and only then ShowWindow(SW_MAXIMIZE) — after which the OS
 // owns the geometry (the monitor's work area), so the result
 // cannot be out of bounds by construction.
 // ---------------------------------------------------------------------------
@@ -1064,6 +1125,9 @@ struct MonitorInfo {
     /// OS device identity ("\\.\DISPLAY1") — the match key when
     /// a choice is re-validated at click time.
     device: String,
+    /// The HMONITOR value (v1.3.1) — the identity a completed
+    /// move is verified against (MonitorFromWindow).
+    handle: isize,
     /// Physical-pixel rect [x, y, w, h] in virtual-desktop
     /// coordinates (origins can be negative).
     rect_px: [i32; 4],
@@ -1073,9 +1137,12 @@ struct MonitorInfo {
 }
 
 /// A monitor rect in egui points ([x, y, w, h]), converted with
-/// the monitor's OWN scale factor — mixed-DPI setups scale each
-/// display differently, and the target's factor is the one that
-/// governs positions on it.
+/// the monitor's OWN scale factor. Used ONLY for the menu's
+/// "this window is here" marker, which compares against the
+/// window centre egui reports — positions egui itself reports
+/// live in this same per-monitor points space, so the marker
+/// is consistent. (The snap MOVE never uses points: v1.3.1,
+/// see snap_target_point_px.)
 fn monitor_rect_points(m: &MonitorInfo) -> [f32; 4] {
     let s = if m.scale > 0.0 { m.scale } else { 1.0 };
     [
@@ -1094,24 +1161,46 @@ fn monitor_orientation(m: &MonitorInfo) -> &'static str {
     }
 }
 
-/// The one point a snap moves the window to: the monitor's
-/// top-left inset by 60 pt, clamped so the point — and the whole
-/// window, when it fits — stays inside the rect with an 8 pt
-/// margin on every side. Negative-coordinate monitors (left of /
-/// above the primary) work unchanged: everything is computed in
-/// the monitor's own rect space.
-fn snap_target_point(m: &MonitorInfo, win_size: [f32; 2]) -> [f32; 2] {
-    let [rx, ry, rw, rh] = monitor_rect_points(m);
+/// The one point a snap moves the window to (v1.3.1), in
+/// PHYSICAL pixels: the monitor's top-left inset by 60 pt
+/// worth of pixels at the monitor's own scale, clamped so the
+/// point — and the whole window, when it fits — stays inside
+/// the rect with an 8 pt margin (also scaled) on every side.
+/// This is the point SetWindowPos receives; physical pixels
+/// are the whole point of the v1.3.1 mechanism (see the
+/// section header above).
+fn snap_target_point_px(m: &MonitorInfo, win_px: [i32; 2]) -> [i32; 2] {
+    let s = if m.scale > 0.0 { m.scale } else { 1.0 };
+    let inset = 60.0 * s;
+    let margin = 8.0 * s;
     [
-        snap_axis(rx, rw, win_size[0]),
-        snap_axis(ry, rh, win_size[1]),
+        snap_axis(
+            m.rect_px[0] as f32,
+            m.rect_px[2] as f32,
+            win_px[0] as f32,
+            inset,
+            margin,
+        )
+        .round() as i32,
+        snap_axis(
+            m.rect_px[1] as f32,
+            m.rect_px[3] as f32,
+            win_px[1] as f32,
+            inset,
+            margin,
+        )
+        .round() as i32,
     ]
 }
 
-fn snap_axis(origin: f32, len: f32, win_len: f32) -> f32 {
-    const INSET: f32 = 60.0;
-    const MARGIN: f32 = 8.0;
-    if len <= 2.0 * MARGIN {
+/// One axis of the snap target: `origin + inset`, clamped so
+/// the point — and the whole window, when it fits — stays
+/// inside [origin, origin+len) with `margin` to spare on every
+/// side. Negative-coordinate monitors (left of / above the
+/// primary) work unchanged: everything is computed in the
+/// monitor's own rect space.
+fn snap_axis(origin: f32, len: f32, win_len: f32, inset: f32, margin: f32) -> f32 {
+    if len <= 2.0 * margin {
         // Degenerate strip of a monitor: its centre is the only
         // surely-interior point.
         return origin + len / 2.0;
@@ -1120,13 +1209,13 @@ fn snap_axis(origin: f32, len: f32, win_len: f32) -> f32 {
     // fits with margins; otherwise keep the point itself inside
     // (the window is maximized immediately after, so the point
     // alone decides the target monitor).
-    let hi = if win_len + 2.0 * MARGIN <= len {
-        origin + len - MARGIN - win_len
+    let hi = if win_len + 2.0 * margin <= len {
+        origin + len - margin - win_len
     } else {
-        origin + len - MARGIN - 1.0
+        origin + len - margin - 1.0
     };
-    let lo = origin + MARGIN;
-    (origin + INSET).min(hi).max(lo)
+    let lo = origin + margin;
+    (origin + inset).min(hi).max(lo)
 }
 
 /// Which monitor a point (egui points, virtual-desktop
@@ -1225,6 +1314,7 @@ fn enumerate_monitors() -> Vec<MonitorInfo> {
         out.push(MonitorInfo {
             name,
             device,
+            handle: h,
             rect_px: [rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top],
             scale,
             primary: info.monitorInfo.dwFlags & 1 != 0,
@@ -1238,6 +1328,199 @@ fn enumerate_monitors() -> Vec<MonitorInfo> {
 #[cfg(not(target_os = "windows"))]
 fn enumerate_monitors() -> Vec<MonitorInfo> {
     Vec::new()
+}
+
+/// Snap phases (v1.3.1): the move is a small state machine
+/// advanced one step per frame from handle_window_chrome, so
+/// each window-state transition settles before the next step —
+/// never one blind burst of commands.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SnapPhase {
+    /// Leave the states other layers own first: fullscreen is
+    /// winit's (released via a viewport command), the maximized
+    /// / minimized show state is released with a Win32 restore.
+    LeaveStates,
+    /// Issue the physical-pixel move (SetWindowPos).
+    Move,
+    /// Confirm arrival (MonitorFromWindow == the target) before
+    /// maximizing; a miss retries the restore+move once.
+    Verify,
+}
+
+/// What one snap step should do this frame.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SnapAction {
+    SendFullscreenOff,
+    Restore,
+    Wait,
+    MoveWindow,
+    MaximizeAndFinish,
+    Fail,
+}
+
+/// The facts the snap decision needs, gathered fresh per frame.
+#[derive(Clone, Copy, Default)]
+struct SnapFacts {
+    /// egui reports the window in (borderless) fullscreen.
+    fullscreen: bool,
+    /// The window is maximized or minimized (needs a restore
+    /// before it can be moved meaningfully).
+    zoomed: bool,
+    /// MonitorFromWindow says the window is on the target.
+    on_target: bool,
+    /// The job's overall time budget has run out.
+    expired: bool,
+}
+
+/// Move attempts per snap: the initial move plus ONE retry.
+const SNAP_MAX_MOVES: u8 = 2;
+/// Overall budget for one snap. Past it the job fails safe:
+/// the window stays wherever it verifiably is — visible, on a
+/// real monitor (every move targets a clamped interior point),
+/// never wedged mid-transition.
+const SNAP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The pure snap decision: (next phase, this frame's action).
+/// Arrival beats expiry — a window that just landed is
+/// maximized, not failed. Kept free of Win32 so the whole
+/// sequence is unit-testable headlessly.
+fn snap_next(phase: SnapPhase, f: SnapFacts, attempts: u8) -> (SnapPhase, SnapAction) {
+    use SnapAction::*;
+    use SnapPhase::*;
+    if phase == Verify && f.on_target {
+        return (Verify, MaximizeAndFinish);
+    }
+    if f.expired {
+        return (phase, Fail);
+    }
+    match phase {
+        LeaveStates => {
+            if f.fullscreen {
+                (LeaveStates, SendFullscreenOff)
+            } else if f.zoomed {
+                (Move, Restore)
+            } else {
+                (Move, Wait)
+            }
+        }
+        Move => (Verify, MoveWindow),
+        Verify => {
+            if attempts < SNAP_MAX_MOVES {
+                (Move, Restore)
+            } else {
+                (Verify, Fail)
+            }
+        }
+    }
+}
+
+/// An in-flight snap (v1.3.1): created by a Monitor-menu click,
+/// advanced per frame by App::advance_snap, dropped on success,
+/// failure or timeout. Never persisted.
+struct SnapJob {
+    target: MonitorInfo,
+    phase: SnapPhase,
+    attempts: u8,
+    deadline: Instant,
+}
+
+// ----------------------------------------------------------------
+// Direct Win32 window ops for the snap (v1.3.1). The tray code
+// already manipulates this same HWND directly (ShowWindowAsync
+// from the tray thread, v1.2.3); the snap runs on the UI
+// thread — the window's own thread — so the synchronous forms
+// are the right ones here: each call has fully landed when it
+// returns. Non-Windows builds get inert stubs (enumeration is
+// empty there, so no snap job can ever start).
+// ----------------------------------------------------------------
+
+/// Maximized (IsZoomed) or minimized (IsIconic) — either means
+/// a restore is owed before a move.
+#[cfg(target_os = "windows")]
+fn win32_needs_restore(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsZoomed};
+    unsafe { IsZoomed(hwnd as _) != 0 || IsIconic(hwnd as _) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_needs_restore(_hwnd: isize) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn win32_restore_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE};
+    unsafe {
+        ShowWindow(hwnd as _, SW_RESTORE);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_restore_window(_hwnd: isize) {}
+
+#[cfg(target_os = "windows")]
+fn win32_maximize_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MAXIMIZE};
+    unsafe {
+        ShowWindow(hwnd as _, SW_MAXIMIZE);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_maximize_window(_hwnd: isize) {}
+
+/// Move the window's top-left to a PHYSICAL-pixel point,
+/// keeping its size and z-order (SetWindowPos).
+#[cfg(target_os = "windows")]
+fn win32_move_window(hwnd: isize, x: i32, y: i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOSIZE, SWP_NOZORDER};
+    unsafe {
+        SetWindowPos(
+            hwnd as _,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_move_window(_hwnd: isize, _x: i32, _y: i32) {}
+
+/// The monitor the window is on right now (HMONITOR as isize;
+/// MONITOR_DEFAULTTONEAREST always names one for a real
+/// window) — the arrival check a move is verified against.
+#[cfg(target_os = "windows")]
+fn win32_window_monitor(hwnd: isize) -> isize {
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    unsafe { MonitorFromWindow(hwnd as _, MONITOR_DEFAULTTONEAREST) as isize }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_window_monitor(_hwnd: isize) -> isize {
+    0
+}
+
+/// The window's current size in PHYSICAL pixels (GetWindowRect)
+/// — the size the snap target clamp keeps inside the monitor.
+#[cfg(target_os = "windows")]
+fn win32_window_size_px(hwnd: isize) -> [i32; 2] {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut rc: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd as _, &mut rc) } != 0 && rc.right > rc.left {
+        [rc.right - rc.left, rc.bottom - rc.top]
+    } else {
+        [1120, 780]
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_window_size_px(_hwnd: isize) -> [i32; 2] {
+    [1120, 780]
 }
 
 /// Parse a NAMED REG_SZ value out of `reg query` output (the App
@@ -2633,18 +2916,45 @@ fn group_average(values: &[i64]) -> Option<f64> {
     }
 }
 
-/// The brightnessSet payload for a percent (floor 1%, v1.2.3 —
-/// the old 11% floor came from the reference slider, not the
-/// devices). Brightness is ONLY ever sent to devices that
-/// natively report a brightness field (v1.3.0, reversing the
-/// v1.2.3 route that dimmed colour-only devices through the V of
-/// a colorSet): the legacy API surfaces no brightness/temp for a
-/// colour-only strip — on/off + colour only — so the app shows
-/// no brightness control for it, exactly like the reference.
-/// (The strip hardware itself can dim via other channels; this
-/// API simply doesn't expose it. See DESIGN.md.)
-fn brightness_set_value(pct: i64) -> Value {
-    json!(pct.clamp(1, 100))
+/// The hardware brightness floor on the DEVICE scale (v1.3.1):
+/// the user's bulbs switch OFF ENTIRELY below 11% — it is their
+/// true minimum, not a UI preference. (v1.2.3 lowered the floor
+/// to 1% on the theory that 11% was inherited from the
+/// reference slider; the field disproved that within a day.)
+const BRIGHTNESS_FLOOR_PCT: i64 = 11;
+
+/// Map a UI brightness percent (1..100 — what every slider
+/// shows and edits) to the DEVICE percent a brightnessSet
+/// sends (11..100), linearly: device = 11 + (ui-1) * 89/99.
+/// The slider's bottom therefore displays "1%" while sending
+/// exactly the 11% hardware minimum — a lit bulb is never
+/// commanded below it — and the top is a true 100%.
+fn brightness_ui_to_device(ui: i64) -> i64 {
+    let ui = ui.clamp(1, 100);
+    (BRIGHTNESS_FLOOR_PCT as f64 + (ui - 1) as f64 * 89.0 / 99.0).round() as i64
+}
+
+/// Map a reported DEVICE percent back to the UI scale for
+/// display (the inverse of brightness_ui_to_device):
+/// ui = 1 + (device-11) * 99/89, clamped to 1..100 — a bulb
+/// reporting its 11% minimum displays "1%", and anything
+/// reported below 11% (while on) displays as 1% too.
+fn brightness_device_to_ui(dev: i64) -> i64 {
+    ((1.0 + (dev - BRIGHTNESS_FLOOR_PCT) as f64 * 99.0 / 89.0).round() as i64).clamp(1, 100)
+}
+
+/// The brightnessSet payload for a UI percent: the mapped
+/// device value (see brightness_ui_to_device). Brightness is
+/// ONLY ever sent to devices that natively report a brightness
+/// field (v1.3.0, reversing the v1.2.3 route that dimmed
+/// colour-only devices through the V of a colorSet): the legacy
+/// API surfaces no brightness/temp for a colour-only strip —
+/// on/off + colour only — so the app shows no brightness
+/// control for it, exactly like the reference. (The strip
+/// hardware itself can dim via other channels; this API simply
+/// doesn't expose it. See DESIGN.md.)
+fn brightness_set_value(ui_pct: i64) -> Value {
+    json!(brightness_ui_to_device(ui_pct))
 }
 
 /// The fan-out plan for one group action. `num` carries the brightness
@@ -3435,12 +3745,15 @@ fn status_text(d: &Device) -> String {
     let mut parts = vec![if d.state { "On".to_string() } else { "Off".to_string() }];
     if d.state {
         if let Some(b) = d.brightness_pct {
-            parts.push(format!("{}%", b));
+            // Displayed on the UI scale (v1.3.1), like the sliders.
+            parts.push(format!("{}%", brightness_device_to_ui(b)));
         }
         if d.color_mode.as_deref() == Some("colour") {
             parts.push("Colour".to_string());
         } else if let Some(t) = d.temp_slider {
-            parts.push(format!("{}K", temp_slider_to_kelvin(t)));
+            // Displayed at the nearest stop (v1.3.1), like the
+            // temp sliders themselves.
+            parts.push(format!("{}K", temp_display_kelvin(t)));
         }
     }
     parts.join(" · ")
@@ -3504,7 +3817,11 @@ fn slim_slider(
         pos2(rect.right(), mid_y + 3.0),
     );
     p.rect_filled(track_rect, Rounding::same(3.0), track);
-    let ratio = if max > min { (out.value - min) / (max - min) } else { 0.0 };
+    // The PAINT ratio clamps to the track: a value below the
+    // range (e.g. a device reporting under a slider's floor)
+    // parks the thumb at the end instead of drawing it off the
+    // track — `out.value` itself stays the honest value.
+    let ratio = if max > min { ((out.value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
     let thumb_x = rect.left() + 9.0 + ratio * (rect.width() - 18.0);
     if ratio > 0.0 {
         let fill_rect = egui::Rect::from_min_max(
@@ -3607,6 +3924,10 @@ struct App {
     /// (show_from_tray), so an arg-less autostart/restartable-app
     /// relaunch can neither flash nor stick open.
     launch_hidden_pending: bool,
+    /// In-flight snap-to-monitor job (v1.3.1): created by a
+    /// Monitor-menu click, advanced one step per frame by
+    /// handle_window_chrome (see advance_snap), never persisted.
+    snap_job: Option<SnapJob>,
     // rate-limit backoff (v1.2.0): while set, autorefresh skips
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
@@ -3791,6 +4112,7 @@ impl App {
             arg_launch_mode: LaunchMode::Normal,
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
+            snap_job: None,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -4679,29 +5001,91 @@ impl App {
         }
     }
 
-    /// Snap to monitor (v1.3.0): act on a display chosen in the
-    /// header menu. The list is RE-ENUMERATED here, at click
-    /// time — a display unplugged since the menu opened turns
-    /// the click into a no-op with a note, never a blind move.
-    /// Command order is the safety story: leave fullscreen /
-    /// maximized, move to the single clamped interior point on
-    /// the target display, then maximize and let the OS own the
-    /// geometry. Nothing is persisted; startup is unaffected.
+    /// Snap to monitor: act on a display chosen in the header
+    /// menu. The list is RE-ENUMERATED here, at click time — a
+    /// display unplugged since the menu opened turns the click
+    /// into a no-op with a note, never a blind move. The click
+    /// itself only STARTS a SnapJob (v1.3.1): the actual move
+    /// is the per-frame state machine in advance_snap — direct
+    /// Win32 in physical pixels, arrival verified before
+    /// maximizing. (v1.3.0's one-frame burst of viewport
+    /// commands never moved the window on a mixed-DPI desk;
+    /// see the snap section header.) Nothing is persisted;
+    /// startup is unaffected.
     fn snap_to_monitor(&mut self, ctx: &egui::Context, chosen_device: &str) {
         let monitors = enumerate_monitors();
         let Some(m) = monitors.iter().find(|m| m.device == chosen_device) else {
             self.toast("That display is no longer available", false);
             return;
         };
-        let win_size = ctx
-            .input(|i| i.viewport().outer_rect.map(|r| [r.width(), r.height()]))
-            .unwrap_or([1120.0, 780.0]);
-        let pt = snap_target_point(m, win_size);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(pt[0], pt[1])));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-        self.toast(format!("Snapped to {}", m.name), false);
+        self.snap_job = Some(SnapJob {
+            target: m.clone(),
+            phase: SnapPhase::LeaveStates,
+            attempts: 0,
+            deadline: Instant::now() + SNAP_TIMEOUT,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Advance an in-flight snap by ONE step (v1.3.1), called
+    /// every frame from handle_window_chrome. The decision is
+    /// the pure snap_next; this gathers the frame's facts and
+    /// performs the decided effect. A step per frame lets each
+    /// window-state transition fully land before the next, and
+    /// the move is verified (MonitorFromWindow) before anything
+    /// maximizes — the two things the v1.3.0 burst never did.
+    fn advance_snap(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(job) = &self.snap_job else { return };
+        let (phase, attempts, target, deadline) = (
+            job.phase,
+            job.attempts,
+            job.target.clone(),
+            job.deadline,
+        );
+        let Some(hwnd) = main_hwnd(frame) else {
+            ctx.request_repaint();
+            return;
+        };
+        let facts = SnapFacts {
+            fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+            zoomed: win32_needs_restore(hwnd),
+            on_target: win32_window_monitor(hwnd) == target.handle,
+            expired: Instant::now() >= deadline,
+        };
+        let (next, action) = snap_next(phase, facts, attempts);
+        match action {
+            SnapAction::SendFullscreenOff => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            SnapAction::Restore => win32_restore_window(hwnd),
+            SnapAction::Wait => {}
+            SnapAction::MoveWindow => {
+                let size = win32_window_size_px(hwnd);
+                let pt = snap_target_point_px(&target, size);
+                win32_move_window(hwnd, pt[0], pt[1]);
+                if let Some(job) = &mut self.snap_job {
+                    job.attempts += 1;
+                }
+            }
+            SnapAction::MaximizeAndFinish => {
+                win32_maximize_window(hwnd);
+                self.snap_job = None;
+                self.toast(format!("Snapped to {}", target.name), false);
+                return;
+            }
+            SnapAction::Fail => {
+                self.snap_job = None;
+                self.toast(
+                    format!("Couldn't move to {} — window left as-is", target.name),
+                    true,
+                );
+                return;
+            }
+        }
+        if let Some(job) = &mut self.snap_job {
+            job.phase = next;
+        }
+        ctx.request_repaint();
     }
 
     /// Tray actions + window-close behaviour, run every frame
@@ -4740,6 +5124,10 @@ impl App {
         // have had their chance, a still-pending Minimized launch
         // re-asserts its invisibility.
         self.enforce_launch_hold(ctx);
+        // Snap to monitor (v1.3.1): advance an in-flight snap
+        // one step per frame — the HWND was just published
+        // above, fresh for this frame.
+        self.advance_snap(ctx, frame);
         // Focus regained (clicking back into the window) is a
         // backoff reset trigger for camera feeds (v1.2.2).
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
@@ -5754,17 +6142,26 @@ impl App {
                     // the API reports no brightness for them.
                     if devs.iter().any(|d| d.has_brightness) {
                         let avg = group_average(&b_vals).unwrap_or(100.0);
+                        // The header speaks the UI scale too
+                        // (v1.3.1), so it agrees with the cards:
+                        // average on the device scale, map once.
+                        let ui_avg = brightness_device_to_ui(avg.round() as i64);
                         self.group_slider(
-                            ui, &sec2, "b", "Brightness", 1.0, 100.0, avg as f32,
+                            ui, &sec2, "b", "Brightness", 1.0, 100.0, ui_avg as f32,
                             |v| format!("{}%", v.round() as i64),
                             GroupKind::Brightness,
                         );
                     }
                     if devs.iter().any(|d| d.has_temp) {
                         let avg = group_average(&t_vals).unwrap_or(TEMP_NEUTRAL_SLIDER as f64);
+                        // The group temp slider sits at the stop
+                        // nearest the members' average Kelvin
+                        // (v1.3.1) — its value is a stop index,
+                        // and a broadcast sends that exact stop.
+                        let stop = temp_stop_index(temp_slider_to_kelvin(avg.round() as i64));
                         self.group_slider(
-                            ui, &sec2, "t", "Colour temperature", 1000.0, 10000.0, avg as f32,
-                            |v| format!("{}K", temp_slider_to_kelvin((v / 50.0).round() as i64 * 50)),
+                            ui, &sec2, "t", "Colour temperature", 0.0, (TEMP_STOPS_K.len() - 1) as f32, stop as f32,
+                            |v| format!("{}K", temp_stop_kelvin(v.round() as i64)),
                             GroupKind::Temp,
                         );
                     }
@@ -6456,14 +6853,22 @@ impl App {
                 if dev.online && !dev.is_scene {
                     if dev.has_brightness {
                         let pct = dev.brightness_pct.filter(|&p| p > 0).unwrap_or(100);
-                        self.slider_row(ui, &dev, "b", "Brightness", 1.0, 100.0, pct as f32, |v| {
+                        // Sliders live on the UI scale (1..100 ->
+                        // device 11..100, v1.3.1): the reported
+                        // device percent is mapped for display.
+                        let ui_pct = brightness_device_to_ui(pct);
+                        self.slider_row(ui, &dev, "b", "Brightness", 1.0, 100.0, ui_pct as f32, |v| {
                             format!("{}%", v.round() as i64)
                         });
                     }
                     if dev.has_temp {
                         let t = dev.temp_slider.unwrap_or(TEMP_NEUTRAL_SLIDER);
-                        self.slider_row(ui, &dev, "t", "Colour temperature", 1000.0, 10000.0, t as f32, |v| {
-                            format!("{}K", temp_slider_to_kelvin((v / 50.0).round() as i64 * 50))
+                        // Temp sliders show stop indices (v1.3.1):
+                        // the reported value displays at its
+                        // nearest stop without being rewritten.
+                        let stop = temp_stop_index(temp_slider_to_kelvin(t));
+                        self.slider_row(ui, &dev, "t", "Colour temperature", 0.0, (TEMP_STOPS_K.len() - 1) as f32, stop as f32, |v| {
+                            format!("{}K", temp_stop_kelvin(v.round() as i64))
                         });
                     }
                     if dev.has_color {
@@ -7118,7 +7523,9 @@ impl App {
         );
         if out.changed {
             let v = if tag == "t" {
-                (out.value / 50.0).round() * 50.0 // temp slider steps by 50, like the web
+                // Temp sliders move in stop indices (v1.3.1):
+                // each drag position is a whole detent.
+                out.value.round()
             } else {
                 out.value
             };
@@ -7129,7 +7536,9 @@ impl App {
             let v = self.slider_live.remove(&key).unwrap_or(out.value);
             self.dragging_slider = false;
             if tag == "t" {
-                self.do_temp(&dev.id, v.round() as i64);
+                // Send the exact stop, converted to the API
+                // scale (v1.3.1).
+                self.do_temp(&dev.id, temp_kelvin_to_slider(temp_stop_kelvin(v.round() as i64)));
             } else {
                 self.do_brightness(&dev.id, v.round() as i64);
             }
@@ -8298,9 +8707,11 @@ mod tests {
         // v1.3.0: brightness fan-out reaches ONLY the two field
         // bulbs — the colour-only strip is excluded (pre-1.3.0 it
         // joined via a synthesized colorSet; that route is gone).
+        // v1.3.1: the fan-out value is a UI percent — UI 55 maps
+        // to device 60 (11 + 54*89/99 = 59.5) on the wire.
         let plan = group_plan(&members, GroupKind::Brightness, 55, None);
         assert_eq!(plan.len(), 2);
-        assert!(plan.iter().all(|(_, a, v)| *a == "brightnessSet" && *v == json!(55)));
+        assert!(plan.iter().all(|(_, a, v)| *a == "brightnessSet" && *v == json!(60)));
         assert!(plan.iter().all(|(id, _, _)| id != "ls"), "strip must not be dimmed");
 
         let plan = group_plan(&members, GroupKind::Temp, 6000, None);
@@ -8486,16 +8897,39 @@ mod tests {
     }
 
     #[test]
-    fn brightness_floor_is_one_percent() {
-        // v1.2.3 (Bug E): the minimum is 1% everywhere — the 11%
-        // floor was inherited from the reference slider, not the
-        // devices. Values below the floor clamp to 1, low values
-        // pass through. (Single route since v1.3.0: brightnessSet
-        // to native-brightness devices only.)
-        assert_eq!(brightness_set_value(0), json!(1));
-        assert_eq!(brightness_set_value(5), json!(5));
+    fn brightness_ui_device_mapping() {
+        // v1.3.1: the UI scale is 1..100, the DEVICE scale is
+        // 11..100 (the bulbs switch off entirely below 11% — a
+        // hardware minimum), mapped linearly in both directions.
+        // Endpoints, both directions.
+        assert_eq!(brightness_ui_to_device(1), 11, "bottomed-out slider sends exactly the floor");
+        assert_eq!(brightness_ui_to_device(100), 100);
+        assert_eq!(brightness_device_to_ui(11), 1, "a bulb at its minimum displays 1%");
+        assert_eq!(brightness_device_to_ui(100), 100);
+        // Midpoint: UI 50 <-> device 55 (11 + 49*89/99 = 55.05).
+        assert_eq!(brightness_ui_to_device(50), 55);
+        assert_eq!(brightness_device_to_ui(55), 50);
+        // Reported values below the floor (while on) display as
+        // 1%, never 0 or negative.
+        assert_eq!(brightness_device_to_ui(5), 1);
+        assert_eq!(brightness_device_to_ui(0), 1);
+        // Sends NEVER go below the floor, whatever the slider
+        // (or a stale caller) asks for.
+        for ui in [0, 1, 2, 25, 99, 100, 140] {
+            assert!(brightness_ui_to_device(ui) >= BRIGHTNESS_FLOOR_PCT, "ui {ui} sends >= 11");
+        }
+        assert_eq!(brightness_set_value(1), json!(11));
         assert_eq!(brightness_set_value(100), json!(100));
-        assert_eq!(brightness_set_value(140), json!(100));
+        // Round trip is exact at the anchor points and never
+        // drifts by more than 1 anywhere (integer rounding on a
+        // 89/99 slope is not a perfect bijection).
+        for ui in [1, 25, 50, 100] {
+            assert_eq!(brightness_device_to_ui(brightness_ui_to_device(ui)), ui, "ui {ui} round-trips");
+        }
+        for ui in 1..=100 {
+            let back = brightness_device_to_ui(brightness_ui_to_device(ui));
+            assert!((back - ui).abs() <= 1, "ui {ui} round-trips within 1 (got {back})");
+        }
     }
 
     #[test]
@@ -8508,10 +8942,69 @@ mod tests {
         );
         assert!(d.has_brightness && d.has_temp && d.has_color);
         assert_eq!(d.brightness_pct, Some(80), "reported brightness still wins");
-        let plan = group_plan(&[d], GroupKind::Brightness, 40, None);
+        // Group broadcasts carry a UI percent (v1.3.1): UI 40
+        // sends device 46 (11 + 39*89/99 = 46.06).
+        let plan = group_plan(&[d.clone()], GroupKind::Brightness, 40, None);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].1, "brightnessSet");
-        assert_eq!(plan[0].2, json!(40));
+        assert_eq!(plan[0].2, json!(46));
+        // A bottomed-out group slider sends exactly the floor.
+        let plan = group_plan(&[d], GroupKind::Brightness, 1, None);
+        assert_eq!(plan[0].2, json!(11));
+    }
+
+    #[test]
+    fn temp_stops_snap_and_send() {
+        // v1.3.1: five detents, snapped in Kelvin space.
+        assert_eq!(TEMP_STOPS_K, [2700, 3000, 4000, 5000, 6500]);
+        // Representative in-between readings (the user's bulbs)
+        // display at the nearest stop.
+        assert_eq!(TEMP_STOPS_K[temp_stop_index(3080)], 3000);
+        assert_eq!(TEMP_STOPS_K[temp_stop_index(3780)], 4000);
+        assert_eq!(TEMP_STOPS_K[temp_stop_index(3970)], 4000);
+        assert_eq!(TEMP_STOPS_K[temp_stop_index(2700)], 2700);
+        assert_eq!(TEMP_STOPS_K[temp_stop_index(6500)], 6500);
+        assert_eq!(TEMP_STOPS_K[temp_stop_index(2000)], 2700, "below range -> first stop");
+        assert_eq!(TEMP_STOPS_K[temp_stop_index(9000)], 6500, "above range -> last stop");
+        // Every stop round-trips: stop -> API scale -> Kelvin
+        // is the stop again (so a drag/send always lands
+        // exactly on a stop).
+        for (i, &k) in TEMP_STOPS_K.iter().enumerate() {
+            let sent = temp_kelvin_to_slider(k);
+            assert_eq!(temp_slider_to_kelvin(sent), k, "stop {k} survives the API scale");
+            assert_eq!(temp_stop_kelvin(i as i64), k);
+            assert_eq!(temp_display_kelvin(sent), k);
+        }
+        // A reported in-between value displays at its stop via
+        // the full reported->slider->display path: the user's
+        // 3970K bulb (reported scale 4000-ish) shows 4000K.
+        let reported = temp_slider_to_reported(temp_kelvin_to_slider(3970));
+        assert_eq!(temp_display_kelvin(temp_reported_to_slider(reported as f64)), 4000);
+        // Index clamping at the slider ends.
+        assert_eq!(temp_stop_kelvin(-3), 2700);
+        assert_eq!(temp_stop_kelvin(99), 6500);
+    }
+
+    #[test]
+    fn group_temp_broadcast_sends_exact_stop() {
+        // v1.3.1: the group temp path sends the converted stop —
+        // the same value do_temp would send for that stop.
+        let d = dev(
+            "lb",
+            "Bulb",
+            json!({ "state": true, "brightness": 800, "color_temp": 4000 }),
+        );
+        for &k in TEMP_STOPS_K.iter() {
+            let plan = group_plan(&[d.clone()], GroupKind::Temp, temp_kelvin_to_slider(k), None);
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].1, "colorTemperatureSet");
+            assert_eq!(plan[0].2, json!(temp_kelvin_to_slider(k)), "stop {k} sent exactly");
+            assert_eq!(
+                temp_slider_to_kelvin(plan[0].2.as_i64().unwrap()),
+                k,
+                "sent value reads back as the stop"
+            );
+        }
     }
 
     #[test]
@@ -9327,6 +9820,7 @@ mod tests {
         MonitorInfo {
             name: "M".into(),
             device: "D".into(),
+            handle: 0,
             rect_px: [x, y, w, h],
             scale,
             primary,
@@ -9350,41 +9844,122 @@ mod tests {
     }
 
     #[test]
-    fn snap_point_is_interior_and_clamped() {
-        let win = [1120.0, 780.0];
-        // Roomy monitor: the plain 60 pt inset.
-        assert_eq!(snap_target_point(&mon(0, 0, 1920, 1080, 1.0, true), win), [60.0, 60.0]);
+    fn snap_point_px_is_interior_and_clamped() {
+        // All values PHYSICAL pixels (v1.3.1): the point is what
+        // SetWindowPos receives — no scale conversion can move
+        // it onto another monitor.
+        let win = [1120, 780];
+        // Roomy monitor at 100%: the plain 60 px inset.
+        assert_eq!(snap_target_point_px(&mon(0, 0, 1920, 1080, 1.0, true), win), [60, 60]);
         // Negative-origin monitor left of the primary.
         assert_eq!(
-            snap_target_point(&mon(-1920, 0, 1920, 1080, 1.0, false), win),
-            [-1860.0, 60.0]
+            snap_target_point_px(&mon(-1920, 0, 1920, 1080, 1.0, false), win),
+            [-1860, 60]
         );
         // Monitor above the primary (negative y).
         assert_eq!(
-            snap_target_point(&mon(0, -1080, 1920, 1080, 1.0, false), win),
-            [60.0, -1020.0]
+            snap_target_point_px(&mon(0, -1080, 1920, 1080, 1.0, false), win),
+            [60, -1020]
         );
         // Window wider than the monitor: the point still lands
         // strictly inside, with margin.
         let small = mon(0, 0, 800, 600, 1.0, false);
-        let p = snap_target_point(&small, win);
-        assert!(p[0] > 0.0 && p[0] < 800.0 && p[1] > 0.0 && p[1] < 600.0, "point {p:?} interior");
-        // Narrow monitor: the 60 pt inset already lands inside.
+        let p = snap_target_point_px(&small, win);
+        assert!(p[0] > 0 && p[0] < 800 && p[1] > 0 && p[1] < 600, "point {p:?} interior");
+        // Narrow monitor: the 60 px inset already lands inside.
         let narrow = mon(100, 0, 100, 900, 1.0, false);
-        let p = snap_target_point(&narrow, win);
-        assert!((p[0] - 160.0).abs() < 0.01, "inset x, got {}", p[0]);
+        let p = snap_target_point_px(&narrow, win);
+        assert_eq!(p[0], 160, "inset x");
         // Very narrow monitor: the inset overshoots the far edge
         // and clamps back inside it (width - margin - 1 = 41).
         let vnarrow = mon(0, 0, 50, 900, 1.0, false);
-        let p = snap_target_point(&vnarrow, win);
-        assert!((p[0] - 41.0).abs() < 0.01, "clamped x, got {}", p[0]);
-        // Scaled portrait panel to the right (the user's desk):
-        // 1080×1920 px at 100% beside the primary.
-        let portrait = mon(1920, 0, 1080, 1920, 1.0, false);
-        assert_eq!(snap_target_point(&portrait, win), [1980.0, 60.0]);
+        let p = snap_target_point_px(&vnarrow, win);
+        assert_eq!(p[0], 41, "clamped x");
         // Degenerate tiny monitor: centre point, still interior.
         let tiny = mon(50, 50, 10, 10, 1.0, false);
-        assert_eq!(snap_target_point(&tiny, win), [55.0, 55.0]);
+        assert_eq!(snap_target_point_px(&tiny, win), [55, 55]);
+    }
+
+    #[test]
+    fn snap_point_px_users_desk_mixed_dpi() {
+        // THE v1.3.0 field failure, as fixtures: a 2560x1440
+        // landscape primary with a 2160x3840 (4K) PORTRAIT
+        // target to its right, at a HIGHER scale factor than
+        // the source. v1.3.0 converted the target point to
+        // points with the TARGET's scale while winit applied
+        // it with the SOURCE's — the window never left the
+        // landscape panel. In physical pixels there is nothing
+        // to convert: at any target scale the point is strictly
+        // inside the portrait rect and NOT on the source.
+        let source = mon(0, 0, 2560, 1440, 1.25, true);
+        for scale in [1.5, 1.75, 2.0] {
+            let target = mon(2560, 0, 2160, 3840, scale, false);
+            // The restored window's physical size on the source
+            // (1120x780 pt at the source's 125% = 1400x975 px).
+            let p = snap_target_point_px(&target, [1400, 975]);
+            assert!(
+                p[0] >= 2560 && p[0] < 2560 + 2160 && p[1] >= 0 && p[1] < 3840,
+                "scale {scale}: point {p:?} inside the portrait target"
+            );
+            assert!(
+                !(p[0] >= source.rect_px[0]
+                    && p[0] < source.rect_px[0] + source.rect_px[2]
+                    && p[1] >= source.rect_px[1]
+                    && p[1] < source.rect_px[1] + source.rect_px[3]),
+                "scale {scale}: point {p:?} must NOT land on the source monitor"
+            );
+            // The inset is 60 pt worth of pixels at the TARGET's
+            // scale (the window fits easily, so no clamping).
+            assert_eq!(p, [2560 + (60.0 * scale) as i32, (60.0 * scale) as i32]);
+        }
+        // A window LARGER than the portrait panel in one axis
+        // still lands strictly inside it.
+        let target = mon(2560, 0, 2160, 3840, 2.0, false);
+        let p = snap_target_point_px(&target, [2600, 900]);
+        assert!(p[0] > 2560 && p[0] < 2560 + 2160 && p[1] > 0 && p[1] < 3840, "oversize window point {p:?} interior");
+    }
+
+    #[test]
+    fn snap_state_machine_sequences() {
+        use SnapAction::*;
+        use SnapPhase::*;
+        let calm = SnapFacts { fullscreen: false, zoomed: false, on_target: false, expired: false };
+        // Plain window, already restored: straight to Move.
+        assert_eq!(snap_next(LeaveStates, calm, 0), (Move, Wait));
+        // Maximized window: restore first, move next frame.
+        assert_eq!(
+            snap_next(LeaveStates, SnapFacts { zoomed: true, ..calm }, 0),
+            (Move, Restore)
+        );
+        // Fullscreen is released first and the phase waits for
+        // egui to confirm it (fullscreen wins over zoomed).
+        assert_eq!(
+            snap_next(LeaveStates, SnapFacts { fullscreen: true, zoomed: true, ..calm }, 0),
+            (LeaveStates, SendFullscreenOff)
+        );
+        // The move itself, then verification.
+        assert_eq!(snap_next(Move, calm, 0), (Verify, MoveWindow));
+        // Verified arrival: maximize and finish — even if the
+        // deadline passed on the same frame.
+        assert_eq!(
+            snap_next(Verify, SnapFacts { on_target: true, expired: true, ..calm }, 1),
+            (Verify, MaximizeAndFinish)
+        );
+        // First miss (one move spent): retry the restore+move.
+        assert_eq!(snap_next(Verify, calm, 1), (Move, Restore));
+        // Second miss (both moves spent): fail safe, no
+        // maximize on the wrong monitor.
+        assert_eq!(snap_next(Verify, calm, 2), (Verify, Fail));
+        // Timeout anywhere else fails the job (window stays
+        // wherever it verifiably is).
+        assert_eq!(
+            snap_next(Move, SnapFacts { expired: true, ..calm }, 0),
+            (Move, Fail)
+        );
+        assert_eq!(
+            snap_next(LeaveStates, SnapFacts { expired: true, ..calm }, 0),
+            (LeaveStates, Fail)
+        );
     }
 
     #[test]
@@ -9562,6 +10137,7 @@ mod tests {
             arg_launch_mode: LaunchMode::Normal,
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
+            snap_job: None,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -9811,7 +10387,10 @@ mod tests {
             "strip panels not adjacent/atomic: temp.x - bright.x = {}",
             temp.x - bright.x
         );
-        let bval = first("80%").expect("group brightness value drawn");
+        // The fixture bulbs report device 80%, which DISPLAYS
+        // as UI 78% under the v1.3.1 mapping (device 11..100 ->
+        // UI 1..100).
+        let bval = first("78%").expect("group brightness value drawn");
         let tval = texts
             .iter()
             .filter(|(t, _)| {
@@ -9822,7 +10401,7 @@ mod tests {
             .expect("group temperature value drawn");
         assert!(
             (bval.y - bright.y).abs() <= 1.5 && (tval.y - temp.y).abs() <= 1.5,
-            "strip values off their label line: 80% y={} (label {}), temp value y={} (label {})",
+            "strip values off their label line: 78% y={} (label {}), temp value y={} (label {})",
             bval.y,
             bright.y,
             tval.y,
