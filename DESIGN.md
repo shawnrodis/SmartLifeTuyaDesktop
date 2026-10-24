@@ -291,13 +291,16 @@ column max width: 760px.
   collapsed Connection/proxy section, credentials fine print).
 - Settings panels, in order: Appearance · App updates · Connection ·
   Stream gateway & cameras · Saved login · Hidden devices · Help.
-  The Windows edition inserts **Startup & background** after App
+  The native editions insert **Startup & background** after App
   updates (below); the web edition shows a quiet "Web edition" info
   card above App updates (and a matching Help entry) noting that some
   features are Windows-app-only, with a "Get the Windows app" link.
-- **Startup & tray (v1.2.1) — Windows only, a stated platform
-  difference** (the web edition has no equivalent; its Settings note
-  above says so). "Start with Windows" is an ON/OFF toggle (default
+- **Startup & tray (v1.2.1; macOS v1.4.0) — native only, a stated
+  platform difference** (the web edition has no equivalent; its
+  Settings note above says so). The mechanisms described here are
+  Windows'; macOS mirrors the same semantics with its own plumbing
+  (a LaunchAgent and a menu-bar tray — the platform matrix at the
+  end of this file has the mapping). "Start with Windows" is an ON/OFF toggle (default
   OFF = no autostart entry at all) writing the per-user Run key
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value
   `SmartLifeTuyaDesktop` = the quoted current-exe path; on load the
@@ -341,7 +344,11 @@ column max width: 760px.
   ignored and dropped on the next save.)
   **Snap to monitor (v1.3.0; mechanism replaced in v1.3.1)** is
   the supported way to place the window, and it is deliberately
-  click-time only: the header's **🖥 Monitor** button lists the
+  click-time only — and **Windows-only** (v1.4.0): the move is
+  done with direct Win32 calls, and the multi-monitor desk it
+  exists for is a Windows desk, so the macOS app doesn't render
+  the button at all (a stated deviation; see the platform
+  matrix at the end of this file). The header's **🖥 Monitor** button lists the
   displays enumerated live from the OS (friendly name when
   available, resolution, orientation, a primary marker, and a
   marker for the display the window is currently on). Choosing
@@ -415,6 +422,9 @@ column max width: 760px.
   flag + repaint poke had the same starvation). The 200 ms
   hidden heartbeat remains as belt-and-braces. This is a
   Windows-only platform behaviour; the web edition has no tray.
+  (macOS polls the tray receivers in the frame loop instead —
+  the starvation this thread fixes is a Windows hidden-window
+  quirk, and the pre-v1.2.3 polling pattern is sound there.)
 - **Auto-update.** Both editions share one version number and check
   `api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest`
   on launch, at most once per 24h (attempt-based, stored locally:
@@ -426,4 +436,45 @@ column max width: 760px.
   with progress, verifies the file name matches
   `SmartLifeTuyaDesktop-Setup-v{version}.exe`, launches it and exits so
   the installer can replace the app; "Open releases page" is the
-  fallback.
+  fallback. **macOS (v1.4.0):** the same flow downloads the release's
+  `SmartLifeTuyaDesktop-v{version}.dmg` and *opens* it (the user
+  drags the app into Applications, then relaunches); the app does
+  not exit. Asset selection is a pure function of version +
+  platform — a release missing the platform's asset offers no
+  update, and neither platform can ever be handed the other's file.
+
+## Platform matrix (v1.4.0 — the macOS port)
+
+One Rust codebase ships the Windows and macOS native apps; the
+web edition is the separate single-file HTML app. Everything not
+listed here is shared, identical code and behaviour. The macOS
+build is produced by CI from each release tag (a universal
+aarch64 + x86_64 binary in an ad-hoc-signed `.dmg`); it is
+unsigned, so first launch needs right-click → Open or
+`xattr -dr com.apple.quarantine`.
+
+| Concern | Windows | macOS | Web |
+|---|---|---|---|
+| Config file | `%APPDATA%\SmartLifeTuyaDesktop\config.json` | `~/Library/Application Support/SmartLifeTuyaDesktop/config.json` | `localStorage` (`slc_*`) |
+| Start at login | per-user registry Run key | LaunchAgent plist in `~/Library/LaunchAgents` (`com.shawnrodis.smartlifetuya`), same command/flags, same self-healing reconcile | — |
+| Tray | system tray; dedicated event thread (hidden-window frames can starve) | menu-bar tray; receivers polled in the frame loop | — |
+| First-hide "still running" hint | one-time tray balloon | toast only (no balloon API equivalent — deviation) | — |
+| Single instance | named mutex + kernel event; second launch signals Show | `flock` on `instance.lock` in the config dir + a `show-request` file the primary polls (~0.4 s) | browser tabs are independent |
+| Snap to monitor | 🖥 Monitor button, direct Win32 move + verified maximize | **absent** (deviation: Win32 mechanism; the multi-monitor desk it serves is Windows) | Window Management API fullscreen where available, else hidden |
+| Live camera tiles | bundled `ffmpeg.exe` beside the exe | bundled per-arch static ffmpeg in the `.app` Resources (`ffmpeg-arm64` / `ffmpeg-x86_64`, picked by `std::env::consts::ARCH`), then PATH | gateway embed only |
+| External player (Watch) | VLC via PATH / App Paths / Program Files | VLC via PATH / `/Applications/VLC.app` | — |
+| Update install | download Setup `.exe`, run it, app exits | download `.dmg`, open it, user drags into Applications; app keeps running | notice + download the new `.html` |
+| Window placement memory | none (removed in v1.3.0 after the v1.2.5 off-screen incident) | none | none |
+
+macOS notes:
+
+- Close-to-tray and launch-minimized work through the same
+  viewport-visibility commands as Windows, with tray restore
+  driven by the frame loop's receiver polling plus the existing
+  hidden heartbeat — the mechanisms are platform-neutral in
+  eframe, so no setting is hidden on macOS.
+- The stored autostart command string is the shared source of
+  truth in both stores: on macOS it is decomposed into the
+  plist's `ProgramArguments` (XML-escaped) and reconstructed on
+  read, a pure round-trip covered by tests.
+- The `.app` bundle id is `com.shawnrodis.smartlifetuya`.

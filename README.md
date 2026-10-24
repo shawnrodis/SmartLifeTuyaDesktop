@@ -5,10 +5,14 @@
 # SmartLife & Tuya Desktop
 
 A clean, modern dashboard for your **Smart Life / Tuya** devices — lights,
-plugs, switches and scenes — in two editions that look and behave the same:
+plugs, switches and scenes — in editions that look and behave the same:
 
 - **Windows app** (this repo's Rust + egui program): a small native app
   with a per-user installer — no admin rights needed.
+- **macOS app** (the same program, since v1.4.0): a universal
+  (Apple Silicon + Intel) `.dmg`, built by CI on each release. It's
+  unsigned — see [Download](#download) for the one-time Gatekeeper
+  bypass.
 - **Web app** (`web/SmartLife_Tuya_Desktop.html`): a single self-contained
   HTML file — open it in any modern browser, from disk or any static host.
   No build step, no dependencies. Also live at
@@ -36,16 +40,25 @@ customisable interface they always deserved.
   <br><em>Camera tiles resize — Normal, Large, or full-row Wide, as here. The feed watches the lot while the lights wait below. (Feed blurred for privacy.)</em>
 </p>
 
-## Download (Windows)
+## Download
 
-Grab `SmartLifeTuyaDesktop-Setup-v1.2.1.exe` from
+**Windows:** grab `SmartLifeTuyaDesktop-Setup-v<version>.exe` from
 [Releases](https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases) and
 run it — per-user install to `%LOCALAPPDATA%\SmartLifeTuyaDesktop`, with
 Start Menu shortcuts and an uninstaller. No administrator rights required.
-The installer is larger than it used to be (~100 MB) because it bundles
-ffmpeg for live camera video — see [Camera video](#camera-video) below.
-The web edition is the `SmartLife_Tuya_Desktop.html` asset on the same
-release. Both editions share one version number and check for updates
+
+**macOS:** grab `SmartLifeTuyaDesktop-v<version>.dmg` from the same
+release, open it, and drag the app into Applications. The build is
+**unsigned** (no Apple Developer certificate), so the first launch needs
+the standard bypass: **right-click the app → Open** (and confirm), or run
+`xattr -dr com.apple.quarantine /Applications/SmartLifeTuyaDesktop.app`
+once. After that it opens normally. One universal binary covers both
+Apple Silicon and Intel Macs.
+
+The installers are larger than they used to be (~100 MB) because they
+bundle ffmpeg for live camera video — see [Camera video](#camera-video)
+below. The web edition is the `SmartLife_Tuya_Desktop.html` asset on the
+same release. All editions share one version number and check for updates
 themselves (Settings → App updates). (Building from source is optional;
 instructions below.)
 
@@ -86,24 +99,54 @@ instructions below.)
 - **Pinned shortcuts** — pin any device with 📌 and a full working copy
   appears in the Pinned section; the device also stays in its
   group below. Scenes always get their own Scenes section.
-- **Start with Windows & system tray (Windows app)** — Settings →
-  Startup & background can launch the app with Windows (per-user, no
-  admin) as a normal window, minimized to the tray, or maximized, and
-  can keep it running in the system tray when the window is closed —
-  left-click the tray icon to reopen it, right-click → Quit to exit.
-  (Windows-only: the web edition's Settings says which features are
-  Windows-app-only and links here.)
+- **Start with the OS & tray (native apps)** — Settings →
+  Startup & background can launch the app at startup (Windows: per-user
+  Run key; macOS: a LaunchAgent — no admin either way) as a normal
+  window, minimized to the tray / menu bar, or maximized, and can keep
+  it running in the tray when the window is closed — click the icon to
+  reopen it, Quit on its menu to exit. (Native-only: the web edition's
+  Settings says which features are app-only and links here.)
+- **Snap to a monitor (Windows app)** — the header's 🖥 Monitor menu
+  moves the window onto the display you pick and maximizes it there.
+  (The mechanism is Windows'; the multi-monitor desk this was built
+  for is a Windows one, so the macOS app doesn't offer it.)
 - **Make it yours** — Dark / Light / **Black** (true-black) themes, 7
   accent colours, comfortable / compact card density, search box.
   Everything is remembered locally.
-- **Self-updating** — both editions check GitHub once a day for a newer
+- **Self-updating** — all editions check GitHub once a day for a newer
   release; the Windows app downloads and launches the new installer
-  itself, the web edition offers the new file (and the hosted copy is
-  always current).
+  itself, the macOS app downloads the new `.dmg` and opens it (drag
+  into Applications to replace), and the web edition offers the new
+  file (and the hosted copy is always current).
 - **Private by design** — your credentials go only to Tuya's own servers
   over HTTPS. "Keep me logged in" stores them only on your device
-  (web: this browser's local storage; Windows: a JSON config in your user
-  profile) so the app can silently re-login when the session expires.
+  (web: this browser's local storage; native apps: a JSON config in your
+  user profile) so the app can silently re-login when the session expires.
+
+## What's new in 1.4.0
+
+- **New: a native macOS app joins every release.** Each release now
+  also ships `SmartLifeTuyaDesktop-v<version>.dmg` — a universal
+  (Apple Silicon + Intel) build of this same app, assembled by CI
+  from the release tag. It's the full app, not a subset: dashboard,
+  cameras (with the same bundled-ffmpeg live tiles — a per-arch
+  static ffmpeg rides inside the bundle), menu-bar tray with
+  close-to-tray and start-at-login (a per-user LaunchAgent),
+  single-instance behaviour, and the same themes and layout.
+- **Unsigned, on purpose.** There's no Apple Developer certificate
+  behind it, so Gatekeeper will refuse the first double-click —
+  right-click → Open once (or `xattr -dr com.apple.quarantine` the
+  app) and it launches normally from then on. The macOS updater
+  matches: it downloads the new `.dmg` and opens it — drag into
+  Applications to replace, then relaunch.
+- **One honest difference:** the 🖥 **Snap to monitor** button is
+  Windows-only (its move is done with Win32 calls, and the
+  multi-monitor desk it was built for is a Windows desk), so it
+  doesn't appear in the macOS app. The Windows-only tray balloon
+  likewise has no macOS equivalent; everything else is 1:1.
+- Windows and web are unchanged apart from the version — the
+  Windows app just also learned to never mistake the `.dmg` for
+  its own update (and vice versa).
 
 ## What's new in 1.3.2
 
