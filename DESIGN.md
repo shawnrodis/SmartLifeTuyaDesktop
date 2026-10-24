@@ -27,6 +27,8 @@ and 1px borders only — no drop shadows, no backdrop blur — so both renderers
 Three themes — **Dark / Light / Black** — share the accent system; Black
 is the true-black (OLED) variant: pure `#000` background, near-black
 cards, subtle borders. The theme applies to the login screen too.
+The default theme for a fresh install (no stored preference) is
+**Black** (v1.3.0); a stored Dark/Light/Black choice always wins.
 
 Accent choices (both editions, same order): Indigo `#6366f1`, Sky `#0ea5e9`,
 Teal `#14b8a6`, Green `#22c55e`, Amber `#f59e0b`, Rose `#f43f5e`,
@@ -156,7 +158,12 @@ column max width: 760px.
   in one toast ("…: 4 of 5 updated — X didn't respond") and a refresh
   reconciles. Pinned, Ungrouped, Cameras and Scenes get no group
   controls. **Strip layout (v1.2.3):** each control group is one
-  unbreakable mini-panel of uniform height (44px) — All toggle
+  unbreakable mini-panel of uniform height (51px since v1.3.0 —
+  the panels' true content height; at 44 the content overflowed
+  its allocation and the wrapped placer's cross-axis centring
+  set later panels a few points lower than the first, which put
+  the colour-temperature slider visibly below the brightness
+  slider; the strip row is top-aligned now) — All toggle
   (84px), each slider group (240px, label+value over its slider),
   swatches + 🎨 (352px, one row) — and the strip flows whole
   groups left→right, wrapping whole groups only; the custom-colour
@@ -229,6 +236,35 @@ column max width: 760px.
   merged — including the post-login one (v1.2.1 ran it against an
   empty previous list, so a thin payload could replace the full
   state wholesale and become the new merge anchor).
+- **Wire formats are stringly-typed for lights (v1.3.0, Fix A).**
+  Real discovery payloads of this API encode a SWITCH's state as a
+  JSON bool and its numbers as numbers, but a LIGHT's state as the
+  string `"true"`/`"false"` and its brightness as a string (`"800"`).
+  Both parsers therefore read bools tolerantly (bool / `"true"` /
+  `"false"` / number) and numbers tolerantly (number or numeric
+  string); the placeholder test in the merge uses the same tolerant
+  numeric read. (Strict parsing read every light as Off while plugs
+  were correct — the reference implementation only ever checks
+  `state === false`, which is why it never had the bug.)
+- **Brightness/temperature controls = native fields only (v1.3.0,
+  Fix B — reverses the v1.2.3 synthesis).** A colour-only device
+  (the Desk RGB strip: hue/saturation/colour mode, but no
+  brightness and no colour_temp in its payload) gets NO brightness
+  slider, NO colour-temp slider, no brightness commands, and no
+  seat in the group brightness average or broadcast — colour
+  controls and on/off only, exactly as the reference app shows.
+  This is an API-surface limitation, not a device limitation: the
+  official Smart Life app CAN dim the strip and set its colour
+  temperature, and the hardware supports both — but the legacy
+  homeassistant-style API this app (and the reference) is built on
+  simply doesn't surface brightness/temp fields for this device,
+  so there is nothing truthful to bind a control to. The v1.2.3
+  route (dimming through the V of a colour command, and recording
+  that V as a brightness reading) is removed everywhere; the
+  colour command's payload still carries its HSV brightness
+  component (the API requires the field — the reference sends the
+  current brightness or 100), it just isn't treated as device
+  brightness state.
 - A pinned device shows as a full working card in Pinned **and** stays in
   its normal section. Scenes can't be pinned or grouped; they always live
   in Scenes.
@@ -275,24 +311,32 @@ column max width: 760px.
   been shown by a real Show action, every frame re-asserts
   `Visible(false)` (the launch hold, `enforce_launch_hold`) so
   the window can neither flash nor stick open.
-  **Window placement memory (v1.2.5):** while the window is
-  visible, `track_window_geometry` records its outer position,
-  inner size and maximized flag into `prefs.window_geom`
-  (throttled to one config write per second, flushed again on
-  every quit path — `quit_now`'s save and `on_exit`). Hidden or
-  taskbar-minimized frames never record (their rects are junk),
-  and a maximized window only updates the flag — the stored
-  pos/size stay the restore rect. At startup, main() feeds the
-  saved geometry through `restore_placement` with the current
-  virtual desktop (GetSystemMetrics, converted to points via
-  the system DPI): a position is applied only if ≥120×40 pt of
-  the window would intersect the virtual desktop — otherwise
-  the position (and maximized) is dropped and the window opens
-  with default placement, keeping a sane saved size. The
-  placement composes with the launch mode: a Minimized launch
-  still starts hidden, with the geometry applied underneath so
-  the eventual Show lands in the right place; a saved maximized
-  state is restored when the launch mode itself is Normal.
+  **Window placement is the OS default (v1.3.0 — the v1.2.5
+  placement memory is REMOVED).** v1.2.5 saved the window's outer
+  position / inner size / maximized flag and restored them at
+  launch; in the field the restored window could open slightly
+  off-screen with its title bar unreachable, the release was
+  pulled, and the feature is gone outright: nothing about window
+  geometry is written to or read from the config, and startup
+  placement is exactly v1.2.4's (OS default + the launch mode).
+  (A v1.2.5-era config file still loads; the orphaned key is
+  ignored and dropped on the next save.)
+  **Snap to monitor (v1.3.0)** is the supported way to place the
+  window, and it is deliberately click-time only: the header's
+  **🖥 Monitor** button lists the displays enumerated live from
+  the OS (friendly name when available, resolution, orientation,
+  a primary marker, and a marker for the display the window is
+  currently on). Choosing one re-enumerates, unmaximizes, moves
+  the window to a single clamped interior point of that display
+  (its rect converted to points with THAT display's own scale
+  factor, inset 60 pt and clamped inside with margin), then
+  maximizes — the OS owns the final geometry (the display's work
+  area), so the result cannot be out of bounds. Nothing persists.
+  **Web deviation (stated):** a page cannot move its window, so
+  where the Window Management API exists (Chrome/Edge,
+  `getScreenDetails`) the same button lists screens and choosing
+  one requests fullscreen on that screen; where the API is
+  absent, the button is hidden.
 - **Single instance & tray event pumping (v1.2.2) — Windows.** The
   app is single-instance: the first process holds the named mutex
   `SmartLifeTuyaDesktop.SingleInstance` for its lifetime. A later

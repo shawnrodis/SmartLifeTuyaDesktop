@@ -150,6 +150,20 @@
   .group-controls .gc-slider{min-width:190px; flex:1 1 190px; max-width:300px}
   .group-controls .ctl{margin-top:0}
   .group-controls .swatches{margin-top:6px}
+  /* Snap-to-monitor popup (v1.3.0): lists the OS screens (Window
+     Management API); mirrors the Windows edition's header menu. */
+  #snap-menu{
+    position:fixed; z-index:60; width:300px; padding:6px;
+    background:var(--card); border:1px solid var(--card-border); border-radius:14px;
+  }
+  .snap-item{
+    display:block; width:100%; text-align:left; background:transparent; border:none;
+    padding:8px 10px; border-radius:9px; cursor:pointer; color:var(--text); font:inherit;
+  }
+  .snap-item:hover{background:var(--accent-soft)}
+  .snap-name{font-weight:700; font-size:13.5px}
+  .snap-meta{font-size:12px; color:var(--text-dim); margin-top:2px}
+  .snap-empty{padding:8px 10px; font-size:12.5px; color:var(--text-dim)}
   /* Update banner (dashboard, dismissible per version) */
   #update-banner{
     display:flex; align-items:center; gap:10px; flex-wrap:wrap;
@@ -406,11 +420,13 @@
           <option value="120">2 min</option>
         </select>
         <button class="btn" id="btn-refresh">↻ Refresh</button>
+        <button class="btn hidden" id="btn-monitor">🖥 Monitor</button>
         <button class="btn" id="btn-edit">✎ Edit</button>
         <button class="btn" id="btn-settings">⚙ Settings</button>
         <button class="btn" id="btn-logout">Log out</button>
       </div>
     </header>
+    <div id="snap-menu" class="hidden" role="menu"></div>
     <div id="editbar" class="hidden">
       <span>✎ <b>Edit mode</b> — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.</span>
       <button class="btn small" id="btn-addgroup">＋ New group</button>
@@ -1729,6 +1745,64 @@ async function runGroupAction(sec, kind, value) {
   fetchDevices(true);
 }
 
+/* ---------------- Snap to monitor (v1.3.0, web edition) ---------
+   A page cannot move its window across monitors. Where the Window
+   Management API exists (Chrome/Edge: window.getScreenDetails),
+   the 🖥 Monitor button lists the screens and choosing one
+   requests fullscreen on that screen — the closest a page can
+   get. Where the API is absent, the button stays hidden. (Stated
+   deviation from the Windows edition's true move+maximize; see
+   DESIGN.md.) Nothing is persisted; the choice is click-time only. */
+function snapSupported() { return typeof window.getScreenDetails === "function"; }
+var snapScreens = null;
+async function openSnapMenu() {
+  var menu = $("snap-menu");
+  if (!menu.classList.contains("hidden")) { closeSnapMenu(); return; }
+  var details;
+  try {
+    details = await window.getScreenDetails();
+  } catch (e) {
+    toast("Display access was denied, so screens can't be listed", true);
+    return;
+  }
+  snapScreens = details;
+  renderSnapMenu();
+  var r = $("btn-monitor").getBoundingClientRect();
+  menu.style.left = Math.max(8, r.right - 300) + "px";
+  menu.style.top = (r.bottom + 6) + "px";
+  menu.classList.remove("hidden");
+  if (details.addEventListener) details.addEventListener("screenschange", renderSnapMenu);
+}
+function closeSnapMenu() { $("snap-menu").classList.add("hidden"); }
+function renderSnapMenu() {
+  var menu = $("snap-menu");
+  menu.innerHTML = "";
+  if (!snapScreens || !snapScreens.screens.length) {
+    menu.appendChild(el("div", "snap-empty", "No displays found"));
+    return;
+  }
+  snapScreens.screens.forEach(function (s, i) {
+    var name = s.label || ("Display " + (i + 1));
+    var meta = s.width + " × " + s.height
+      + (s.height > s.width ? " · Portrait" : " · Landscape")
+      + (s.isPrimary ? " · Primary" : "")
+      + (snapScreens.currentScreen === s ? " · This window is here" : "");
+    var item = el("button", "snap-item");
+    item.appendChild(el("div", "snap-name", name));
+    item.appendChild(el("div", "snap-meta", meta));
+    item.addEventListener("click", function () { snapToScreen(s); });
+    menu.appendChild(item);
+  });
+}
+async function snapToScreen(screen) {
+  closeSnapMenu();
+  try {
+    await document.documentElement.requestFullscreen({ screen: screen });
+  } catch (e) {
+    toast("Fullscreen on that display was denied", true);
+  }
+}
+
 /* ---------------- Auto-update runtime ---------------- */
 function loadUpdateStore() { return slcGet("update", { lastCheck: 0, dismissed: "" }); }
 function saveUpdateStore(u) { slcSet("update", u); }
@@ -2829,6 +2903,17 @@ function init() {
   $("set-previews").addEventListener("change", function (ev) {
     S.prefs.previews = ev.target.checked; savePrefs(); renderAll();
   });
+  /* Snap to monitor (v1.3.0): the button exists only where the
+     Window Management API does. */
+  if (snapSupported()) {
+    $("btn-monitor").classList.remove("hidden");
+    $("btn-monitor").addEventListener("click", openSnapMenu);
+    document.addEventListener("click", function (ev) {
+      var menu = $("snap-menu");
+      if (!menu.classList.contains("hidden") && !menu.contains(ev.target) && ev.target.id !== "btn-monitor") closeSnapMenu();
+    });
+    document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") closeSnapMenu(); });
+  }
   $("btn-settings").addEventListener("click", showSettings);
   $("btn-back").addEventListener("click", function () { showApp(); renderAll(); });
   $("set-theme").addEventListener("change", function (ev) { S.prefs.theme = ev.target.value; savePrefs(); applyPrefs(); });
