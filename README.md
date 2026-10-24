@@ -49,11 +49,15 @@ Start Menu shortcuts and an uninstaller. No administrator rights required.
 
 **macOS:** grab `SmartLifeTuyaDesktop-v<version>.dmg` from the same
 release, open it, and drag the app into Applications. The build is
-**unsigned** (no Apple Developer certificate), so the first launch needs
-the standard bypass: **right-click the app → Open** (and confirm), or run
-`xattr -dr com.apple.quarantine /Applications/SmartLifeTuyaDesktop.app`
-once. After that it opens normally. One universal binary covers both
-Apple Silicon and Intel Macs.
+**unsigned** (no Apple Developer certificate), so on first launch macOS
+refuses and offers to move it to Trash — don't. Instead open **System
+Settings → Privacy & Security**, scroll to the Security section, and
+click **Open Anyway** next to the app, then authenticate (Touch ID or
+password) and confirm **Open**. After that it opens normally. (Terminal
+alternative, before first launch:
+`xattr -dr com.apple.quarantine /Applications/SmartLifeTuyaDesktop.app`;
+on older macOS versions, right-click → Open does the same job.) One
+universal binary covers both Apple Silicon and Intel Macs.
 
 The installers are larger than they used to be (~100 MB) because they
 bundle ffmpeg for live camera video — see [Camera video](#camera-video)
