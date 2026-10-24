@@ -105,7 +105,46 @@ instructions below.)
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.3.0
+
+- **Snap to monitor (Windows app).** A new **🖥 Monitor** button
+  in the header lists your displays (name, resolution,
+  orientation, which one is primary, and which one the window
+  is on). Pick one and the window moves there and maximizes —
+  handy with multiple monitors, including portrait ones. It
+  acts only when you click: nothing is saved, and how the app
+  starts is unchanged. In the **web edition** (Chrome/Edge), the
+  same button picks a screen for fullscreen instead — a page
+  can't move its own window — and is hidden where the browser
+  doesn't support that.
+- **Fixed: every light showing as Off.** The service reports a
+  light's on/off as text (`"true"`/`"false"`) while plugs use a
+  real on/off value; the app only understood the plug format,
+  so all lights read Off (and their brightness readings were
+  dropped too). Lights now report correctly in both editions.
+- **The colour-only strip lost its brightness slider** (e.g.
+  the Desk RGB strip). Through this service it reports on/off
+  and colour only — no brightness or colour temperature — so it
+  no longer shows controls the service can't honour; colour and
+  on/off still work, and it still joins group colour and
+  on/off broadcasts. (The strip itself can dim in the official
+  app; this service just doesn't expose it.)
+- **Group header sliders aligned.** The colour-temperature
+  slider sat a few points lower than the brightness slider in
+  section headers; both tracks now share one baseline.
+- **Black is the default theme** on a fresh install. If you
+  already picked Dark or Light, your choice is kept.
+- **Removed: window position memory (was 1.2.5).** Startup
+  placement is back to the plain OS default — see the note on
+  the 1.2.5 section below.
+
 ## What's new in 1.2.5
+
+> **Removed in 1.3.0.** The placement memory below could reopen
+> the window slightly off-screen (title bar out of reach) on
+> some multi-monitor setups, so the feature was taken back out;
+> 1.3.0 starts with the OS-default placement, and the new
+> 🖥 Monitor snap (above) covers moving between displays.
 
 - **The app remembers where its window was (Windows app).**
   Window position, size and maximized state are saved as you
