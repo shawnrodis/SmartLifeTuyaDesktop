@@ -18,6 +18,11 @@ plugs, switches and scenes — in editions that look and behave the same:
   No build step, no dependencies. Also live at
   [shawnrodis.github.io/SmartLifeTuyaDesktop](https://shawnrodis.github.io/SmartLifeTuyaDesktop).
 
+> **Android?** There is no Android port, by design — Smart Life, Tuya,
+> and Tapo already exist as Android apps and do the mobile job well. If
+> you absolutely must have an APK version of this, wrap the web edition
+> yourself with [web-to-app](https://github.com/shiaho777/web-to-app).
+
 Both sign in to Tuya's cloud with the same account you use in the Smart Life
 (or Tuya Smart) app and control devices through Tuya's own API — the same
 approach as the classic Smart Life web dashboards, with the tidy,
