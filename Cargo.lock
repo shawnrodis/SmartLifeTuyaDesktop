@@ -1381,6 +1381,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3739,11 +3749,12 @@ checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
 name = "smartlife-tuya-desktop"
-version = "1.3.2"
+version = "1.4.0"
 dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "fs2",
  "raw-window-handle 0.6.2",
  "reqwest",
  "serde",

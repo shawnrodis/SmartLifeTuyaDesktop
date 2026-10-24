@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! SmartLife & Tuya Desktop (Windows edition) — a clean dashboard for
+//! SmartLife & Tuya Desktop (native desktop editions: Windows &
+//! macOS) — a clean dashboard for
 //! Smart Life / Tuya devices, 1:1 with the single-file web edition in
 //! `web/SmartLife_Tuya_Desktop.html`. Both talk to Tuya's legacy consumer
 //! cloud API ("homeassistant" API):
@@ -317,9 +318,11 @@ struct Prefs {
     /// then PATH). A full path or a bare program name both work.
     #[serde(default)]
     ffmpeg_path: String,
-    /// Start with Windows (v1.2.1): an entry exists in the per-user
-    /// HKCU Run key. The registry is the source of truth — this is
-    /// reconciled against it at startup (see reconcile_autostart).
+    /// Start with the OS (v1.2.1): an entry exists in the
+    /// platform's per-user autostart store (Windows: the HKCU
+    /// Run key; macOS: a LaunchAgent plist, v1.4.0). The store
+    /// is the source of truth — this is reconciled against it
+    /// at startup (see reconcile_autostart).
     #[serde(default)]
     start_with_windows: bool,
     /// How autostart launches the app: "normal" | "minimized" |
@@ -407,6 +410,12 @@ struct UpdateCfg {
 fn config_path() -> PathBuf {
     let base: PathBuf = if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        // The native macOS per-user data home (v1.4.0) — a Mac
+        // user looks in ~/Library/Application Support, never in
+        // ~/.config.
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -414,6 +423,16 @@ fn config_path() -> PathBuf {
     }
     .unwrap_or_else(|| PathBuf::from("."));
     base.join("SmartLifeTuyaDesktop").join("config.json")
+}
+
+/// The directory holding config.json — sibling files (the macOS
+/// single-instance lock, the show-request signal) live here too.
+#[cfg(any(target_os = "macos", test))]
+fn config_dir() -> PathBuf {
+    config_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn load_config() -> Config {
@@ -894,12 +913,14 @@ fn open_external(url: &str) -> Result<(), String> {
         .map_err(|e| format!("{}", e))
 }
 
-/// File name to look for on disk for a bare player name.
+/// File name to look for on disk for a bare player name. The
+/// ".exe" suffix is a Windows convention; elsewhere the bare
+/// name is already the file name.
 fn player_exe_name(name: &str) -> String {
-    if name.to_lowercase().ends_with(".exe") {
-        name.to_string()
-    } else {
+    if cfg!(target_os = "windows") && !name.to_lowercase().ends_with(".exe") {
         format!("{}.exe", name)
+    } else {
+        name.to_string()
     }
 }
 
@@ -976,10 +997,12 @@ fn app_paths_lookup(_name: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Startup & system tray (v1.2.1) — WINDOWS EDITION ONLY. Starting
-// with Windows, running minimized to the tray and closing to the
-// tray are system behaviours a web page simply doesn't have; the
-// web edition is unchanged and DESIGN.md documents the difference.
+// Startup & system tray (v1.2.1 on Windows; v1.4.0 adds macOS
+// with the native mechanisms — a LaunchAgent for start-at-login,
+// the menu-bar tray). Starting with the OS, running minimized
+// to the tray and closing to the tray are system behaviours a
+// web page simply doesn't have; the web edition is unchanged
+// and DESIGN.md documents the differences.
 // ---------------------------------------------------------------------------
 
 /// The per-user autostart (Run) key + this app's value name in it.
@@ -1062,8 +1085,10 @@ fn resolve_launch_mode(argv: LaunchMode, prefs: LaunchMode) -> LaunchMode {
     }
 }
 
-/// The value stored in the Run key: the exe path in quotes (install
-/// paths contain spaces), plus the launch-mode flag if any.
+/// The stored autostart command: the exe path in quotes (install
+/// paths contain spaces), plus the launch-mode flag if any. The
+/// Run key stores it verbatim; the macOS LaunchAgent stores the
+/// same command decomposed into ProgramArguments.
 fn autostart_command(exe: &Path, mode: LaunchMode) -> String {
     let mut s = format!("\"{}\"", exe.display());
     if let Some(f) = mode.flag() {
@@ -1073,8 +1098,8 @@ fn autostart_command(exe: &Path, mode: LaunchMode) -> String {
     s
 }
 
-/// What the Run key SHOULD hold for these prefs: the command when
-/// "Start with Windows" is ON, or None when OFF — OFF is a
+/// What the autostart store SHOULD hold for these prefs: the
+/// command when autostart is ON, or None when OFF — OFF is a
 /// first-class state meaning NO autostart entry exists at all.
 fn desired_autostart(prefs: &Prefs, exe: &Path) -> Option<String> {
     if prefs.start_with_windows {
@@ -1083,6 +1108,26 @@ fn desired_autostart(prefs: &Prefs, exe: &Path) -> Option<String> {
         None
     }
 }
+
+/// Startup & background panel wording (v1.4.0): the feature is
+/// the same on both desktop platforms; the OS nouns are not.
+#[cfg(target_os = "windows")]
+const AUTOSTART_LABEL: &str = "Start with Windows";
+#[cfg(not(target_os = "windows"))]
+const AUTOSTART_LABEL: &str = "Start at login";
+
+#[cfg(target_os = "windows")]
+const CLOSE_TO_TRAY_LABEL: &str =
+    "Keep running in the system tray when the window is closed";
+#[cfg(not(target_os = "windows"))]
+const CLOSE_TO_TRAY_LABEL: &str =
+    "Keep running in the menu bar when the window is closed";
+
+#[cfg(not(target_os = "macos"))]
+const AUTOSTART_HELP: &str = "Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. The “Launch as” choice applies to every launch of the app — autostart, Start Menu, and shortcuts alike — not just the Windows-startup one; a launch that carries its own --minimized or --maximized flag (as the autostart entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a Windows-app feature; the web edition has no equivalent.";
+
+#[cfg(target_os = "macos")]
+const AUTOSTART_HELP: &str = "Start at login uses a per-user LaunchAgent in ~/Library/LaunchAgents — no administrator rights needed, and OFF means no LaunchAgent file exists at all. The “Launch as” choice applies to every launch of the app — login, Finder, and Dock alike — not just the login one; a launch that carries its own --minimized or --maximized flag (as the LaunchAgent entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the menu bar at the top of the screen, and clicking the icon (or “Open” on its menu) brings the window back. With “Keep running in the menu bar” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the icon's menu. The icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a native-app feature; the web edition has no equivalent.";
 
 // ---------------------------------------------------------------------------
 // Snap to monitor (v1.3.0; mechanism replaced in v1.3.1): a
@@ -1323,8 +1368,10 @@ fn enumerate_monitors() -> Vec<MonitorInfo> {
     out
 }
 
-/// Non-Windows builds have no enumeration (the snap button then
-/// reports no displays) — the shipped app is the Windows one.
+/// Non-Windows builds have no enumeration: the snap is a Win32
+/// mechanism and its button is Windows-only UI (v1.4.0), so no
+/// snap job can ever start elsewhere — this stub just keeps the
+/// shared helpers (menu marker maths, the state machine) total.
 #[cfg(not(target_os = "windows"))]
 fn enumerate_monitors() -> Vec<MonitorInfo> {
     Vec::new()
@@ -1668,7 +1715,7 @@ fn win32_show_main_window(restore: bool) {
 /// Pure event→action mapping for tray MENU events (muda channel):
 /// the Open item shows, the Quit item quits, anything else is not
 /// ours. No state of any kind gates the mapping.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn tray_action_for_menu(
     id: &tray_icon::menu::MenuId,
     open_id: &tray_icon::menu::MenuId,
@@ -1689,7 +1736,7 @@ fn tray_action_for_menu(
 /// click is only complete on release), a left double-click
 /// shows; everything else is ignored — the same mapping
 /// drain_tray_events used pre-v1.2.3.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn tray_action_for_icon_parts(double_click: bool, left_button: bool, button_up: bool) -> Option<TrayAction> {
     if (double_click && left_button) || (left_button && button_up) {
         Some(TrayAction::Show)
@@ -1886,6 +1933,71 @@ fn acquire_single_instance() -> (InstanceRole, Option<InstanceGuard>) {
     }
 }
 
+// ----------------------------------------------------------------
+// Single instance (v1.4.0, macOS) — the same contract as the
+// Windows mutex guard above, with native mechanisms: the
+// primary holds an exclusive flock (fs2) on instance.lock in
+// the config dir for its whole lifetime; the OS releases it
+// when the process dies, however it dies, so a stale lock is
+// impossible. A secondary can't signal through a kernel event
+// (there is none), so it touches a show-request file the
+// primary polls from its frame loop (throttled — the hidden
+// 200 ms heartbeat guarantees frames while it matters) and
+// exits before creating a window, an icon or a pump.
+// ----------------------------------------------------------------
+
+/// Try to take the instance lock at `path`, creating the file
+/// if needed. Some(file) = the lock is held (keep the File
+/// alive — dropping it releases the lock); None = another
+/// process holds it, or the file couldn't be created at all
+/// (the caller decides which; see acquire_single_instance).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn try_lock_instance_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The macOS instance guard: just the locked file. Dropping it
+/// closes the fd, which releases the flock.
+#[cfg(target_os = "macos")]
+struct FileInstanceGuard {
+    _file: std::fs::File,
+}
+
+/// The show-request signal file (macOS single instance): a
+/// secondary launch creates it; the primary polls for it,
+/// consumes it and shows its window.
+#[cfg(target_os = "macos")]
+fn show_request_path() -> PathBuf {
+    config_dir().join("show-request")
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_single_instance() -> (InstanceRole, Option<FileInstanceGuard>) {
+    let dir = config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    match try_lock_instance_file(&dir.join("instance.lock")) {
+        Ok(Some(file)) => (InstanceRole::Primary, Some(FileInstanceGuard { _file: file })),
+        Ok(None) => {
+            // Secondary: ask the primary to show itself, then
+            // let main exit BEFORE any window / tray icon /
+            // pump exists — the Windows contract, via a file.
+            let _ = std::fs::write(show_request_path(), b"show");
+            (InstanceRole::Secondary, None)
+        }
+        // Couldn't even create the lock file — never block the
+        // launch itself (same rule as the Windows path).
+        Err(_) => (InstanceRole::Primary, None),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn reg_command() -> Command {
     let mut cmd = Command::new("reg");
@@ -1896,7 +2008,132 @@ fn reg_command() -> Command {
     cmd
 }
 
-/// The current Run-key value for this app, if an entry exists.
+// ----------------------------------------------------------------
+// macOS autostart (v1.4.0): a per-user LaunchAgent plist is the
+// native equivalent of the Windows Run key — launchd runs the
+// program at login while the file exists in ~/Library/
+// LaunchAgents, and removing the file removes the entry
+// completely (no launchctl bookkeeping needed for agents that
+// only carry RunAtLoad). The conversion helpers are pure
+// (command <-> plist), so the round-trip is unit-tested on any
+// host; the reg_* macOS impls below just read/write the file.
+// reg_run_value reports the stored command in the same
+// "\"<exe>\" --flag" shape the registry path reports, so
+// reconcile_autostart treats both stores identically.
+// ----------------------------------------------------------------
+
+/// This app's LaunchAgent label (= plist file stem).
+#[cfg(any(target_os = "macos", test))]
+const LAUNCH_AGENT_LABEL: &str = "com.shawnrodis.smartlifetuya";
+
+/// Where the LaunchAgent plist lives (macOS).
+#[cfg(target_os = "macos")]
+fn launch_agent_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| {
+        PathBuf::from(h)
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{}.plist", LAUNCH_AGENT_LABEL))
+    })
+}
+
+/// XML-escape text destined for a plist <string>.
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Inverse of xml_escape (only the entities it can produce).
+#[cfg(any(target_os = "macos", test))]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Split a stored autostart command ("\"<exe>\" --minimized")
+/// back into its exe path and launch mode — the inverse of
+/// autostart_command, shared by the macOS plist writer.
+#[cfg(any(target_os = "macos", test))]
+fn parse_autostart_command(cmd: &str) -> Option<(String, LaunchMode)> {
+    let cmd = cmd.trim();
+    let exe = if let Some(rest) = cmd.strip_prefix('"') {
+        rest.split('"').next()?.to_string()
+    } else {
+        cmd.split_whitespace().next()?.to_string()
+    };
+    if exe.is_empty() {
+        return None;
+    }
+    Some((exe, launch_mode_from_command(cmd)))
+}
+
+/// The LaunchAgent plist for a stored autostart command.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_plist(cmd: &str) -> Option<String> {
+    let (exe, mode) = parse_autostart_command(cmd)?;
+    let mut lines: Vec<String> = vec![
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_string(),
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">".to_string(),
+        "<plist version=\"1.0\">".to_string(),
+        "<dict>".to_string(),
+        "    <key>Label</key>".to_string(),
+        format!("    <string>{}</string>", LAUNCH_AGENT_LABEL),
+        "    <key>ProgramArguments</key>".to_string(),
+        "    <array>".to_string(),
+        format!("        <string>{}</string>", xml_escape(&exe)),
+    ];
+    if let Some(flag) = mode.flag() {
+        lines.push(format!("        <string>{}</string>", flag));
+    }
+    lines.extend([
+        "    </array>".to_string(),
+        "    <key>RunAtLoad</key>".to_string(),
+        "    <true/>".to_string(),
+        "</dict>".to_string(),
+        "</plist>".to_string(),
+        String::new(),
+    ]);
+    Some(lines.join("\n"))
+}
+
+/// The exe a LaunchAgent plist launches: the first <string> of
+/// its ProgramArguments array. (The launch-mode flag, when
+/// present, is a later <string> in the same array and is read
+/// off the whole text by launch_mode_from_command.)
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_exe(plist: &str) -> Option<String> {
+    let after = plist.split("<key>ProgramArguments</key>").nth(1)?;
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    let exe = xml_unescape(after[start..end].trim());
+    if exe.is_empty() {
+        None
+    } else {
+        Some(exe)
+    }
+}
+
+/// Reconstruct the stored autostart command from a plist's
+/// text — what reg_run_value reports on macOS. None when the
+/// plist isn't this app's agent.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_command(plist: &str) -> Option<String> {
+    if !plist.contains(LAUNCH_AGENT_LABEL) {
+        return None;
+    }
+    let exe = launch_agent_exe(plist)?;
+    Some(autostart_command(
+        Path::new(&exe),
+        launch_mode_from_command(plist),
+    ))
+}
+
+/// The current autostart entry for this app, if one exists —
+/// the Run-key value on Windows, the LaunchAgent's command on
+/// macOS. Same reported shape on both (see the notes above).
 #[cfg(target_os = "windows")]
 fn reg_run_value() -> Option<String> {
     let key = format!("HKCU\\{}", RUN_KEY);
@@ -1910,12 +2147,20 @@ fn reg_run_value() -> Option<String> {
     parse_reg_named_value(&String::from_utf8_lossy(&out.stdout), RUN_VALUE_NAME)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn reg_run_value() -> Option<String> {
+    let path = launch_agent_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    launch_agent_command(&text)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn reg_run_value() -> Option<String> {
     None
 }
 
-/// Write (Some) or remove (None) the Run-key value.
+/// Write (Some) or remove (None) the autostart entry — the
+/// Run-key value on Windows, the LaunchAgent plist on macOS.
 #[cfg(target_os = "windows")]
 fn reg_set_run_value(cmdline: Option<&str>) -> bool {
     let key = format!("HKCU\\{}", RUN_KEY);
@@ -1930,17 +2175,37 @@ fn reg_set_run_value(cmdline: Option<&str>) -> bool {
     status.map(|s| s.success()).unwrap_or(false)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn reg_set_run_value(cmdline: Option<&str>) -> bool {
+    let Some(path) = launch_agent_path() else {
+        return false;
+    };
+    match cmdline {
+        Some(cmd) => {
+            let Some(plist) = launch_agent_plist(cmd) else {
+                return false;
+            };
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            std::fs::write(&path, plist).is_ok()
+        }
+        None => !path.exists() || std::fs::remove_file(&path).is_ok(),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn reg_set_run_value(_cmdline: Option<&str>) -> bool {
     false
 }
 
-/// Startup reconciliation: the REGISTRY is the truth for "Start
-/// with Windows". An existing entry wins — the toggle shows ON,
-/// its flag sets the stored launch mode, and a stale command (an
-/// old exe path after a move, say) is rewritten canonically for
-/// the current exe. No entry → the toggle shows OFF, whatever the
-/// saved prefs claimed, so the switch never lies.
+/// Startup reconciliation: the OS autostart STORE is the truth
+/// for "Start with Windows / at login". An existing entry wins —
+/// the toggle shows ON, its flag sets the stored launch mode, and
+/// a stale command (an old exe path after a move, say) is
+/// rewritten canonically for the current exe. No entry → the
+/// toggle shows OFF, whatever the saved prefs claimed, so the
+/// switch never lies.
 fn reconcile_autostart(cfg: &mut Config) {
     let Ok(exe) = std::env::current_exe() else { return };
     match reg_run_value() {
@@ -1959,8 +2224,9 @@ fn reconcile_autostart(cfg: &mut Config) {
     }
 }
 
-/// Apply the Start-with-Windows prefs to the registry; true when
-/// the registry afterwards holds exactly what the prefs intend.
+/// Apply the Start-with-Windows prefs to the OS autostart store;
+/// true when the store afterwards holds exactly what the prefs
+/// intend.
 fn apply_autostart(prefs: &Prefs) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
@@ -1974,11 +2240,11 @@ fn apply_autostart(prefs: &Prefs) -> bool {
 /// stay alive — dropping it removes the icon — so it rides along
 /// in the App for the whole session once created.
 struct TrayState {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     _icon: tray_icon::TrayIcon,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     open_id: tray_icon::menu::MenuId,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     quit_id: tray_icon::menu::MenuId,
 }
 
@@ -1989,7 +2255,7 @@ enum TrayAction {
     Quit,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn build_tray() -> Option<TrayState> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
     let open_item = MenuItem::new("Open SmartLife & Tuya Desktop", true, None);
@@ -2019,18 +2285,27 @@ fn build_tray() -> Option<TrayState> {
     })
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn build_tray() -> Option<TrayState> {
     None
 }
 
-/// v1.2.3: tray events are no longer drained here. The dedicated
-/// tray thread (spawn_tray_thread, by TRAY_QUEUE above) owns both
-/// receivers — muda's menu channel and tray-icon's icon channel —
-/// and pushes mapped actions onto TRAY_QUEUE; the UI thread just
-/// drains the queue in handle_window_chrome. Draining from
-/// update() starved whenever the hidden window ran no frames,
-/// which is exactly when tray actions matter.
+/// v1.2.3: tray events are no longer drained here (on Windows).
+/// The dedicated tray thread (spawn_tray_thread, by TRAY_QUEUE
+/// above) owns both receivers — muda's menu channel and tray-icon's
+/// icon channel — and pushes mapped actions onto TRAY_QUEUE; the
+/// UI thread just drains the queue in handle_window_chrome.
+/// Draining from update() starved on Windows whenever the hidden
+/// window ran no frames, which is exactly when tray actions
+/// matter (see the Bug C note at TRAY_QUEUE).
+///
+/// macOS (v1.4.0) deliberately uses the simpler pre-v1.2.3
+/// pattern — App::poll_tray_events_macos drains both receivers
+/// into the same TRAY_QUEUE from handle_window_chrome. The
+/// starvation was a Windows/winit quirk (an invisible window
+/// never turns request_redraw into a frame); on macOS the
+/// run loop keeps delivering the 200 ms hidden heartbeat, so
+/// frames — and therefore polls — keep happening while hidden.
 
 /// The main window's HWND, for the one-time tray balloon.
 #[cfg(target_os = "windows")]
@@ -2116,13 +2391,17 @@ fn show_tray_balloon(_hwnd: isize) {}
 
 /// VLC's well-known install folders: its installer registers App
 /// Paths but does NOT add itself to PATH (the v1.1.0 "vlc: program
-/// not found" bug — VLC was installed all along).
+/// not found" bug — VLC was installed all along). On macOS the
+/// binary lives inside the app bundle in /Applications.
 fn vlc_known_dirs() -> Vec<PathBuf> {
     let mut v = Vec::new();
     for var in ["ProgramFiles", "ProgramFiles(x86)"] {
         if let Some(pf) = std::env::var_os(var) {
             v.push(PathBuf::from(pf).join("VideoLAN").join("VLC"));
         }
+    }
+    if cfg!(target_os = "macos") {
+        v.push(PathBuf::from("/Applications/VLC.app/Contents/MacOS"));
     }
     v
 }
@@ -2158,10 +2437,12 @@ fn launch_player(player_cmd: &str, url: &str) -> Result<String, String> {
     let spawn_path = match resolve_player_program(&prog) {
         Some(p) => p,
         None => {
-            return Err(format!(
-                "{}: program not found (searched PATH, the Windows App Paths registry entries, and the usual install folders)",
-                prog
-            ))
+            let searched = if cfg!(target_os = "windows") {
+                "searched PATH, the Windows App Paths registry entries, and the usual install folders"
+            } else {
+                "searched PATH and the usual install folders"
+            };
+            return Err(format!("{}: program not found ({})", prog, searched))
         }
     };
     Command::new(&spawn_path)
@@ -2219,13 +2500,35 @@ fn ffmpeg_args(url: &str, w: usize, h: usize) -> Vec<String> {
     ]
 }
 
+/// The bundled ffmpeg's file name for a macOS architecture
+/// (v1.4.0): the CI ships one static build per architecture in
+/// the .app's Resources under these exact names, and the app
+/// picks its own architecture's. None for anything else.
+#[cfg(any(target_os = "macos", test))]
+fn ffmpeg_bundled_name(arch: &str) -> Option<&'static str> {
+    match arch {
+        "aarch64" => Some("ffmpeg-arm64"),
+        "x86_64" => Some("ffmpeg-x86_64"),
+        _ => None,
+    }
+}
+
 /// Candidate ffmpeg locations, in lookup order: (1) beside the app
-/// exe (the installer puts it there), (2) the Settings override (a
-/// path, or a bare name resolved against PATH), (3) PATH.
+/// exe (the Windows installer puts it there; on macOS the .app's
+/// Resources copy — per-architecture, see ffmpeg_bundled_name —
+/// sits beside-equivalent at ../Resources), (2) the Settings
+/// override (a path, or a bare name resolved against PATH),
+/// (3) PATH.
 fn ffmpeg_candidates(exe_dir: &Path, override_path: &str, path_var: &str) -> Vec<PathBuf> {
     let bin = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     let mut out: Vec<PathBuf> = Vec::new();
     out.push(exe_dir.join(bin));
+    #[cfg(target_os = "macos")]
+    if let Some(name) = ffmpeg_bundled_name(std::env::consts::ARCH) {
+        // .app layout: the exe is Contents/MacOS/<exe>, the
+        // bundled binaries are Contents/Resources/<name>.
+        out.push(exe_dir.join("../Resources").join(name));
+    }
     let ov = override_path.trim();
     if !ov.is_empty() {
         let p = PathBuf::from(ov);
@@ -3310,9 +3613,13 @@ enum NetResult {
 // ---------------------------------------------------------------------------
 // Auto-update (workstream C) — both editions check the project's GitHub
 // "latest release" at most once per 24 h (attempt-based) and compare
-// versions numerically. This edition can go further than the web page:
-// it downloads the Setup .exe, verifies its name, runs it, and exits so
-// the per-user installer can replace the running app.
+// versions numerically. The native editions go further than the web
+// page, each with its own asset (v1.4.0 made the choice a platform
+// function): Windows downloads the Setup .exe, verifies its name,
+// runs it, and exits so the per-user installer can replace the
+// running app; macOS downloads the .dmg, verifies its name, and
+// OPENS it (drag-to-Applications is the user's step — the app
+// never touches its own bundle and does not exit).
 // ---------------------------------------------------------------------------
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3322,8 +3629,53 @@ const RELEASES_PAGE: &str =
     "https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 const UPDATE_PERIOD_MS: i64 = 24 * 60 * 60 * 1000;
 
-fn expected_installer_name(version: &str) -> String {
-    format!("SmartLifeTuyaDesktop-Setup-v{}.exe", version)
+/// The release asset THIS platform installs from: the Windows
+/// Setup .exe, or the macOS disk image (v1.4.0). `os` is
+/// std::env::consts::OS at the call site; a parameter so both
+/// platforms' choices are unit-testable on any host. The macOS
+/// app must never be offered the .exe (or vice versa).
+fn expected_update_asset_name_for(version: &str, os: &str) -> String {
+    if os == "macos" {
+        format!("SmartLifeTuyaDesktop-v{}.dmg", version)
+    } else {
+        format!("SmartLifeTuyaDesktop-Setup-v{}.exe", version)
+    }
+}
+
+fn expected_update_asset_name(version: &str) -> String {
+    expected_update_asset_name_for(version, std::env::consts::OS)
+}
+
+/// Pick this platform's asset out of a release's asset list —
+/// an exact name match (the same strictness the download
+/// verification applies again before anything runs/opens).
+fn select_update_asset<'a>(assets: &'a [Value], version: &str, os: &str) -> Option<&'a Value> {
+    let want = expected_update_asset_name_for(version, os);
+    assets.iter().find(|a| {
+        a.get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| n == want)
+            .unwrap_or(false)
+    })
+}
+
+/// What "install" means once the asset is downloaded & verified.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum UpdateInstall {
+    /// Windows: run the Setup .exe, then exit so it can replace
+    /// the running app.
+    RunInstallerAndExit,
+    /// macOS: open the .dmg and let the user drag the app into
+    /// Applications; the app keeps running.
+    OpenDiskImage,
+}
+
+fn update_install_for(os: &str) -> UpdateInstall {
+    if os == "macos" {
+        UpdateInstall::OpenDiskImage
+    } else {
+        UpdateInstall::RunInstallerAndExit
+    }
 }
 
 fn parse_version(s: &str) -> Vec<u64> {
@@ -3354,29 +3706,26 @@ fn version_newer(latest: &str, current: &str) -> bool {
 struct ReleaseInfo {
     version: String,
     page_url: String,
-    exe_name: String,
-    exe_url: String,
-    exe_size: u64,
+    asset_name: String,
+    asset_url: String,
+    asset_size: u64,
 }
 
-/// Pull the installer asset out of a GitHub "latest release" response.
+/// Pull THIS platform's update asset out of a GitHub "latest
+/// release" response (the Setup .exe on Windows, the .dmg on
+/// macOS — select_update_asset).
 fn parse_release(v: &Value) -> Option<ReleaseInfo> {
     let tag = v.get("tag_name")?.as_str()?;
     let version = tag.trim_start_matches('v').to_string();
     let page_url = v.get("html_url")?.as_str()?.to_string();
     let assets = v.get("assets")?.as_array()?;
-    let exe = assets.iter().find(|a| {
-        a.get("name")
-            .and_then(|n| n.as_str())
-            .map(|n| n.starts_with("SmartLifeTuyaDesktop-Setup-") && n.ends_with(".exe"))
-            .unwrap_or(false)
-    })?;
+    let asset = select_update_asset(assets, &version, std::env::consts::OS)?;
     Some(ReleaseInfo {
         version,
         page_url,
-        exe_name: exe.get("name")?.as_str()?.to_string(),
-        exe_url: exe.get("browser_download_url")?.as_str()?.to_string(),
-        exe_size: exe.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+        asset_name: asset.get("name")?.as_str()?.to_string(),
+        asset_url: asset.get("browser_download_url")?.as_str()?.to_string(),
+        asset_size: asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
     })
 }
 
@@ -3905,7 +4254,7 @@ struct App {
     drag: Option<DragState>,
     /// A press that hasn't yet earned drag status (see PendingDrag).
     drag_pending: Option<PendingDrag>,
-    // startup & tray (v1.2.1, Windows only): the tray icon once
+    // startup & tray (v1.2.1; macOS v1.4.0): the tray icon once
     // created (stays for the session), whether the window is
     // currently hidden in the tray, whether a real Quit is in
     // flight (bypasses close-to-tray), and the launch mode the
@@ -4138,7 +4487,7 @@ impl App {
         let saved_session = cfg.session.clone();
         app.cfg = cfg;
         // Startup & tray (v1.2.1): record how we were launched, let
-        // the registry correct the Start-with-Windows prefs, and
+        // the autostart store correct the Start-with-Windows prefs, and
         // create the tray icon when this session needs one — the
         // app started minimized (its ONLY way back is the tray) or
         // close-to-tray is on. Once created it stays for the
@@ -4387,19 +4736,20 @@ impl App {
             return;
         }
         // Verify BEFORE downloading that the asset is exactly the
-        // installer this release is supposed to ship.
-        if info.exe_name != expected_installer_name(&info.version) {
+        // update file this release is supposed to ship for THIS
+        // platform (the Setup .exe on Windows, the .dmg on macOS).
+        if info.asset_name != expected_update_asset_name(&info.version) {
             self.update_error = Some(format!(
-                "Unexpected installer name “{}” — refusing to download it. Use the releases page instead.",
-                info.exe_name
+                "Unexpected update file name “{}” — refusing to download it. Use the releases page instead.",
+                info.asset_name
             ));
             return;
         }
         self.update_error = None;
-        self.update_dl = Some((0, info.exe_size));
+        self.update_dl = Some((0, info.asset_size));
         let tx = self.tx.clone();
-        let url = info.exe_url.clone();
-        let name = info.exe_name.clone();
+        let url = info.asset_url.clone();
+        let name = info.asset_name.clone();
         std::thread::spawn(move || {
             let result: Result<std::path::PathBuf, String> = (|| {
                 let mut resp = http_client()
@@ -4957,6 +5307,45 @@ impl App {
         }
     }
 
+    /// macOS tray events (v1.4.0): drain both of tray-icon's
+    /// receivers into TRAY_QUEUE, mapped through the same pure
+    /// functions the Windows tray thread uses. Called from
+    /// handle_window_chrome just before the queue drain, so a
+    /// mapped action lands in the same frame it was polled.
+    #[cfg(target_os = "macos")]
+    fn poll_tray_events_macos(&mut self) {
+        let Some(tray) = &self.tray else { return };
+        let (open_id, quit_id) = (tray.open_id.clone(), tray.quit_id.clone());
+        let menu_rx = tray_icon::menu::MenuEvent::receiver();
+        while let Ok(ev) = menu_rx.try_recv() {
+            if let Some(a) = tray_action_for_menu(ev.id(), &open_id, &quit_id) {
+                push_tray_action(a);
+            }
+        }
+        let icon_rx = tray_icon::TrayIconEvent::receiver();
+        while let Ok(ev) = icon_rx.try_recv() {
+            use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+            let (dbl, left, up) = match &ev {
+                TrayIconEvent::DoubleClick { button, .. } => {
+                    (true, *button == MouseButton::Left, false)
+                }
+                TrayIconEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } => (
+                    false,
+                    *button == MouseButton::Left,
+                    *button_state == MouseButtonState::Up,
+                ),
+                _ => (false, false, false),
+            };
+            if let Some(a) = tray_action_for_icon_parts(dbl, left, up) {
+                push_tray_action(a);
+            }
+        }
+    }
+
     /// The real quit path (v1.2.3, extracted unchanged from the
     /// tray-Quit arm): drop the icon FIRST so no phantom icon is
     /// left behind, stop the pumps, save, and REALLY exit — the
@@ -5113,6 +5502,29 @@ impl App {
         }
         if SHOW_REQUESTED.swap(false, Ordering::SeqCst) {
             self.show_from_tray(ctx);
+        }
+        // macOS (v1.4.0): tray events are polled here, into the
+        // same queue the drain below consumes (no tray thread —
+        // see the note at build_tray).
+        #[cfg(target_os = "macos")]
+        self.poll_tray_events_macos();
+        // macOS single instance (v1.4.0): a secondary launch
+        // signals by file (no kernel event to wait on). Poll for
+        // it throttled — the hidden heartbeat keeps frames coming
+        // while hidden, which is when this matters.
+        #[cfg(target_os = "macos")]
+        {
+            static LAST_POLL_MS: std::sync::atomic::AtomicI64 =
+                std::sync::atomic::AtomicI64::new(0);
+            let now = now_ms();
+            if now - LAST_POLL_MS.load(Ordering::SeqCst) >= 400 {
+                LAST_POLL_MS.store(now, Ordering::SeqCst);
+                let path = show_request_path();
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                    self.show_from_tray(ctx);
+                }
+            }
         }
         for action in drain_tray_actions() {
             match action {
@@ -5569,13 +5981,13 @@ impl App {
                     self.update_dl = None;
                     match result {
                         Ok(path) => {
-                            // Final verification before anything runs it:
-                            // the file name must be exactly this release's
-                            // expected installer name.
+                            // Final verification before anything runs /
+                            // opens it: the file name must be exactly
+                            // this release's expected update asset.
                             let expected = self
                                 .update_info
                                 .as_ref()
-                                .map(|i| expected_installer_name(&i.version))
+                                .map(|i| expected_update_asset_name(&i.version))
                                 .unwrap_or_default();
                             let actual = path
                                 .file_name()
@@ -5586,7 +5998,7 @@ impl App {
                                 self.update_launch = Some(path);
                             } else {
                                 self.update_error = Some(
-                                    "The downloaded file's name doesn't match the expected installer, so it was not run. Use the releases page instead."
+                                    "The downloaded file's name doesn't match the expected update file, so it was not used. Use the releases page instead."
                                         .to_string(),
                                 );
                             }
@@ -5832,11 +6244,18 @@ impl App {
                         if ui.add(Button::new("↻ Refresh")).clicked() {
                             self.spawn_discovery(false);
                         }
-                        // Snap to monitor (v1.3.0): the menu lists
-                        // the displays enumerated live as it opens;
-                        // choosing one re-validates and snaps (see
+                        // Snap to monitor (v1.3.0) — WINDOWS ONLY
+                        // (v1.4.0): the mechanism is direct Win32,
+                        // so the button doesn't exist on macOS at
+                        // all (the user's multi-monitor desk is
+                        // Windows; see DESIGN.md's platform matrix).
+                        // The menu lists the displays enumerated
+                        // live as it opens; choosing one
+                        // re-validates and snaps (see
                         // snap_to_monitor). 🖥 = U+1F5A5, covered by
                         // the embedded Noto Sans Symbols 2 fallback.
+                        #[cfg(target_os = "windows")]
+                        {
                         let mut snap_choice: Option<String> = None;
                         ui.menu_button("🖥 Monitor", |ui| {
                             ui.set_min_width(264.0);
@@ -5872,6 +6291,7 @@ impl App {
                         });
                         if let Some(dev) = snap_choice {
                             self.snap_to_monitor(ctx, &dev);
+                        }
                         }
                         let mut interval = self.cfg.prefs.interval;
                         ComboBox::from_id_source("hdr_interval")
@@ -7705,7 +8125,11 @@ impl App {
                                     });
                                     ui.add_space(6.0);
                                     ui.label(
-                                        RichText::new("The download's file name is verified before it runs. This app closes itself once the installer starts, so the installer can replace it.")
+                                        RichText::new(if cfg!(target_os = "macos") {
+                                            "The download's file name is verified before it opens. The disk image opens so you can drag the new version into Applications — quit and relaunch the app afterwards."
+                                        } else {
+                                            "The download's file name is verified before it runs. This app closes itself once the installer starts, so the installer can replace it."
+                                        })
                                             .size(12.5)
                                             .color(pal.dim),
                                     );
@@ -7739,11 +8163,11 @@ impl App {
                             }
                             _ => {}
                         }
-                        // ---- Startup & background (Windows only) ----
+                        // ---- Startup & background (native editions) ----
                         let mut start_act: Option<(&'static str, String)> = None;
                         Self::settings_panel(ui, &pal, "Startup & background", |ui| {
                             let mut on = self.cfg.prefs.start_with_windows;
-                            if ui.checkbox(&mut on, "Start with Windows").changed() {
+                            if ui.checkbox(&mut on, AUTOSTART_LABEL).changed() {
                                 start_act = Some(("toggle", on.to_string()));
                             }
                             if on {
@@ -7774,18 +8198,12 @@ impl App {
                             }
                             ui.add_space(10.0);
                             let mut ctt = self.cfg.prefs.close_to_tray;
-                            if ui
-                                .checkbox(
-                                    &mut ctt,
-                                    "Keep running in the system tray when the window is closed",
-                                )
-                                .changed()
-                            {
+                            if ui.checkbox(&mut ctt, CLOSE_TO_TRAY_LABEL).changed() {
                                 start_act = Some(("tray", ctt.to_string()));
                             }
                             ui.add_space(10.0);
                             ui.label(
-                                RichText::new("Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. The “Launch as” choice applies to every launch of the app — autostart, Start Menu, and shortcuts alike — not just the Windows-startup one; a launch that carries its own --minimized or --maximized flag (as the autostart entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a Windows-app feature; the web edition has no equivalent.")
+                                RichText::new(AUTOSTART_HELP)
                                     .size(12.5)
                                     .color(pal.dim),
                             );
@@ -7796,18 +8214,18 @@ impl App {
                                 if apply_autostart(&self.cfg.prefs) {
                                     self.toast(
                                         if self.cfg.prefs.start_with_windows {
-                                            "Start with Windows: on"
+                                            format!("{}: on", AUTOSTART_LABEL)
                                         } else {
-                                            "Start with Windows: off"
+                                            format!("{}: off", AUTOSTART_LABEL)
                                         },
                                         false,
                                     );
                                 } else {
-                                    // Show the registry truth, not the wish.
+                                    // Show the store's truth, not the wish.
                                     self.cfg.prefs.start_with_windows =
                                         reg_run_value().is_some();
                                     self.toast(
-                                        "Couldn't update the Windows startup entry.",
+                                        "Couldn't update the startup entry.",
                                         true,
                                     );
                                 }
@@ -8449,19 +8867,43 @@ impl eframe::App for App {
         if self.drag.is_some() || self.drag_pending.is_some() {
             self.update_drag(ctx);
         }
-        // A verified installer download: run it, then exit so the
-        // per-user installer can replace this app while it isn't running.
+        // A verified update download (v1.4.0: the install step is
+        // platform-shaped — see UpdateInstall).
         if let Some(path) = self.update_launch.take() {
-            // An installer exit is a real exit — close-to-tray must
-            // not turn it into a hide.
-            self.quitting = true;
-            match Command::new(&path).spawn() {
-                Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Err(e) => {
-                    self.update_error = Some(format!(
-                        "The installer was downloaded but could not be started: {}",
-                        e
-                    ));
+            match update_install_for(std::env::consts::OS) {
+                UpdateInstall::RunInstallerAndExit => {
+                    // Run the installer, then exit so the per-user
+                    // installer can replace this app while it isn't
+                    // running. An installer exit is a real exit —
+                    // close-to-tray must not turn it into a hide.
+                    self.quitting = true;
+                    match Command::new(&path).spawn() {
+                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(e) => {
+                            self.update_error = Some(format!(
+                                "The installer was downloaded but could not be started: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+                UpdateInstall::OpenDiskImage => {
+                    // macOS: open the .dmg and step aside — the
+                    // user drags the new app into Applications and
+                    // relaunches when ready. The app never exits
+                    // or replaces itself.
+                    match Command::new("open").arg(&path).spawn() {
+                        Ok(_) => self.toast(
+                            "Update downloaded — drag the app into Applications to replace this copy, then relaunch.",
+                            false,
+                        ),
+                        Err(e) => {
+                            self.update_error = Some(format!(
+                                "The update was downloaded but the disk image could not be opened: {}",
+                                e
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -8554,6 +8996,14 @@ fn main() -> eframe::Result<()> {
         (InstanceRole::Secondary, _) => return Ok(()),
         (InstanceRole::Primary, guard) => guard,
     };
+    // Single instance (v1.4.0, macOS): the flock guard — a
+    // secondary signals via the show-request file and exits
+    // just as early (see acquire_single_instance above).
+    #[cfg(target_os = "macos")]
+    let _instance_guard = match acquire_single_instance() {
+        (InstanceRole::Secondary, _) => return Ok(()),
+        (InstanceRole::Primary, guard) => guard,
+    };
     // Launch mode (v1.2.1 flags; v1.2.4 resolution): the autostart
     // Run command carries --minimized / --maximized per the
     // Settings launch mode, and the same flags work for manual
@@ -8562,8 +9012,8 @@ fn main() -> eframe::Result<()> {
     // (resolve_launch_mode), so launches with no command line at
     // all — Windows' restartable-apps relaunch after sign-in, a
     // Start Menu click — honour "Minimized (to tray)" too. The
-    // saved prefs are read through the same registry reconcile
-    // App::new runs (an existing Run entry re-derives them; the
+    // saved prefs are read through the same autostart reconcile
+    // App::new runs (an existing entry re-derives them; the
     // reconcile is idempotent, App::new's pass becomes a no-op).
     let argv_mode = launch_mode_from_args(&std::env::args().collect::<Vec<String>>());
     let mut startup_cfg = load_config();
@@ -9034,7 +9484,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.3.2");
+        assert_eq!(APP_VERSION, "1.4.0");
     }
 
     #[test]
@@ -9045,18 +9495,25 @@ mod tests {
         let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
         let app_path = PathBuf::from("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe");
         let known = vec![PathBuf::from("C:\\Program Files\\VideoLAN\\VLC")];
+        // The on-disk file name is platform-shaped (v1.4.0):
+        // "vlc.exe" on Windows, the bare name elsewhere.
+        let exe_name = if cfg!(target_os = "windows") { "vlc.exe" } else { "vlc" };
         let cands = player_candidates("vlc", &path_dirs, Some(&app_path), &known);
-        assert_eq!(cands[0], PathBuf::from("/bin").join("vlc.exe"));
-        assert_eq!(cands[1], PathBuf::from("/usr/bin").join("vlc.exe"));
+        assert_eq!(cands[0], PathBuf::from("/bin").join(exe_name));
+        assert_eq!(cands[1], PathBuf::from("/usr/bin").join(exe_name));
         assert_eq!(cands[2], app_path);
         assert_eq!(
             cands[3],
-            PathBuf::from("C:\\Program Files\\VideoLAN\\VLC").join("vlc.exe")
+            PathBuf::from("C:\\Program Files\\VideoLAN\\VLC").join(exe_name)
         );
         assert_eq!(cands.len(), 4);
         // ".exe" isn't doubled, and no App Paths hit keeps the order.
-        assert_eq!(player_exe_name("vlc"), "vlc.exe");
-        assert_eq!(player_exe_name("VLC.exe"), "VLC.exe");
+        if cfg!(target_os = "windows") {
+            assert_eq!(player_exe_name("vlc"), "vlc.exe");
+            assert_eq!(player_exe_name("VLC.exe"), "VLC.exe");
+        } else {
+            assert_eq!(player_exe_name("vlc"), "vlc");
+        }
         let cands = player_candidates("mpv", &path_dirs, None, &[]);
         assert_eq!(cands.len(), 2);
         // A path-like command is used exactly as given.
@@ -9397,13 +9854,56 @@ mod tests {
         });
         let info = parse_release(&v).expect("release parses");
         assert_eq!(info.version, "1.2.0");
-        assert_eq!(info.exe_name, "SmartLifeTuyaDesktop-Setup-v1.2.0.exe");
-        assert_eq!(info.exe_name, expected_installer_name(&info.version));
+        assert_eq!(info.asset_name, "SmartLifeTuyaDesktop-Setup-v1.2.0.exe");
+        assert_eq!(info.asset_name, expected_update_asset_name(&info.version));
         assert_ne!(
             "SmartLifeTuyaDesktop-Setup-v9.9.9.exe",
-            expected_installer_name(&info.version)
+            expected_update_asset_name(&info.version)
         );
         assert!(parse_release(&json!({ "tag_name": "v1.2.0", "html_url": "x", "assets": [] })).is_none());
+    }
+
+    #[test]
+    fn update_asset_selection_per_platform() {
+        // One release carrying every platform's assets: each
+        // platform must pick exactly its own file — the macOS
+        // app must never be offered the Windows .exe, nor the
+        // Windows app the .dmg (v1.4.0).
+        let assets = json!([
+            { "name": "SmartLife_Tuya_Desktop.html", "browser_download_url": "https://dl/html", "size": 100 },
+            { "name": "SmartLifeTuyaDesktop-Setup-v1.4.0.exe", "browser_download_url": "https://dl/exe", "size": 200 },
+            { "name": "SmartLifeTuyaDesktop-v1.4.0.dmg", "browser_download_url": "https://dl/dmg", "size": 300 }
+        ]);
+        let assets = assets.as_array().unwrap();
+        let win = select_update_asset(assets, "1.4.0", "windows").expect("windows asset");
+        assert_eq!(
+            win.get("name").and_then(|n| n.as_str()),
+            Some("SmartLifeTuyaDesktop-Setup-v1.4.0.exe")
+        );
+        let mac = select_update_asset(assets, "1.4.0", "macos").expect("macos asset");
+        assert_eq!(
+            mac.get("name").and_then(|n| n.as_str()),
+            Some("SmartLifeTuyaDesktop-v1.4.0.dmg")
+        );
+        assert_eq!(mac.get("size").and_then(|s| s.as_u64()), Some(300));
+        // A release missing the platform's asset selects nothing
+        // (no update is offered) rather than the wrong file.
+        assert!(select_update_asset(&assets[..2], "1.4.0", "macos").is_none());
+        assert_eq!(
+            expected_update_asset_name_for("1.4.0", "macos"),
+            "SmartLifeTuyaDesktop-v1.4.0.dmg"
+        );
+        assert_eq!(
+            expected_update_asset_name_for("1.4.0", "windows"),
+            "SmartLifeTuyaDesktop-Setup-v1.4.0.exe"
+        );
+        // And the install step matches the asset: run + exit for
+        // the installer, open for the disk image.
+        assert_eq!(update_install_for("macos"), UpdateInstall::OpenDiskImage);
+        assert_eq!(
+            update_install_for("windows"),
+            UpdateInstall::RunInstallerAndExit
+        );
     }
 
     // ---------------- v1.2.1: section order ----------------
@@ -10048,6 +10548,100 @@ mod tests {
         assert_eq!(parse_reg_named_value(out, "Missing"), None);
         assert_eq!(parse_reg_named_value("ERROR: not found", "SmartLifeTuyaDesktop"), None);
         assert_eq!(parse_reg_named_value("", "SmartLifeTuyaDesktop"), None);
+    }
+
+    // ---------------- v1.4.0: macOS port ----------------
+
+    #[test]
+    fn launch_agent_plist_roundtrip() {
+        // The stored autostart command decomposes into the
+        // LaunchAgent plist and reads back identically, for
+        // every launch mode — the registry path stores the
+        // string itself, so the plist must not lose information.
+        for mode in [
+            LaunchMode::Normal,
+            LaunchMode::Minimized,
+            LaunchMode::Maximized,
+        ] {
+            let cmd = autostart_command(
+                Path::new(
+                    "/Applications/SmartLife & Tuya Desktop.app/Contents/MacOS/SmartLifeTuyaDesktop",
+                ),
+                mode,
+            );
+            let plist = launch_agent_plist(&cmd).expect("plist builds");
+            assert!(plist.contains(LAUNCH_AGENT_LABEL));
+            assert!(plist.contains("<key>RunAtLoad</key>"));
+            // The "&" in the path is XML-escaped in the plist…
+            assert!(plist.contains("SmartLife &amp; Tuya"));
+            // …and unescaped on read-back: an exact round-trip.
+            assert_eq!(launch_agent_command(&plist).as_deref(), Some(cmd.as_str()));
+        }
+        // A foreign plist is not this app's agent.
+        assert!(launch_agent_command("<plist><dict></dict></plist>").is_none());
+        // Garbage commands don't build plists.
+        assert!(launch_agent_plist("").is_none());
+        assert!(parse_autostart_command("").is_none());
+        // An unquoted stored command (no spaces in the path)
+        // parses too.
+        assert_eq!(
+            parse_autostart_command("/opt/app/SmartLifeTuyaDesktop --maximized"),
+            Some((
+                "/opt/app/SmartLifeTuyaDesktop".to_string(),
+                LaunchMode::Maximized
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_file_excludes_second_holder() {
+        // The macOS single-instance guard's core: while one
+        // holder has the flock, a second attempt gets None; once
+        // the holder drops, the lock is free again (the OS
+        // releases it with the fd — no stale locks possible).
+        let path = std::env::temp_dir().join(format!(
+            "sltd-instance-lock-test-{}.lock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let first = try_lock_instance_file(&path)
+            .expect("lock file creates")
+            .expect("first holder gets the lock");
+        assert!(try_lock_instance_file(&path)
+            .expect("second open works")
+            .is_none());
+        drop(first);
+        assert!(try_lock_instance_file(&path)
+            .expect("relock works")
+            .is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ffmpeg_bundled_names_per_arch() {
+        // The names the macOS CI must place in the .app's
+        // Resources — the app looks up exactly these.
+        assert_eq!(ffmpeg_bundled_name("aarch64"), Some("ffmpeg-arm64"));
+        assert_eq!(ffmpeg_bundled_name("x86_64"), Some("ffmpeg-x86_64"));
+        assert_eq!(ffmpeg_bundled_name("arm"), None);
+    }
+
+    #[test]
+    fn snap_monitor_button_is_windows_only() {
+        // Structural gate (v1.4.0): the 🖥 Monitor menu button is
+        // Windows-only UI (the snap mechanism is direct Win32) —
+        // it must stay behind its cfg gate so macOS never renders
+        // a button that cannot work.
+        let full = include_str!("main.rs");
+        let src = full.split("#[cfg(test)]").next().unwrap_or(full);
+        let needle = concat!("menu_button(\"🖥 ", "Monitor\"");
+        let at = src.find(needle).expect("monitor menu button exists");
+        let before = &src[at.saturating_sub(600)..at];
+        assert!(
+            before.contains("#[cfg(target_os = \"windows\")]"),
+            "the Monitor menu button lost its Windows-only cfg gate"
+        );
     }
 
     #[test]
