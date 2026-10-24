@@ -265,6 +265,24 @@ column max width: 760px.
   component (the API requires the field — the reference sends the
   current brightness or 100), it just isn't treated as device
   brightness state.
+- **Brightness scales (v1.3.1).** The bulbs switch OFF ENTIRELY
+  below 11% — a hardware minimum on the device scale (the
+  v1.2.3 1% floor was field-disproved within a day). The 11%
+  floor is kept internally but represented as 1% in the UI:
+  sliders run 1..100 (UI) while sends run 11..100 (device),
+  mapped linearly both ways (device = 11 + (ui−1)·89/99;
+  ui = 1 + (device−11)·99/89) in both editions — cards, group
+  header and status lines all speak the UI scale, so a
+  bottomed-out slider displays "1%" and sends exactly 11, and
+  a bulb reporting 11% (or less, while on) displays "1%".
+- **Colour-temperature stops (v1.3.1).** Temp sliders have
+  exactly five detents — 2700K, 3000K, 4000K, 5000K, 6500K:
+  slider values are stop indices, and display/send both snap
+  in Kelvin space before the API-scale conversion. A device
+  reporting an in-between value (3080K, 3780K, 3970K…)
+  displays at the nearest stop; its stored reading is not
+  rewritten until the user actually drags. Group broadcasts
+  send the exact stop the header slider sits on.
 - A pinned device shows as a full working card in Pinned **and** stays in
   its normal section. Scenes can't be pinned or grouped; they always live
   in Scenes.
@@ -321,17 +339,31 @@ column max width: 760px.
   placement is exactly v1.2.4's (OS default + the launch mode).
   (A v1.2.5-era config file still loads; the orphaned key is
   ignored and dropped on the next save.)
-  **Snap to monitor (v1.3.0)** is the supported way to place the
-  window, and it is deliberately click-time only: the header's
-  **🖥 Monitor** button lists the displays enumerated live from
-  the OS (friendly name when available, resolution, orientation,
-  a primary marker, and a marker for the display the window is
-  currently on). Choosing one re-enumerates, unmaximizes, moves
-  the window to a single clamped interior point of that display
-  (its rect converted to points with THAT display's own scale
-  factor, inset 60 pt and clamped inside with margin), then
-  maximizes — the OS owns the final geometry (the display's work
-  area), so the result cannot be out of bounds. Nothing persists.
+  **Snap to monitor (v1.3.0; mechanism replaced in v1.3.1)** is
+  the supported way to place the window, and it is deliberately
+  click-time only: the header's **🖥 Monitor** button lists the
+  displays enumerated live from the OS (friendly name when
+  available, resolution, orientation, a primary marker, and a
+  marker for the display the window is currently on). Choosing
+  one re-enumerates and starts a snap job. v1.3.0 moved the
+  window with a one-frame burst of egui viewport commands whose
+  target point was computed in points with the TARGET display's
+  scale factor — but winit applies such a position using the
+  scale of the monitor the window is CURRENTLY on, so on a
+  mixed-DPI desk the point landed back inside the source
+  monitor and the window never moved (field-proven on a
+  2560×1440 landscape + 2160×3840 portrait pairing). Since
+  v1.3.1 the move is direct Win32 on the app HWND, in PHYSICAL
+  pixels end-to-end: a per-frame state machine (pure, tested
+  decision logic) leaves fullscreen/maximized
+  (`ShowWindow(SW_RESTORE)`), `SetWindowPos`es the window to a
+  single clamped interior point of the target display (60 pt
+  inset at the target's own scale, margin-clamped), VERIFIES
+  arrival with `MonitorFromWindow` (one restore+move retry,
+  3 s overall budget, fail-safe leaves the window visible and
+  untouched), and only then `ShowWindow(SW_MAXIMIZE)` — the OS
+  owns the final geometry (the display's work area), so the
+  result cannot be out of bounds. Nothing persists.
   **Web deviation (stated):** a page cannot move its window, so
   where the Window Management API exists (Chrome/Edge,
   `getScreenDetails`) the same button lists screens and choosing

@@ -105,6 +105,29 @@ instructions below.)
   (web: this browser's local storage; Windows: a JSON config in your user
   profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.3.1
+
+- **Fixed: Snap to monitor didn't move the window.** On
+  mixed-DPI setups (e.g. a 1440p main screen beside a 4K
+  portrait screen) the 1.3.0 snap computed its target with the
+  wrong display's scaling and the window stayed put. The move
+  is now done in physical pixels with the arrival verified
+  before the window maximizes — pick a display in the
+  **🖥 Monitor** menu and the window really goes there.
+- **Brightness sliders show 1–100% again — honestly.** The
+  bulbs switch off entirely below 11%, so 11% is the true
+  minimum: the slider's bottom now displays "1%" for that
+  minimum instead of letting you drag a lit bulb to its
+  switch-off point. A bulb sitting at its minimum reads "1%",
+  full brightness reads "100%", and everything in between is
+  scaled to match — in both editions, cards and group header
+  alike.
+- **Colour temperature snaps to five stops.** Temp sliders
+  now land exactly on 2700K, 3000K, 4000K, 5000K or 6500K.
+  A bulb reporting something in between (3780K, say) displays
+  at the nearest stop, and group changes broadcast an exact
+  stop to every light.
+
 ## What's new in 1.3.0
 
 - **Snap to monitor (Windows app).** A new **🖥 Monitor** button
