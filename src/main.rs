@@ -3200,12 +3200,22 @@ fn two_row_header(avail_after_icon: f32, trailing_deduct: f32) -> bool {
 /// Group-controls strip geometry (v1.2.3, Bug A). Every control
 /// group in a section header is ONE unbreakable mini-panel of
 /// this height: the All toggle, each slider group (label+value
-/// over its slider: ~17 + 3 + 22 ≈ 42), and the swatch row all
-/// allocate exactly GROUP_PANEL_H, so the wrapped placer can
-/// only move WHOLE groups between lines — v1.2.2's height-0
-/// slider allocations (vec2(210, 0)) let it interleave the
-/// Brightness and Colour-temperature pairs into a staircase.
-const GROUP_PANEL_H: f32 = 44.0;
+/// over its slider), and the swatch row all allocate exactly
+/// GROUP_PANEL_H, so the wrapped placer can only move WHOLE
+/// groups between lines — v1.2.2's height-0 slider allocations
+/// (vec2(210, 0)) let it interleave the Brightness and
+/// Colour-temperature pairs into a staircase.
+/// v1.3.0 alignment fix: the constant is the panels' TRUE
+/// content height — label row 18 + item spacing 8 + gap 3 +
+/// slider 22 = 51, measured on the headless harness. At 44 the
+/// content overflowed its allocation, and the wrapped placer's
+/// cross-axis CENTERING then parked each subsequent panel a
+/// couple of points lower than the first (the colour-temperature
+/// slider sat visibly below the brightness slider). The strip
+/// now also lays out with cross-axis Align::Min (see
+/// group_controls), so every panel shares the row's top edge by
+/// construction, whatever the placer's row-height estimate.
+const GROUP_PANEL_H: f32 = 51.0;
 /// Width of one group slider panel (label+value row over a full
 /// slim slider).
 const GROUP_SLIDER_W: f32 = 240.0;
@@ -5449,7 +5459,13 @@ impl App {
                 // height 0, which let the placer staircase and
                 // interleave the label/slider pairs.)
                 let gkey = format!("grp:{}", sec2.key);
-                ui.horizontal_wrapped(|ui| {
+                // Top-aligned wrapped row (v1.3.0): horizontal_wrapped
+                // centres panels on the cross axis, which — against
+                // the placer's row-height estimate — let later panels
+                // drift a few points down. Align::Min pins every
+                // panel to the row top, so the Brightness and Colour
+                // temperature slider tracks share one baseline.
+                ui.with_layout(Layout::left_to_right(Align::Min).with_main_wrap(true), |ui| {
                     ui.allocate_ui_with_layout(
                         vec2(GROUP_ALL_W, GROUP_PANEL_H),
                         Layout::left_to_right(Align::Center),
@@ -9447,6 +9463,53 @@ mod tests {
             bright.y,
             tval.y,
             temp.y
+        );
+        // Slider tracks on ONE baseline (v1.3.0 gate): the two
+        // group sliders' track rects (h=6: background + accent
+        // fill per slider) inside the strip band must share a
+        // centre y — pre-fix the placer's cross-axis centring put
+        // the colour-temperature track ~1-3.5 pt below the
+        // brightness track while the LABELS still passed the
+        // 1.5 pt tolerance above.
+        let mut track_ys: Vec<f32> = Vec::new();
+        fn walkr(s: &egui::epaint::Shape, acc: &mut Vec<f32>, lo: f32, hi: f32) {
+            match s {
+                egui::epaint::Shape::Rect(r) => {
+                    let c = r.rect.center();
+                    if (r.rect.height() - 6.0).abs() < 0.1
+                        && r.rect.width() >= 150.0
+                        && c.y >= lo
+                        && c.y <= hi
+                    {
+                        acc.push(c.y);
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for x in v {
+                        walkr(x, acc, lo, hi);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walkr(&cs.shape, &mut track_ys, bright.y + 15.0, bright.y + 70.0);
+        }
+        assert!(
+            track_ys.len() >= 4,
+            "expected both group sliders' track rects in the strip band, found {}",
+            track_ys.len()
+        );
+        let (mut tmin, mut tmax) = (f32::MAX, f32::MIN);
+        for y in &track_ys {
+            tmin = tmin.min(*y);
+            tmax = tmax.max(*y);
+        }
+        assert!(
+            tmax - tmin <= 0.5,
+            "group slider tracks off one baseline: centre y spans {:.2}..{:.2}",
+            tmin,
+            tmax
         );
         // Swatches: one straight row inside the strip band.
         // Filtered to the swatch radius (12) — the strip also
