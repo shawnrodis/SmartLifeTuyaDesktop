@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.3.0">
+<meta name="version" content="1.3.1">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -487,7 +487,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.3.0</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.3.1</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -751,12 +751,15 @@ function applyProxy(url, preset, customProxy, regionKey) {
 
 /* ---------------- Value-scale conversions (pure) ----------------
    Scales mirror the reference implementation exactly:
-   - device brightness is reported 0..1000; UI % = brightness/10.
-     brightnessSet sends the % value; its useful range is 1..100.
+   - device brightness is reported 0..1000; device % = brightness/10.
+     brightnessSet sends a DEVICE-scale %; the UI scale 1..100 maps
+     onto device 11..100 (v1.3.1, see brightnessUiToDevice below).
    - colour temperature is SENT on a 1000..10000 scale whose ends are
      labelled 2700K / 6500K, but REPORTED on a stretched scale:
        reported = (sent - 1000) * 4.033 + 1000
        slider   = (reported - 1000) / 4.033 + 1000
+     and the temp sliders snap to five Kelvin stops (v1.3.1, see
+     TEMP_STOPS_K below).
    - colour is HSV: hue 0..360, saturation 0..1, brightness = % .  */
 function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
@@ -773,6 +776,26 @@ function tempSliderToReported(slider) {
 }
 function tempSliderToKelvin(slider) {
   return Math.round((2700 + (clamp(slider, 1000, 10000) - 1000) * (3800 / 9000)) / 10) * 10;
+}
+
+/* The five colour-temperature stops (v1.3.1), in Kelvin.
+   Every colour-temperature slider has exactly these detents:
+   its value is a stop INDEX (0..4), and anything displayed or
+   sent is one of these five values (snapped in Kelvin space,
+   before the API-scale conversion). Mirrors the Rust edition. */
+var TEMP_STOPS_K = [2700, 3000, 4000, 5000, 6500];
+function tempNearestStopIndex(kelvin) {
+  var best = 0;
+  for (var i = 1; i < TEMP_STOPS_K.length; i++) {
+    if (Math.abs(kelvin - TEMP_STOPS_K[i]) < Math.abs(kelvin - TEMP_STOPS_K[best])) best = i;
+  }
+  return best;
+}
+function tempStopKelvin(index) {
+  return TEMP_STOPS_K[clamp(Math.round(index), 0, TEMP_STOPS_K.length - 1)];
+}
+function tempKelvinToSlider(kelvin) {
+  return clamp(Math.round(1000 + (kelvin - 2700) * 9000 / 3800), 1000, 10000);
 }
 
 /* ---------------- Colour helpers (pure) ---------------- */
@@ -938,7 +961,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.3.0";
+var APP_VERSION = "1.3.1";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1257,16 +1280,32 @@ function groupAverage(members, pick) {
   });
   return n ? sum / n : null;
 }
-/* What a brightness move sends (v1.3.0): always a plain
-   brightnessSet — the colour-route synthesis of v1.2.3 is gone,
-   and callers only reach here for devices with a native
-   brightness field. Shared by the card slider (doBrightness) and
-   the group fan-out (groupPlan) so the two can never drift apart.
-   Brightness floor is 1% (v1.2.3): the old 11% floor came from
-   the reference implementation's slider, not from the devices. */
+/* Brightness scales (v1.3.1): the bulbs switch OFF ENTIRELY
+   below 11% — a hardware minimum on the DEVICE scale, kept
+   internally but represented as 1% in the UI. The map is
+   linear both ways: device = 11 + (ui-1) * 89/99 and
+   ui = 1 + (device-11) * 99/89. A bottomed-out slider
+   displays "1%" and sends exactly 11; a bulb reporting its
+   11% minimum (or anything below it, while on) displays 1%.
+   Mirrors the Rust edition. */
+var BRIGHTNESS_FLOOR_PCT = 11;
+function brightnessUiToDevice(ui) {
+  ui = clamp(Math.round(ui), 1, 100);
+  return Math.round(BRIGHTNESS_FLOOR_PCT + (ui - 1) * 89 / 99);
+}
+function brightnessDeviceToUi(dev) {
+  return clamp(Math.round(1 + (dev - BRIGHTNESS_FLOOR_PCT) * 99 / 89), 1, 100);
+}
+
+/* What a brightness move sends: always a plain brightnessSet
+   (v1.3.0) — the colour-route synthesis of v1.2.3 is gone, and
+   callers only reach here for devices with a native brightness
+   field. `pct` is a UI percent; the wire value is the mapped
+   device percent (v1.3.1). Shared by the card slider
+   (doBrightness) and the group fan-out (groupPlan) so the two
+   can never drift apart. */
 function brightnessCommand(device, pct) {
-  pct = clamp(Math.round(pct), 1, 100);
-  return { action: "brightnessSet", value: pct };
+  return { action: "brightnessSet", value: brightnessUiToDevice(pct) };
 }
 
 /* The fan-out plan for one group action. kind: "toggle" | "brightness"
@@ -1938,8 +1977,10 @@ function statusText(d) {
   var parts = [];
   if (d.isScene) return "Scene — tap Start to run";
   parts.push(d.state ? "On" : "Off");
-  if (d.state && d.brightnessPct !== null) parts.push(d.brightnessPct + "%");
-  if (d.state && d.tempSlider !== null && d.colorMode !== "colour") parts.push(tempSliderToKelvin(d.tempSlider) + "K");
+  // Display scales (v1.3.1): brightness shows the UI percent,
+  // temperature the nearest stop — same as the sliders.
+  if (d.state && d.brightnessPct !== null) parts.push(brightnessDeviceToUi(d.brightnessPct) + "%");
+  if (d.state && d.tempSlider !== null && d.colorMode !== "colour") parts.push(tempStopKelvin(tempNearestStopIndex(tempSliderToKelvin(d.tempSlider))) + "K");
   if (d.state && d.colorMode === "colour") parts.push("Colour");
   return parts.join(" · ");
 }
@@ -2043,7 +2084,7 @@ function renderGroupControls(sec) {
   if (bMembers.length) {
     var bVals = bMembers.filter(function (d) { return d.brightnessPct !== null && d.brightnessPct > 0; });
     var avgB = bVals.length ? groupAverage(bVals, function (d) { return d.brightnessPct; }) : 100;
-    var bs = sliderRow("Brightness", 1, 100, Math.max(1, Math.round(avgB)), function (v) { return Math.round(v) + "%"; });
+    var bs = sliderRow("Brightness", 1, 100, brightnessDeviceToUi(Math.round(avgB)), function (v) { return Math.round(v) + "%"; });
     bs.wrap.classList.add("gc-slider");
     bindSlider(bs, function (v) { return Math.round(v) + "%"; }, function (v) { runGroupAction(sec, "brightness", v); });
     box.appendChild(bs.wrap);
@@ -2053,10 +2094,13 @@ function renderGroupControls(sec) {
   if (tMembers.length) {
     var tVals = tMembers.filter(function (d) { return d.tempSlider !== null; });
     var avgT = tVals.length ? groupAverage(tVals, function (d) { return d.tempSlider; }) : 5500;
-    var ts = sliderRow("Colour temperature", 1000, 10000, Math.round(avgT / 50) * 50, function (v) { return tempSliderToKelvin(v) + "K"; });
-    ts.input.step = 50;
+    // Stop-index slider (v1.3.1): sits at the stop nearest the
+    // members' average Kelvin; a broadcast sends that exact stop.
+    var tIdx = tempNearestStopIndex(tempSliderToKelvin(Math.round(avgT)));
+    var ts = sliderRow("Colour temperature", 0, TEMP_STOPS_K.length - 1, tIdx, function (v) { return tempStopKelvin(v) + "K"; });
+    ts.input.step = 1;
     ts.wrap.classList.add("gc-slider");
-    bindSlider(ts, function (v) { return tempSliderToKelvin(v) + "K"; }, function (v) { runGroupAction(sec, "temp", v); });
+    bindSlider(ts, function (v) { return tempStopKelvin(v) + "K"; }, function (v) { runGroupAction(sec, "temp", tempKelvinToSlider(tempStopKelvin(v))); });
     box.appendChild(ts.wrap);
   }
   // colour — swatches + picker, broadcast to colour-capable members
@@ -2201,7 +2245,9 @@ function renderCard(d, sec) {
       // Brightness gates on the NATIVE field (v1.3.0): a
       // colour-only strip gets colour controls only.
       var bVal = (d.brightnessPct !== null && d.brightnessPct > 0) ? d.brightnessPct : 100;
-      var bs = sliderRow("Brightness", 1, 100, Math.max(1, bVal), function (v) { return Math.round(v) + "%"; });
+      // UI scale (v1.3.1): the reported device percent is
+      // mapped for display; the slider edits 1..100 UI.
+      var bs = sliderRow("Brightness", 1, 100, brightnessDeviceToUi(bVal), function (v) { return Math.round(v) + "%"; });
       if (!d.online) bs.input.disabled = true;
       bindSlider(bs, function (v) { return Math.round(v) + "%"; }, function (v) { doBrightness(d, v); });
       card.appendChild(bs.wrap);
@@ -2209,10 +2255,14 @@ function renderCard(d, sec) {
     if (d.hasTemp) {
       // Neutral slider 5500 ≈ 4600K when no reading is known —
       // never the 2700K floor a placeholder used to snap to.
+      // Stop-index slider (v1.3.1): the reported value displays
+      // at its nearest stop without being rewritten; a commit
+      // sends the exact stop.
       var tVal = (d.tempSlider !== null) ? d.tempSlider : 5500;
-      var ts = sliderRow("Colour temperature", 1000, 10000, tVal, function (v) { return tempSliderToKelvin(v) + "K"; });
-      ts.input.step = 50;
-      bindSlider(ts, function (v) { return tempSliderToKelvin(v) + "K"; }, function (v) { doTemp(d, v); });
+      var tIdx = tempNearestStopIndex(tempSliderToKelvin(tVal));
+      var ts = sliderRow("Colour temperature", 0, TEMP_STOPS_K.length - 1, tIdx, function (v) { return tempStopKelvin(v) + "K"; });
+      ts.input.step = 1;
+      bindSlider(ts, function (v) { return tempStopKelvin(v) + "K"; }, function (v) { doTemp(d, tempKelvinToSlider(tempStopKelvin(v))); });
       card.appendChild(ts.wrap);
     }
     if (d.hasColor) {
