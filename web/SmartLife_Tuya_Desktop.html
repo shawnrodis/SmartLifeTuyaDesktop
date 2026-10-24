@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="black">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1422,7 +1422,9 @@ var S = {
 
 function defaultPrefs() {
   return {
-    theme: "dark", accent: "#6366f1", density: "comfortable",
+    /* Fresh-install default theme is Black (v1.3.0); a stored
+       preference overrides this in loadPrefs. */
+    theme: "black", accent: "#6366f1", density: "comfortable",
     autorefresh: true, interval: 30,
     proxyPreset: "auto", proxyCustom: "",
     gatewayUrl: "", gatewayType: "go2rtc",

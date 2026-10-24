@@ -354,7 +354,10 @@ fn default_player_cmd() -> String {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
-            theme: "dark".into(),
+            // Fresh-install default theme is Black (v1.3.0); a
+            // stored preference always wins — this only applies
+            // when no theme has ever been saved.
+            theme: "black".into(),
             accent: "#6366f1".into(),
             density: "comfortable".into(),
             autorefresh: true,
@@ -9052,6 +9055,23 @@ mod tests {
                 !src.contains(needle),
                 "placement-memory remnant {needle:?} is still in main.rs"
             );
+        }
+    }
+
+    #[test]
+    fn theme_default_is_black_stored_preference_wins() {
+        // v1.3.0: fresh state (nothing stored) -> Black.
+        assert_eq!(Prefs::default().theme, "black");
+        assert_eq!(Config::default().prefs.theme, "black");
+        // A stored Dark or Light choice is respected untouched.
+        for stored in ["dark", "light", "black"] {
+            let cfg: Config = serde_json::from_str(&format!(
+                "{{\"prefs\":{{\"theme\":\"{stored}\",\"accent\":\"#6366f1\",\
+                 \"density\":\"comfortable\",\"autorefresh\":true,\"interval\":30,\
+                 \"proxy_preset\":\"auto\",\"proxy_custom\":\"\"}}}}"
+            ))
+            .unwrap();
+            assert_eq!(cfg.prefs.theme, stored, "stored theme must win");
         }
     }
 
