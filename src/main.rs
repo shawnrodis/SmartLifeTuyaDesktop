@@ -2146,8 +2146,41 @@ struct Device {
     raw: Value,
 }
 
+/// A discovery value as a number (v1.3.0, Fix A): the legacy
+/// homeassistant API is STRINGLY-TYPED for lights — real payloads
+/// carry brightness as "800", not 800 (switches use real numbers;
+/// see the census fixtures in the tests) — so a JSON string that
+/// parses as a number counts as a number. The pre-1.3.0 reader
+/// used as_f64() alone and silently dropped every light reading.
+fn value_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 fn data_f64(data: &Map<String, Value>, key: &str) -> Option<f64> {
-    data.get(key).and_then(|v| v.as_f64())
+    data.get(key).and_then(value_f64)
+}
+
+/// A discovery value as a bool (v1.3.0, Fix A): switches report
+/// state as a real JSON bool, but LIGHTS report it as the STRING
+/// "true"/"false" — the field bug behind every light reading Off
+/// while plugs read correctly. The reference implementation only
+/// ever checks `state === false`, i.e. it never demanded a bool;
+/// this reader accepts bool, "true"/"false" strings and numbers.
+fn data_bool(data: &Map<String, Value>, key: &str) -> Option<bool> {
+    match data.get(key) {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0),
+        _ => None,
+    }
 }
 
 fn parse_device(raw: &Value) -> Device {
@@ -2201,8 +2234,8 @@ fn parse_device(raw: &Value) -> Device {
         kind: kind.to_string(),
         icon_kind,
         is_scene,
-        online: data.get("online").and_then(|v| v.as_bool()) != Some(false),
-        state: data.get("state").and_then(|v| v.as_bool()) == Some(true),
+        online: data_bool(data, "online") != Some(false),
+        state: data_bool(data, "state") == Some(true),
         has_brightness,
         has_temp,
         has_color,
@@ -2244,7 +2277,10 @@ fn fresh_value_counts(key: &str, v: &Value) -> bool {
         return false;
     }
     if key == "brightness" || key == "color_temp" {
-        return v.as_f64().map(|n| n > 0.0).unwrap_or(false);
+        // Tolerant (v1.3.0): a string "800" is a real reading,
+        // not a placeholder — judging it by as_f64() alone made
+        // the merge overwrite fresh light values with stale ones.
+        return value_f64(v).map(|n| n > 0.0).unwrap_or(false);
     }
     true
 }
@@ -8039,6 +8075,119 @@ mod tests {
             name,
             json!({ "state": true, "hue": 120, "saturation": 0.5, "color_mode": "colour" }),
         )
+    }
+
+    // ---------------- v1.3.0 Fix A: light wire formats ----------------
+    // Ground truth (real discovery payloads of the legacy
+    // homeassistant API, plus the user's own census): SWITCHES
+    // report state as a JSON bool and numeric fields as numbers,
+    // but LIGHTS report state as the STRING "true"/"false" and
+    // brightness as a STRING ("800"). The strict as_bool/as_f64
+    // parser read every light as Off with no brightness — plugs
+    // were unaffected, which is exactly the field report.
+
+    fn wire_dev(id: &str, name: &str, dev_type: &str, data: Value) -> Device {
+        parse_device(&json!({ "id": id, "name": name, "dev_type": dev_type, "data": data }))
+    }
+
+    #[test]
+    fn wire_formats_switch_bool_light_string() {
+        // Switch ON (bool true) — the plug census shape.
+        let on = wire_dev("p1", "Desk", "switch", json!({ "online": true, "state": true }));
+        assert!(on.state);
+        // Switch OFF (bool false).
+        let off = wire_dev("p2", "Rice Cooker", "switch", json!({ "online": true, "state": false }));
+        assert!(!off.state);
+        // Light ON: string state, string brightness, numeric temp.
+        let light = wire_dev(
+            "l1",
+            "Desk Light",
+            "light",
+            json!({ "brightness": "800", "color_mode": "white", "color_temp": 29000, "online": true, "state": "true" }),
+        );
+        assert!(light.state, "string \"true\" must parse as on");
+        assert_eq!(light.brightness_pct, Some(80), "string brightness must parse");
+        assert!(light.temp_slider.is_some());
+        // Light OFF: string "false" (brightness still reported).
+        let light_off = wire_dev(
+            "l2",
+            "Kitchen Light 1",
+            "light",
+            json!({ "brightness": "570", "color_mode": "white", "color_temp": 7635, "online": false, "state": "false" }),
+        );
+        assert!(!light_off.state);
+        assert_eq!(light_off.brightness_pct, Some(57));
+        assert!(!light_off.online);
+        // The colour-only strip's real shape: colour mode + string
+        // state, nothing else.
+        let strip = wire_dev(
+            "l3",
+            "Desk RGB strip",
+            "light",
+            json!({ "color_mode": "colour", "online": true, "state": "true" }),
+        );
+        assert!(strip.state);
+        assert!(strip.has_color && !strip.has_brightness && !strip.has_temp);
+    }
+
+    #[test]
+    fn census_all_lights_on_plugs_match() {
+        // The user's census (official Smart Life app): all six
+        // lights ON; plugs Desk / Desktop-ShawnR / Server-ShawnR
+        // ON, the rest OFF. Lights use the string wire format,
+        // plugs the bool format.
+        let lights = [
+            "Desk RGB strip",
+            "Desk Light",
+            "Love's Bed Light",
+            "Shawn's Bed Light",
+            "Kitchen Light 1",
+            "Kitchen Light 2",
+        ];
+        for (i, name) in lights.iter().enumerate() {
+            let d = wire_dev(
+                &format!("L{i}"),
+                name,
+                "light",
+                json!({ "brightness": "800", "color_mode": "white", "color_temp": 5000, "online": true, "state": "true" }),
+            );
+            assert!(d.state, "{name} must read ON");
+        }
+        for name in ["Desk", "Desktop-ShawnR", "Server-ShawnR"] {
+            let d = wire_dev(name, name, "switch", json!({ "online": true, "state": true }));
+            assert!(d.state, "plug {name} must read ON");
+        }
+        for name in ["Rice Cooker", "Projector", "Kettle", "Food Processor", "Air Fryer", "Speakers"] {
+            let d = wire_dev(name, name, "switch", json!({ "online": true, "state": false }));
+            assert!(!d.state, "plug {name} must read OFF");
+        }
+    }
+
+    #[test]
+    fn light_state_survives_refresh_merge_cycles() {
+        let on_payload = json!({ "id": "L1", "name": "Desk Light", "dev_type": "light",
+            "data": { "brightness": "800", "color_mode": "white", "color_temp": 5000, "online": true, "state": "true" } });
+        // First load.
+        let first = parse_device(&on_payload);
+        assert!(first.state && first.brightness_pct == Some(80));
+        // A refresh repeating the same payload: state and the
+        // string brightness survive the merge (pre-fix, the fresh
+        // string brightness "didn't count" and the merge replaced
+        // it with the previous cycle's placeholder).
+        let merged = merge_device_data(vec![on_payload.clone()], &[on_payload.clone()]);
+        let again = parse_device(&merged[0]);
+        assert!(again.state && again.brightness_pct == Some(80));
+        // A refresh reporting the light OFF (string "false") wins
+        // over the previous ON — fresh real readings always win.
+        let off_payload = json!({ "id": "L1", "name": "Desk Light", "dev_type": "light",
+            "data": { "brightness": "800", "color_mode": "white", "color_temp": 5000, "online": true, "state": "false" } });
+        let merged = merge_device_data(vec![off_payload], &[on_payload.clone()]);
+        assert!(!parse_device(&merged[0]).state);
+        // A THIN refresh omitting state entirely keeps last-known.
+        let thin = json!({ "id": "L1", "name": "Desk Light", "dev_type": "light",
+            "data": { "online": true } });
+        let merged = merge_device_data(vec![thin], &[on_payload]);
+        assert!(parse_device(&merged[0]).state);
     }
 
     #[test]

@@ -854,7 +854,10 @@ function parseDevice(raw) {
     iconKind: TYPE_ICONS[iconKind] ? iconKind : (TYPE_ICONS[devType] ? devType : "default"),
     isScene: isScene,
     online: data.online !== false,
-    state: data.state === true,
+    /* v1.3.0 (Fix A): lights report state as the STRING "true"/"false"
+       (switches use a real bool) — demanding === true read every
+       light as Off. Accept both wire formats. */
+    state: data.state === true || data.state === "true",
     hasBrightness: hasBrightness,
     hasTemp: hasTemp,
     hasColor: hasColor,
