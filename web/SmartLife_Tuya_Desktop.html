@@ -1076,15 +1076,16 @@ function filterDevices(devices, layout, query) {
 function isLightCapable(d) {
   return !!(!d.isCamera && !d.isScene && (d.hasBrightness || d.hasTemp || d.hasColor));
 }
-/* Brightness CONTROL capability (v1.2.3): a device can be dimmed
-   when it reports a standalone brightness field OR when it takes
-   colour — a colour device's brightness is the V of the HSV colour
-   it already accepts via colorSet. RGB strips report hue/saturation
-   but no standalone brightness (and no colour_temp), so gating the
-   slider on hasBrightness alone left them colour-only; colour
-   temperature stays genuinely unsupported for them via this API. */
+/* Brightness capability (v1.3.0 — reversal of the v1.2.3
+   synthesis): a device can be dimmed only when the API natively
+   reports a brightness field. A colour-only strip (hue/saturation
+   but no brightness, no color_temp) gets NO brightness slider and
+   is never sent a brightness command: the legacy API surfaces
+   on/off + colour only for it, exactly as the reference shows.
+   (The strip hardware can dim via other channels; this API
+   doesn't expose it. See DESIGN.md.) */
 function hasBrightnessControl(d) {
-  return !!(d.hasBrightness || d.hasColor);
+  return !!d.hasBrightness;
 }
 /* The "no explicit group" label for an item: light-capable devices
    live in the automatic Lighting section, cameras in the automatic
@@ -1240,26 +1241,16 @@ function groupAverage(members, pick) {
   });
   return n ? sum / n : null;
 }
-/* What a brightness move sends for this device (v1.2.3):
-   brightnessSet for a real brightness field; for a colour-only
-   device a colorSet preserving its CURRENT hue/saturation with the
-   new percent as the HSV brightness — its only brightness
-   dimension. Shared by the card slider (doBrightness) and the group
-   fan-out (groupPlan) so the two can never drift apart. */
+/* What a brightness move sends (v1.3.0): always a plain
+   brightnessSet — the colour-route synthesis of v1.2.3 is gone,
+   and callers only reach here for devices with a native
+   brightness field. Shared by the card slider (doBrightness) and
+   the group fan-out (groupPlan) so the two can never drift apart.
+   Brightness floor is 1% (v1.2.3): the old 11% floor came from
+   the reference implementation's slider, not from the devices. */
 function brightnessCommand(device, pct) {
-  /* Brightness floor is 1% (v1.2.3): the old 11% floor came from
-     the reference implementation's slider, not from the devices. */
   pct = clamp(Math.round(pct), 1, 100);
-  if (device.hasBrightness) return { action: "brightnessSet", value: pct };
-  return {
-    action: "colorSet",
-    value: {
-      hue: device.hue !== null && device.hue !== undefined ? device.hue : 0,
-      saturation: device.saturation !== null && device.saturation !== undefined
-        ? Math.round(device.saturation * 100) / 100 : 0,
-      brightness: pct
-    }
-  };
+  return { action: "brightnessSet", value: pct };
 }
 
 /* The fan-out plan for one group action. kind: "toggle" | "brightness"
@@ -1274,9 +1265,9 @@ function groupPlan(members, kind, value) {
     devs.forEach(function (d) { plan.push({ id: d.id, action: "turnOnOff", value: target }); });
   } else if (kind === "brightness") {
     var pct = clamp(Math.round(value), 1, 100);
-    // Every dimmable member takes part (v1.2.3): field devices get
-    // brightnessSet, colour-only members get a hue-preserving
-    // colorSet at the same percent.
+    // Only members with a native brightness field take part
+    // (v1.3.0): a colour-only strip is excluded here — it still
+    // joins toggle and color broadcasts.
     devs.filter(function (d) { return hasBrightnessControl(d); })
       .forEach(function (d) {
         var cmd = brightnessCommand(d, pct);
@@ -1697,13 +1688,11 @@ function applyOptimistic(device, action, value) {
     device.colorMode = "white"; data.color_mode = "white";
   } else if (action === "colorSet") {
     device.hue = value.hue; device.saturation = value.saturation;
-    // A colorSet always carries the HSV brightness it set
-    // (v1.2.3): record it as the last-known brightness so a
-    // colour-only device's slider — and the group average —
-    // reflect it. Deliberately NOT written into raw data: the
-    // device never reported a standalone brightness field, and
-    // inventing one would corrupt the capability model on re-parse.
-    if (value.brightness !== null && value.brightness !== undefined) device.brightnessPct = value.brightness;
+    // The colorSet payload carries an HSV brightness component
+    // (the API requires the field), but it is NOT recorded as a
+    // brightness reading (v1.3.0): a colour-only device has no
+    // brightness state in this app — no slider, no group average —
+    // because the API never reports one back.
     device.state = true; data.state = true;
     device.colorMode = "colour"; data.color_mode = "colour";
     data.hue = value.hue; data.saturation = value.saturation;
@@ -1808,10 +1797,9 @@ function doSceneStart(device) {
   });
 }
 function doBrightness(device, pct) {
-  // brightnessSet, or a hue-preserving colorSet for colour-only
-  // devices (v1.2.3) — brightnessCommand decides, and the
-  // optimistic local mutations are exactly applyOptimistic's for
-  // the chosen action.
+  // Plain brightnessSet (v1.3.0) — only reachable from controls
+  // gated on a native brightness field. The optimistic local
+  // mutations are exactly applyOptimistic's for the action.
   var cmd = brightnessCommand(device, pct);
   sendControl(device, cmd.action, cmd.value, function () {
     applyOptimistic(device, cmd.action, cmd.value);
@@ -1969,13 +1957,12 @@ function renderGroupControls(sec) {
   sw.addEventListener("click", function () { runGroupAction(sec, "toggle"); });
   master.appendChild(sw);
   box.appendChild(master);
-  // brightness — shown when any member is CAPABLE (v1.2.2: never
-  // gated on current values); the value averages members that have
-  // a reading, falling back to a neutral 100%. Membership uses the
-  // CONTROL capability (v1.2.3): a group of nothing but colour-only
-  // strips still gets its slider; members join the average once
-  // they have a brightness value (a strip gains one after any
-  // colour/brightness command — see applyOptimistic).
+  // brightness — shown when any member natively reports the
+  // field (v1.2.2: never gated on current values); the value
+  // averages members that have a reading, falling back to a
+  // neutral 100%. Membership is the native field only (v1.3.0):
+  // a group of nothing but colour-only strips gets NO brightness
+  // slider — the API reports no brightness for them.
   var bMembers = devs.filter(function (d) { return hasBrightnessControl(d); });
   if (bMembers.length) {
     var bVals = bMembers.filter(function (d) { return d.brightnessPct !== null && d.brightnessPct > 0; });
@@ -2135,9 +2122,8 @@ function renderCard(d, sec) {
     if (hasBrightnessControl(d)) {
       // Capability-gated (v1.2.2): a missing/placeholder reading
       // renders at a neutral 100%, never removes the control.
-      // Brightness gates on the CONTROL capability (v1.2.3): a
-      // brightness field OR colour (a strip dims through its HSV
-      // value and shows the same neutral 100% until it has one).
+      // Brightness gates on the NATIVE field (v1.3.0): a
+      // colour-only strip gets colour controls only.
       var bVal = (d.brightnessPct !== null && d.brightnessPct > 0) ? d.brightnessPct : 100;
       var bs = sliderRow("Brightness", 1, 100, Math.max(1, bVal), function (v) { return Math.round(v) + "%"; });
       if (!d.online) bs.input.disabled = true;

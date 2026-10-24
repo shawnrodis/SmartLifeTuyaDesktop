@@ -2433,39 +2433,18 @@ fn group_average(values: &[i64]) -> Option<f64> {
     }
 }
 
-/// Brightness CONTROL capability (v1.2.3): a device can be dimmed
-/// when it reports a standalone brightness field OR when it takes
-/// colour — a colour device's brightness is the V of the HSV colour
-/// it already accepts via colorSet. RGB strips report hue/saturation
-/// but no standalone brightness (and no colour_temp), so gating the
-/// slider on has_brightness alone left them colour-only; colour
-/// temperature stays genuinely unsupported for them via this API.
-fn has_brightness_control(d: &Device) -> bool {
-    d.has_brightness || d.has_color
-}
-
-/// What a brightness move sends for this device (v1.2.3):
-/// brightnessSet for a real brightness field; for a colour-only
-/// device a colorSet preserving its CURRENT hue/saturation with the
-/// new percent as the HSV brightness — its only brightness
-/// dimension. Shared by the card slider (do_brightness) and the
-/// group fan-out (group_plan) so the two can never drift apart.
-fn brightness_command(d: &Device, pct: i64) -> (&'static str, Value) {
-    // Brightness floor is 1% (v1.2.3): the old 11% floor came from
-    // the reference implementation's slider, not from the devices.
-    let pct = pct.clamp(1, 100);
-    if d.has_brightness {
-        ("brightnessSet", json!(pct))
-    } else {
-        (
-            "colorSet",
-            json!({
-                "hue": d.hue.unwrap_or(0.0) as i64,
-                "saturation": (d.saturation.unwrap_or(0.0) * 100.0).round() / 100.0,
-                "brightness": pct,
-            }),
-        )
-    }
+/// The brightnessSet payload for a percent (floor 1%, v1.2.3 —
+/// the old 11% floor came from the reference slider, not the
+/// devices). Brightness is ONLY ever sent to devices that
+/// natively report a brightness field (v1.3.0, reversing the
+/// v1.2.3 route that dimmed colour-only devices through the V of
+/// a colorSet): the legacy API surfaces no brightness/temp for a
+/// colour-only strip — on/off + colour only — so the app shows
+/// no brightness control for it, exactly like the reference.
+/// (The strip hardware itself can dim via other channels; this
+/// API simply doesn't expose it. See DESIGN.md.)
+fn brightness_set_value(pct: i64) -> Value {
+    json!(pct.clamp(1, 100))
 }
 
 /// The fan-out plan for one group action. `num` carries the brightness
@@ -2490,12 +2469,11 @@ fn group_plan(
             }
         }
         GroupKind::Brightness => {
-            // Every dimmable member takes part (v1.2.3): field
-            // devices get brightnessSet, colour-only members get a
-            // hue-preserving colorSet at the same percent.
-            for d in devs.iter().filter(|d| has_brightness_control(d)) {
-                let (action, value) = brightness_command(d, num);
-                plan.push((d.id.clone(), action, value));
+            // Only members that natively report a brightness
+            // field take part (v1.3.0): a colour-only strip is
+            // excluded here — it still joins Toggle and Color.
+            for d in devs.iter().filter(|d| d.has_brightness) {
+                plan.push((d.id.clone(), "brightnessSet", brightness_set_value(num)));
             }
         }
         GroupKind::Temp => {
@@ -4644,14 +4622,13 @@ impl App {
 
     fn do_brightness(&mut self, id: &str, pct: i64) {
         let Some(idx) = self.device_index(id) else { return };
+        // Only reachable from controls gated on a native
+        // brightness field (v1.3.0) — the command is always a
+        // plain brightnessSet; no colour-route synthesis.
         let backup = self.backup_data(idx);
-        // brightnessSet, or a hue-preserving colorSet for
-        // colour-only devices (v1.2.3) — brightness_command
-        // decides, and the optimistic local mutations are exactly
-        // apply_group_target's for the chosen action.
-        let (action, value) = brightness_command(&self.devices[idx], pct);
-        self.apply_group_target(idx, action, &value);
-        self.spawn_control(id.to_string(), action, value, backup, false);
+        let value = brightness_set_value(pct);
+        self.apply_group_target(idx, "brightnessSet", &value);
+        self.spawn_control(id.to_string(), "brightnessSet", value, backup, false);
     }
 
     fn do_temp(&mut self, id: &str, slider: i64) {
@@ -4734,16 +4711,13 @@ impl App {
                 let sat = value.get("saturation").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 dev.hue = Some(hue);
                 dev.saturation = Some(sat);
-                // A colorSet always carries the HSV brightness it
-                // set (v1.2.3): record it as the last-known
-                // brightness so a colour-only device's slider — and
-                // the group average — reflect it. Deliberately NOT
-                // written into raw data: the device never reported
-                // a standalone brightness field, and inventing one
-                // would corrupt the capability model on re-parse.
-                if let Some(b) = value.get("brightness").and_then(|v| v.as_f64()) {
-                    dev.brightness_pct = Some(b as i64);
-                }
+                // The colorSet payload still carries an HSV
+                // brightness component for the DEVICE (the API
+                // requires the field), but it is not recorded as a
+                // brightness reading (v1.3.0): a colour-only device
+                // has no brightness state in this app — no slider,
+                // no group average — because the API never reports
+                // one back.
                 dev.state = true;
                 dev.color_mode = Some("colour".to_string());
                 if let Some(data) = dev.raw.get_mut("data").and_then(|v| v.as_object_mut()) {
@@ -5449,7 +5423,14 @@ impl App {
         let pal = self.pal();
         let accent = self.accent();
         let any_on = group_master_on(&members);
-        let b_vals: Vec<i64> = devs.iter().filter_map(|d| d.brightness_pct).collect();
+        // The group brightness average covers only members that
+        // natively report brightness (v1.3.0) — a colour-only
+        // strip never joins it (it has no brightness reading).
+        let b_vals: Vec<i64> = devs
+            .iter()
+            .filter(|d| d.has_brightness)
+            .filter_map(|d| d.brightness_pct)
+            .collect();
         let t_vals: Vec<i64> = devs.iter().filter_map(|d| d.temp_slider).collect();
         let has_color = devs.iter().any(|d| d.has_color);
         let sec2 = sec.clone();
@@ -5485,13 +5466,11 @@ impl App {
                     // of the members that currently have readings —
                     // or a neutral default when none do — never
                     // dropped just because values are missing.
-                    // Brightness uses the CONTROL capability
-                    // (v1.2.3): a group of nothing but colour-only
-                    // strips still gets its slider; members join
-                    // the average once they have a brightness value
-                    // (a strip gains one after any colour/brightness
-                    // command — see apply_group_target).
-                    if devs.iter().any(|d| has_brightness_control(d)) {
+                    // Brightness gates on the NATIVE field
+                    // (v1.3.0): a group of nothing but colour-only
+                    // strips gets no brightness slider at all —
+                    // the API reports no brightness for them.
+                    if devs.iter().any(|d| d.has_brightness) {
                         let avg = group_average(&b_vals).unwrap_or(100.0);
                         self.group_slider(
                             ui, &sec2, "b", "Brightness", 1.0, 100.0, avg as f32,
@@ -5878,7 +5857,7 @@ impl App {
                 d.brightness_pct.is_some(),
                 d.temp_slider.is_some(),
                 d.has_color,
-                has_brightness_control(d),
+                d.has_brightness,
                 d.is_scene,
                 self.open_color_for.as_deref() == Some(id)
             )
@@ -6188,12 +6167,12 @@ impl App {
                 // the slider at its last-known value (the merge
                 // guarantees one once the device has ever reported)
                 // or a neutral default — the control itself must
-                // not vanish. Brightness gates on the CONTROL
-                // capability (v1.2.3): a brightness field OR colour
-                // (a strip dims through its HSV value); temperature
-                // still requires a real colour_temp field.
+                // not vanish. Brightness gates on the NATIVE
+                // brightness field (v1.3.0): a colour-only strip
+                // gets colour controls only, no brightness slider;
+                // temperature requires a real colour_temp field.
                 if dev.online && !dev.is_scene {
-                    if has_brightness_control(&dev) {
+                    if dev.has_brightness {
                         let pct = dev.brightness_pct.filter(|&p| p > 0).unwrap_or(100);
                         self.slider_row(ui, &dev, "b", "Brightness", 1.0, 100.0, pct as f32, |v| {
                             format!("{}%", v.round() as i64)
@@ -8034,17 +8013,13 @@ mod tests {
         assert_eq!(plan.len(), 4);
         assert!(plan.iter().all(|(_, a, v)| *a == "turnOnOff" && *v == json!(0)));
 
-        // v1.2.3: the colour-only strip joins the brightness plan
-        // via a hue-preserving colorSet; the two field bulbs keep
-        // brightnessSet.
+        // v1.3.0: brightness fan-out reaches ONLY the two field
+        // bulbs — the colour-only strip is excluded (pre-1.3.0 it
+        // joined via a synthesized colorSet; that route is gone).
         let plan = group_plan(&members, GroupKind::Brightness, 55, None);
-        assert_eq!(plan.len(), 3);
-        let field: Vec<_> = plan.iter().filter(|(_, a, _)| *a == "brightnessSet").collect();
-        assert_eq!(field.len(), 2);
-        assert!(field.iter().all(|(_, _, v)| *v == json!(55)));
-        let strip_cmd = plan.iter().find(|(id, _, _)| id == "ls").unwrap();
-        assert_eq!(strip_cmd.1, "colorSet");
-        assert_eq!(strip_cmd.2, json!({ "hue": 10, "saturation": 0.5, "brightness": 55 }));
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|(_, a, v)| *a == "brightnessSet" && *v == json!(55)));
+        assert!(plan.iter().all(|(id, _, _)| id != "ls"), "strip must not be dimmed");
 
         let plan = group_plan(&members, GroupKind::Temp, 6000, None);
         assert_eq!(plan.len(), 1);
@@ -8199,21 +8174,32 @@ mod tests {
         assert!(!d.has_brightness, "strip reports no brightness field");
         assert!(!d.has_temp, "strip reports no colour_temp field");
         assert_eq!(d.brightness_pct, None, "no brightness reading either");
-        // …yet it IS dimmable — through its colour (v1.2.3) — while
-        // colour temperature stays genuinely unsupported.
-        assert!(has_brightness_control(&d));
+        // v1.3.0: no brightness field means NO brightness control
+        // (the v1.2.3 colour-route synthesis is removed) — the card
+        // gate and the group planner key off has_brightness alone.
         assert!(device_is_light(&d), "strip still files under Lighting");
     }
 
     #[test]
-    fn strip_brightness_move_is_colorset_preserving_hue_sat() {
+    fn strip_has_no_brightness_route() {
+        // v1.3.0 (Fix B): a colour-only device is EXCLUDED from
+        // brightness fan-out entirely — no slider, no command —
+        // while still joining group Toggle and Color broadcasts.
         let d = strip("ls", "Desk RGB strip");
-        let (action, value) = brightness_command(&d, 40);
-        assert_eq!(action, "colorSet");
-        assert_eq!(
-            value,
-            json!({ "hue": 120, "saturation": 0.5, "brightness": 40 }),
-            "current hue/saturation preserved, new percent becomes the HSV brightness"
+        let members = vec![d.clone()];
+        assert!(
+            group_plan(&members, GroupKind::Brightness, 40, None).is_empty(),
+            "no brightness command may be planned for a colour-only device"
+        );
+        let colour = group_plan(&members, GroupKind::Color, 0, Some("#00ff00"));
+        assert_eq!(colour.len(), 1);
+        assert_eq!(colour[0].1, "colorSet");
+        let toggle = group_plan(&members, GroupKind::Toggle, 0, None);
+        assert_eq!(toggle.len(), 1);
+        assert_eq!(toggle[0].1, "turnOnOff");
+        assert!(
+            group_plan(&members, GroupKind::Temp, 5000, None).is_empty(),
+            "no colour-temp route either — the API reports no temp field"
         );
     }
 
@@ -8222,14 +8208,12 @@ mod tests {
         // v1.2.3 (Bug E): the minimum is 1% everywhere — the 11%
         // floor was inherited from the reference slider, not the
         // devices. Values below the floor clamp to 1, low values
-        // pass through, for both command routes.
-        let b = bulb("lb", "Bulb");
-        assert_eq!(brightness_command(&b, 0), ("brightnessSet", json!(1)));
-        assert_eq!(brightness_command(&b, 5), ("brightnessSet", json!(5)));
-        let s = strip("ls", "Strip");
-        let (action, value) = brightness_command(&s, 0);
-        assert_eq!(action, "colorSet");
-        assert_eq!(value["brightness"], json!(1));
+        // pass through. (Single route since v1.3.0: brightnessSet
+        // to native-brightness devices only.)
+        assert_eq!(brightness_set_value(0), json!(1));
+        assert_eq!(brightness_set_value(5), json!(5));
+        assert_eq!(brightness_set_value(100), json!(100));
+        assert_eq!(brightness_set_value(140), json!(100));
     }
 
     #[test]
@@ -8242,9 +8226,10 @@ mod tests {
         );
         assert!(d.has_brightness && d.has_temp && d.has_color);
         assert_eq!(d.brightness_pct, Some(80), "reported brightness still wins");
-        let (action, value) = brightness_command(&d, 40);
-        assert_eq!(action, "brightnessSet");
-        assert_eq!(value, json!(40));
+        let plan = group_plan(&[d], GroupKind::Brightness, 40, None);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].1, "brightnessSet");
+        assert_eq!(plan[0].2, json!(40));
     }
 
     #[test]
