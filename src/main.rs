@@ -1043,6 +1043,203 @@ fn desired_autostart(prefs: &Prefs, exe: &Path) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Snap to monitor (v1.3.0): a header button lists the displays the
+// OS reports at that moment; choosing one moves the window onto
+// that display and maximizes it there. Click-time only, by
+// design — nothing is persisted, and startup placement is never
+// affected (the v1.2.5 placement memory stays removed). The move
+// sets exactly ONE position — a single interior point of the
+// target monitor — and then issues Maximized, after which the OS
+// owns the geometry (the monitor's work area), so the result
+// cannot be out of bounds by construction.
+// ---------------------------------------------------------------------------
+
+/// One display, as enumerated from the OS when the menu opens.
+#[derive(Clone, PartialEq, Debug)]
+struct MonitorInfo {
+    /// Friendly name when the OS offers one, else the device
+    /// name ("DISPLAY1").
+    name: String,
+    /// OS device identity ("\\.\DISPLAY1") — the match key when
+    /// a choice is re-validated at click time.
+    device: String,
+    /// Physical-pixel rect [x, y, w, h] in virtual-desktop
+    /// coordinates (origins can be negative).
+    rect_px: [i32; 4],
+    /// THIS monitor's scale factor (its effective DPI / 96).
+    scale: f32,
+    primary: bool,
+}
+
+/// A monitor rect in egui points ([x, y, w, h]), converted with
+/// the monitor's OWN scale factor — mixed-DPI setups scale each
+/// display differently, and the target's factor is the one that
+/// governs positions on it.
+fn monitor_rect_points(m: &MonitorInfo) -> [f32; 4] {
+    let s = if m.scale > 0.0 { m.scale } else { 1.0 };
+    [
+        m.rect_px[0] as f32 / s,
+        m.rect_px[1] as f32 / s,
+        m.rect_px[2] as f32 / s,
+        m.rect_px[3] as f32 / s,
+    ]
+}
+
+fn monitor_orientation(m: &MonitorInfo) -> &'static str {
+    if m.rect_px[3] > m.rect_px[2] {
+        "Portrait"
+    } else {
+        "Landscape"
+    }
+}
+
+/// The one point a snap moves the window to: the monitor's
+/// top-left inset by 60 pt, clamped so the point — and the whole
+/// window, when it fits — stays inside the rect with an 8 pt
+/// margin on every side. Negative-coordinate monitors (left of /
+/// above the primary) work unchanged: everything is computed in
+/// the monitor's own rect space.
+fn snap_target_point(m: &MonitorInfo, win_size: [f32; 2]) -> [f32; 2] {
+    let [rx, ry, rw, rh] = monitor_rect_points(m);
+    [
+        snap_axis(rx, rw, win_size[0]),
+        snap_axis(ry, rh, win_size[1]),
+    ]
+}
+
+fn snap_axis(origin: f32, len: f32, win_len: f32) -> f32 {
+    const INSET: f32 = 60.0;
+    const MARGIN: f32 = 8.0;
+    if len <= 2.0 * MARGIN {
+        // Degenerate strip of a monitor: its centre is the only
+        // surely-interior point.
+        return origin + len / 2.0;
+    }
+    // Right/bottom bound: keep the whole window inside when it
+    // fits with margins; otherwise keep the point itself inside
+    // (the window is maximized immediately after, so the point
+    // alone decides the target monitor).
+    let hi = if win_len + 2.0 * MARGIN <= len {
+        origin + len - MARGIN - win_len
+    } else {
+        origin + len - MARGIN - 1.0
+    };
+    let lo = origin + MARGIN;
+    (origin + INSET).min(hi).max(lo)
+}
+
+/// Which monitor a point (egui points, virtual-desktop
+/// coordinates) falls on — used to mark the display the window
+/// currently sits on (by its centre point).
+fn monitor_index_at(monitors: &[MonitorInfo], point: [f32; 2]) -> Option<usize> {
+    monitors.iter().position(|m| {
+        let [x, y, w, h] = monitor_rect_points(m);
+        point[0] >= x && point[0] < x + w && point[1] >= y && point[1] < y + h
+    })
+}
+
+/// Live display enumeration (Windows): EnumDisplayMonitors +
+/// GetMonitorInfoW for the rect/primary flag, GetDpiForMonitor
+/// for each display's own scale, EnumDisplayDevicesW for the
+/// friendly name. Called when the snap menu opens and again when
+/// a choice is acted on — never cached across clicks.
+#[cfg(target_os = "windows")]
+fn enumerate_monitors() -> Vec<MonitorInfo> {
+    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC,
+        HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    // (windows-sys 0.59: BOOL is an i32 alias, LPARAM an isize
+    // alias — plain values, not tuple structs.)
+    unsafe extern "system" fn collect(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let v = &mut *(data as *mut Vec<isize>);
+        v.push(hmon as isize);
+        1
+    }
+
+    fn wide(s: &[u16]) -> String {
+        let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+        String::from_utf16_lossy(&s[..end])
+    }
+
+    let mut handles: Vec<isize> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            &mut handles as *mut Vec<isize> as isize,
+        )
+    };
+    if ok == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for h in handles {
+        let hmon = h as HMONITOR;
+        let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        let got = unsafe {
+            GetMonitorInfoW(
+                hmon,
+                &mut info.monitorInfo as *mut MONITORINFO,
+            )
+        };
+        if got == 0 {
+            continue;
+        }
+        let rc = info.monitorInfo.rcMonitor;
+        let device = wide(&info.szDevice);
+        let (mut dx, mut dy) = (0u32, 0u32);
+        let scale = if unsafe { GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) } == 0
+            && dx > 0
+        {
+            dx as f32 / 96.0
+        } else {
+            1.0
+        };
+        // Friendly name ("Dell U2415" etc.) via the display
+        // device; fall back to the device name ("DISPLAY1").
+        let mut name = String::new();
+        let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        let dev_wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+        if unsafe {
+            EnumDisplayDevicesW(dev_wide.as_ptr(), 0, &mut dd, 0)
+        } != 0
+        {
+            name = wide(&dd.DeviceString);
+        }
+        if name.trim().is_empty() {
+            name = device.trim_start_matches(&['\\', '.'][..]).to_string();
+        }
+        out.push(MonitorInfo {
+            name,
+            device,
+            rect_px: [rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top],
+            scale,
+            primary: info.monitorInfo.dwFlags & 1 != 0,
+        });
+    }
+    out
+}
+
+/// Non-Windows builds have no enumeration (the snap button then
+/// reports no displays) — the shipped app is the Windows one.
+#[cfg(not(target_os = "windows"))]
+fn enumerate_monitors() -> Vec<MonitorInfo> {
+    Vec::new()
+}
+
 /// Parse a NAMED REG_SZ value out of `reg query` output (the App
 /// Paths parser reads the "(Default)" value; the Run key's values
 /// are named, so the name must head the line).
@@ -4482,6 +4679,31 @@ impl App {
         }
     }
 
+    /// Snap to monitor (v1.3.0): act on a display chosen in the
+    /// header menu. The list is RE-ENUMERATED here, at click
+    /// time — a display unplugged since the menu opened turns
+    /// the click into a no-op with a note, never a blind move.
+    /// Command order is the safety story: leave fullscreen /
+    /// maximized, move to the single clamped interior point on
+    /// the target display, then maximize and let the OS own the
+    /// geometry. Nothing is persisted; startup is unaffected.
+    fn snap_to_monitor(&mut self, ctx: &egui::Context, chosen_device: &str) {
+        let monitors = enumerate_monitors();
+        let Some(m) = monitors.iter().find(|m| m.device == chosen_device) else {
+            self.toast("That display is no longer available", false);
+            return;
+        };
+        let win_size = ctx
+            .input(|i| i.viewport().outer_rect.map(|r| [r.width(), r.height()]))
+            .unwrap_or([1120.0, 780.0]);
+        let pt = snap_target_point(m, win_size);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(pt[0], pt[1])));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        self.toast(format!("Snapped to {}", m.name), false);
+    }
+
     /// Tray actions + window-close behaviour, run every frame
     /// before rendering:
     ///  - tray "Open" / icon left-click, or a secondary launch's
@@ -5221,6 +5443,47 @@ impl App {
                         }
                         if ui.add(Button::new("↻ Refresh")).clicked() {
                             self.spawn_discovery(false);
+                        }
+                        // Snap to monitor (v1.3.0): the menu lists
+                        // the displays enumerated live as it opens;
+                        // choosing one re-validates and snaps (see
+                        // snap_to_monitor). 🖥 = U+1F5A5, covered by
+                        // the embedded Noto Sans Symbols 2 fallback.
+                        let mut snap_choice: Option<String> = None;
+                        ui.menu_button("🖥 Monitor", |ui| {
+                            ui.set_min_width(264.0);
+                            let monitors = enumerate_monitors();
+                            if monitors.is_empty() {
+                                ui.label(
+                                    RichText::new("No displays found").color(pal.dim),
+                                );
+                            }
+                            let centre = ctx.input(|i| {
+                                i.viewport().outer_rect.map(|r| [r.center().x, r.center().y])
+                            });
+                            let current = centre.and_then(|c| monitor_index_at(&monitors, c));
+                            for (idx, m) in monitors.iter().enumerate() {
+                                let mut line2 = format!(
+                                    "{} × {} · {}",
+                                    m.rect_px[2],
+                                    m.rect_px[3],
+                                    monitor_orientation(m)
+                                );
+                                if m.primary {
+                                    line2 += " · Primary";
+                                }
+                                if current == Some(idx) {
+                                    line2 += " · This window is here";
+                                }
+                                let entry = format!("{}\n{}", m.name, line2);
+                                if ui.selectable_label(false, entry).clicked() {
+                                    snap_choice = Some(m.device.clone());
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        if let Some(dev) = snap_choice {
+                            self.snap_to_monitor(ctx, &dev);
                         }
                         let mut interval = self.cfg.prefs.interval;
                         ComboBox::from_id_source("hdr_interval")
@@ -9056,6 +9319,87 @@ mod tests {
                 "placement-memory remnant {needle:?} is still in main.rs"
             );
         }
+    }
+
+    // ---------------- v1.3.0: snap to monitor (pure parts) ----------------
+
+    fn mon(x: i32, y: i32, w: i32, h: i32, scale: f32, primary: bool) -> MonitorInfo {
+        MonitorInfo {
+            name: "M".into(),
+            device: "D".into(),
+            rect_px: [x, y, w, h],
+            scale,
+            primary,
+        }
+    }
+
+    #[test]
+    fn snap_conversion_uses_each_monitors_own_scale() {
+        // 2560×1440 physical at 150% -> 1706.7×960 points.
+        let m = mon(0, 0, 2560, 1440, 1.5, true);
+        let r = monitor_rect_points(&m);
+        assert!((r[2] - 1706.67).abs() < 0.1 && (r[3] - 960.0).abs() < 0.1);
+        // At 200% the same panel is 1280×720 points; at 100% it
+        // is the physical size. Negative origins divide too.
+        let m2 = mon(-1920, 0, 1920, 1080, 2.0, false);
+        assert_eq!(monitor_rect_points(&m2), [-960.0, 0.0, 960.0, 540.0]);
+        let m3 = mon(0, 0, 1920, 1080, 1.0, true);
+        assert_eq!(monitor_rect_points(&m3), [0.0, 0.0, 1920.0, 1080.0]);
+        assert_eq!(monitor_orientation(&m3), "Landscape");
+        assert_eq!(monitor_orientation(&mon(0, 0, 1080, 1920, 1.0, false)), "Portrait");
+    }
+
+    #[test]
+    fn snap_point_is_interior_and_clamped() {
+        let win = [1120.0, 780.0];
+        // Roomy monitor: the plain 60 pt inset.
+        assert_eq!(snap_target_point(&mon(0, 0, 1920, 1080, 1.0, true), win), [60.0, 60.0]);
+        // Negative-origin monitor left of the primary.
+        assert_eq!(
+            snap_target_point(&mon(-1920, 0, 1920, 1080, 1.0, false), win),
+            [-1860.0, 60.0]
+        );
+        // Monitor above the primary (negative y).
+        assert_eq!(
+            snap_target_point(&mon(0, -1080, 1920, 1080, 1.0, false), win),
+            [60.0, -1020.0]
+        );
+        // Window wider than the monitor: the point still lands
+        // strictly inside, with margin.
+        let small = mon(0, 0, 800, 600, 1.0, false);
+        let p = snap_target_point(&small, win);
+        assert!(p[0] > 0.0 && p[0] < 800.0 && p[1] > 0.0 && p[1] < 600.0, "point {p:?} interior");
+        // Narrow monitor: the 60 pt inset already lands inside.
+        let narrow = mon(100, 0, 100, 900, 1.0, false);
+        let p = snap_target_point(&narrow, win);
+        assert!((p[0] - 160.0).abs() < 0.01, "inset x, got {}", p[0]);
+        // Very narrow monitor: the inset overshoots the far edge
+        // and clamps back inside it (width - margin - 1 = 41).
+        let vnarrow = mon(0, 0, 50, 900, 1.0, false);
+        let p = snap_target_point(&vnarrow, win);
+        assert!((p[0] - 41.0).abs() < 0.01, "clamped x, got {}", p[0]);
+        // Scaled portrait panel to the right (the user's desk):
+        // 1080×1920 px at 100% beside the primary.
+        let portrait = mon(1920, 0, 1080, 1920, 1.0, false);
+        assert_eq!(snap_target_point(&portrait, win), [1980.0, 60.0]);
+        // Degenerate tiny monitor: centre point, still interior.
+        let tiny = mon(50, 50, 10, 10, 1.0, false);
+        assert_eq!(snap_target_point(&tiny, win), [55.0, 55.0]);
+    }
+
+    #[test]
+    fn snap_current_monitor_detection() {
+        let mons = vec![
+            mon(0, 0, 1920, 1080, 1.0, true),
+            mon(1920, 0, 1080, 1920, 1.0, false),
+            mon(-1600, 0, 1600, 900, 1.25, false), // 1280×720 points
+        ];
+        assert_eq!(monitor_index_at(&mons, [100.0, 100.0]), Some(0));
+        assert_eq!(monitor_index_at(&mons, [2400.0, 900.0]), Some(1));
+        assert_eq!(monitor_index_at(&mons, [-500.0, 300.0]), Some(2));
+        assert_eq!(monitor_index_at(&mons, [5000.0, 100.0]), None);
+        // The shared edge belongs to the right-hand monitor.
+        assert_eq!(monitor_index_at(&mons, [1920.0, 10.0]), Some(1));
     }
 
     #[test]
