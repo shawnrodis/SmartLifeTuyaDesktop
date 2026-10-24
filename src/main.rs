@@ -9579,21 +9579,39 @@ mod tests {
     #[test]
     fn ffmpeg_lookup_order() {
         let bin = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+        // The bundled tier, in order: beside the exe everywhere,
+        // plus — on macOS only — the .app's Resources copy
+        // (per-arch) as its bundle equivalent. The Settings
+        // override ranks after the WHOLE tier, then PATH
+        // (ffmpeg_candidates' doc / DESIGN.md's platform table).
+        // The expectations are indexed off the tier size so this
+        // holds on every host (the first macOS CI run caught the
+        // old fixed indices).
+        let mut bundled = vec![Path::new("/app").join(bin)];
+        if cfg!(target_os = "macos") {
+            bundled.push(
+                Path::new("/app")
+                    .join("../Resources")
+                    .join(ffmpeg_bundled_name(std::env::consts::ARCH).unwrap()),
+            );
+        }
+        let n = bundled.len();
         let cands = ffmpeg_candidates(
             Path::new("/app"),
             "/opt/ff/ffmpeg.exe",
             "/usr/bin:/bin",
         );
-        assert_eq!(cands[0], Path::new("/app").join(bin)); // bundled first
-        assert_eq!(cands[1], PathBuf::from("/opt/ff/ffmpeg.exe")); // override
-        assert_eq!(cands[2], Path::new("/usr/bin").join(bin)); // then PATH
-        assert_eq!(cands[3], Path::new("/bin").join(bin));
+        assert_eq!(&cands[..n], &bundled[..]); // bundled first
+        assert_eq!(cands[n], PathBuf::from("/opt/ff/ffmpeg.exe")); // override
+        assert_eq!(cands[n + 1], Path::new("/usr/bin").join(bin)); // then PATH
+        assert_eq!(cands[n + 2], Path::new("/bin").join(bin));
+        assert_eq!(cands.len(), n + 3);
         // A bare-name override resolves against PATH before plain PATH.
         let cands = ffmpeg_candidates(Path::new("/app"), "myffmpeg", "/usr/bin");
-        assert_eq!(cands[1], Path::new("/usr/bin").join("myffmpeg"));
+        assert_eq!(cands[n], Path::new("/usr/bin").join("myffmpeg"));
         // No override: just bundled + PATH.
         let cands = ffmpeg_candidates(Path::new("/app"), "", "/usr/bin");
-        assert_eq!(cands.len(), 2);
+        assert_eq!(cands.len(), n + 1);
     }
 
     #[test]
@@ -9844,18 +9862,37 @@ mod tests {
 
     #[test]
     fn release_parse_and_installer_name() {
+        // The fixture carries EVERY platform's asset (v1.4.0):
+        // parse_release pulls this host's — the running app only
+        // ever wants its own platform's file, so the parse result
+        // is asserted host-relatively — while the explicit-OS
+        // selections below pin each platform's choice on any host
+        // (the first macOS CI run caught the old exe-only fixture:
+        // on a Mac the parse correctly found no .dmg and the test
+        // panicked expecting one to parse).
         let v = json!({
             "tag_name": "v1.2.0",
             "html_url": "https://github.com/x/releases/v1.2.0",
             "assets": [
                 { "name": "SmartLife_Tuya_Desktop.html", "browser_download_url": "https://dl/html", "size": 100 },
-                { "name": "SmartLifeTuyaDesktop-Setup-v1.2.0.exe", "browser_download_url": "https://dl/exe", "size": 200 }
+                { "name": "SmartLifeTuyaDesktop-Setup-v1.2.0.exe", "browser_download_url": "https://dl/exe", "size": 200 },
+                { "name": "SmartLifeTuyaDesktop-v1.2.0.dmg", "browser_download_url": "https://dl/dmg", "size": 300 }
             ]
         });
         let info = parse_release(&v).expect("release parses");
         assert_eq!(info.version, "1.2.0");
-        assert_eq!(info.asset_name, "SmartLifeTuyaDesktop-Setup-v1.2.0.exe");
         assert_eq!(info.asset_name, expected_update_asset_name(&info.version));
+        let assets = v.get("assets").unwrap().as_array().unwrap();
+        let win = select_update_asset(assets, "1.2.0", "windows").expect("windows asset");
+        assert_eq!(
+            win.get("name").and_then(|n| n.as_str()),
+            Some("SmartLifeTuyaDesktop-Setup-v1.2.0.exe")
+        );
+        let mac = select_update_asset(assets, "1.2.0", "macos").expect("macos asset");
+        assert_eq!(
+            mac.get("name").and_then(|n| n.as_str()),
+            Some("SmartLifeTuyaDesktop-v1.2.0.dmg")
+        );
         assert_ne!(
             "SmartLifeTuyaDesktop-Setup-v9.9.9.exe",
             expected_update_asset_name(&info.version)
