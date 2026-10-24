@@ -8886,7 +8886,11 @@ mod tests {
         // feature (capture + restore) is gone from the crate, so
         // no launch path can read saved window geometry. Needles
         // are concatenated so this test doesn't match itself.
-        let src = include_str!("main.rs");
+        // Scan the production code only (everything before the
+        // test module — the legacy-config fixture below names the
+        // key on purpose).
+        let full = include_str!("main.rs");
+        let src = full.split("#[cfg(test)]").next().unwrap_or(full);
         for needle in [
             concat!("window_", "geom"),
             concat!("Window", "Geom"),
