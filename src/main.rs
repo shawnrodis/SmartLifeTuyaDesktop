@@ -6260,8 +6260,15 @@ impl App {
             ui.add_space(3.0);
             let out = slim_slider(ui, egui::Id::new(&key), live, min, max, true, accent, pal.track);
             if out.changed {
-                let v = if tag == "t" {
-                    (out.value / 50.0).round() * 50.0
+                // Same live semantics as the card sliders
+                // (slider_row): temp moves in whole stop indices,
+                // brightness in UI percent. (Pre-1.3.2 this branch
+                // carried a pre-stop-scale remnant — (v/50)*50 —
+                // which collapsed every temp position to 0, so the
+                // header readout snapped to 2700K the moment the
+                // slider was touched.)
+                let v = if kind == GroupKind::Temp {
+                    out.value.round()
                 } else {
                     out.value
                 };
@@ -6271,7 +6278,20 @@ impl App {
             if out.released {
                 let v = self.slider_live.remove(&key).unwrap_or(out.value);
                 self.dragging_slider = false;
-                self.group_broadcast(sec, kind, v.round() as i64, None);
+                // Convert to the PLANNER's units here, exactly
+                // like the card path converts at commit (v1.3.2):
+                // group_plan's Temp arm takes an API slider value
+                // (1000..=10000), brightness takes a UI percent.
+                // Broadcasting the raw stop index (0..=4) used to
+                // clamp to 1000 — a 2700K blast to every member,
+                // whatever stop the user had actually chosen.
+                let num = match kind {
+                    GroupKind::Temp => {
+                        temp_kelvin_to_slider(temp_stop_kelvin(v.round() as i64))
+                    }
+                    _ => v.round() as i64,
+                };
+                self.group_broadcast(sec, kind, num, None);
             }
         });
     }
@@ -10499,6 +10519,304 @@ mod tests {
             ymin,
             ymax
         );
+    }
+
+    // ---- Group-header slider DRIVE gate (v1.3.2) ----
+    // The v1.3.1 planner tests passed while the field build's
+    // group header sliders did nothing useful: the divergence
+    // lived in the UI→plan wiring (group_slider), which no test
+    // drove. These gates drive the REAL dashboard with synthetic
+    // pointer drags on the header sliders (and, for comparison,
+    // on a card's sliders) and read back the member states the
+    // broadcast applied — the same observable the user sees.
+
+    /// The user's Lighting section, mirrored: five tunable-white
+    /// bulbs with MIXED device brightness / colour-temp readings
+    /// (3080/3780/3970/3000/6500K) plus the colour-only strip.
+    fn group_drive_fixture() -> Vec<Device> {
+        let bulb = |id: &str, name: &str, bright_reported: i64, kelvin: i64| {
+            dev(
+                id,
+                name,
+                json!({
+                    "state": true,
+                    "brightness": bright_reported,
+                    "color_temp": temp_slider_to_reported(temp_kelvin_to_slider(kelvin)),
+                    "color_mode": "white",
+                    "online": true
+                }),
+            )
+        };
+        vec![
+            bulb("b1", "Desk Light", 1000, 3080),
+            bulb("b2", "Kitchen Light 1", 800, 3780),
+            bulb("b3", "Kitchen Light 2", 600, 3970),
+            bulb("b4", "Love's Bed Light", 900, 3000),
+            bulb("b5", "Shawn's Bed Light", 400, 6500),
+            dev(
+                "s1",
+                "Desk RGB strip",
+                json!({ "state": true, "color_mode": "colour", "hue": 10, "saturation": 0.5, "online": true }),
+            ),
+        ]
+    }
+
+    /// One dashboard frame with explicit input events.
+    fn drive_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        clock: &mut f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        *clock += 0.05;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            time: Some(*clock),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| app.view_dashboard(ui));
+        })
+    }
+
+    /// Slider track rects (h≈6) drawn in a frame.
+    fn slider_track_rects(out: &egui::FullOutput) -> Vec<egui::Rect> {
+        let mut acc = Vec::new();
+        fn walk(s: &egui::epaint::Shape, acc: &mut Vec<egui::Rect>) {
+            match s {
+                egui::epaint::Shape::Rect(r) => {
+                    if (r.rect.height() - 6.0).abs() < 0.75 && r.rect.width() >= 100.0 {
+                        acc.push(r.rect);
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for x in v {
+                        walk(x, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut acc);
+        }
+        acc
+    }
+
+    fn widest_track(rects: &[egui::Rect]) -> egui::Rect {
+        rects
+            .iter()
+            .copied()
+            .max_by(|a, b| a.width().partial_cmp(&b.width()).unwrap())
+            .expect("a slider track")
+    }
+
+    /// A realistic drag on a slim_slider track: press at the
+    /// current ratio, travel to the target ratio in steps,
+    /// release, then two idle frames for the commit to land.
+    fn simulate_slider_drag(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        clock: &mut f64,
+        track: egui::Rect,
+        from_ratio: f32,
+        to_ratio: f32,
+    ) -> egui::FullOutput {
+        let y = track.center().y;
+        let lo = track.left() + 9.0;
+        let hi = track.right() - 9.0;
+        let at = |r: f32| egui::pos2(lo + r * (hi - lo), y);
+        drive_frame(app, ctx, size, clock, vec![egui::Event::PointerMoved(at(from_ratio))]);
+        drive_frame(
+            app,
+            ctx,
+            size,
+            clock,
+            vec![egui::Event::PointerButton {
+                pos: at(from_ratio),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        for i in 1..=6 {
+            let r = from_ratio + (to_ratio - from_ratio) * (i as f32 / 6.0);
+            drive_frame(app, ctx, size, clock, vec![egui::Event::PointerMoved(at(r))]);
+        }
+        drive_frame(
+            app,
+            ctx,
+            size,
+            clock,
+            vec![egui::Event::PointerButton {
+                pos: at(to_ratio),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        drive_frame(app, ctx, size, clock, vec![]);
+        drive_frame(app, ctx, size, clock, vec![])
+    }
+
+    /// The group header's two slider tracks + label positions,
+    /// located from the drawn output of a settled frame.
+    fn header_slider_tracks(out: &egui::FullOutput) -> (egui::Rect, egui::Rect, egui::Pos2, egui::Pos2) {
+        let texts = drawn_texts(out);
+        let first = |needle: &str| {
+            texts
+                .iter()
+                .filter(|(t, _)| t == needle)
+                .min_by_key(|(_, p)| (p.y * 10.0) as i32)
+                .map(|(_, p)| *p)
+                .unwrap_or_else(|| panic!("label {needle} drawn"))
+        };
+        let bright_label = first("Brightness");
+        let temp_label = first("Colour temperature");
+        let band: Vec<egui::Rect> = slider_track_rects(out)
+            .into_iter()
+            .filter(|r| r.center().y >= bright_label.y + 12.0 && r.center().y <= bright_label.y + 70.0)
+            .collect();
+        let b_track = widest_track(
+            &band.iter().copied().filter(|r| r.center().x < temp_label.x).collect::<Vec<_>>(),
+        );
+        let t_track = widest_track(
+            &band.iter().copied().filter(|r| r.center().x > temp_label.x).collect::<Vec<_>>(),
+        );
+        (b_track, t_track, bright_label, temp_label)
+    }
+
+    /// The text drawn on a label's own line (its value readout).
+    fn value_on_label_line(out: &egui::FullOutput, label: egui::Pos2) -> Option<String> {
+        drawn_texts(out)
+            .into_iter()
+            .filter(|(_, p)| (p.y - label.y).abs() <= 2.0 && p.x > label.x + 30.0)
+            .min_by_key(|(_, p)| (p.x * 10.0) as i32)
+            .map(|(t, _)| t)
+    }
+
+    fn fixture_device(app: &App, id: &str) -> Device {
+        app.devices.iter().find(|d| d.id == id).cloned().expect("fixture device")
+    }
+
+    #[test]
+    fn gate_group_header_sliders_drive_members() {
+        let mut app = test_app(group_drive_fixture());
+        // Fixture sanity: device-scale readings as parsed.
+        for (id, pct) in [("b1", 100), ("b2", 80), ("b3", 60), ("b4", 90), ("b5", 40)] {
+            assert_eq!(fixture_device(&app, id).brightness_pct, Some(pct), "{id} fixture brightness");
+        }
+        assert_eq!(fixture_device(&app, "s1").brightness_pct, None, "strip has no brightness reading");
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let size = egui::vec2(1500.0, 1080.0);
+        let mut clock = 50.0;
+        // Settle.
+        let mut out = drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        for _ in 0..2 {
+            out = drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        }
+        let (b_track, t_track, b_label, t_label) = header_slider_tracks(&out);
+        // At rest the header displays the honest aggregates:
+        // device-avg brightness 74 -> UI 71%; average Kelvin
+        // ≈4066 -> the 4000K stop.
+        assert_eq!(
+            value_on_label_line(&out, b_label).as_deref(),
+            Some("71%"),
+            "header brightness at rest"
+        );
+        assert_eq!(
+            value_on_label_line(&out, t_label).as_deref(),
+            Some("4000K"),
+            "header temp at rest must sit at the members' nearest stop, not the first stop"
+        );
+        // Drag header brightness to UI 40% (ratio (40-1)/99).
+        let out = simulate_slider_drag(&mut app, &ctx, size, &mut clock, b_track, 70.0 / 99.0, 39.0 / 99.0);
+        for id in ["b1", "b2", "b3", "b4", "b5"] {
+            assert_eq!(
+                fixture_device(&app, id).brightness_pct,
+                Some(brightness_ui_to_device(40)),
+                "{id} must be driven to the dragged UI 40% (device-mapped exactly once)"
+            );
+        }
+        assert_eq!(fixture_device(&app, "s1").brightness_pct, None, "strip untouched by brightness");
+        let (_, _, b_label, _) = header_slider_tracks(&out);
+        assert_eq!(
+            value_on_label_line(&out, b_label).as_deref(),
+            Some("40%"),
+            "header brightness readout after the drag"
+        );
+        // Drag header temp to stop index 3 (5000K), from stop 2.
+        let (_, t_track, _, t_label) = header_slider_tracks(&out);
+        let out = simulate_slider_drag(&mut app, &ctx, size, &mut clock, t_track, 0.5, 0.75);
+        for id in ["b1", "b2", "b3", "b4", "b5"] {
+            assert_eq!(
+                fixture_device(&app, id).temp_slider,
+                Some(temp_kelvin_to_slider(5000)),
+                "{id} must be driven to the chosen 5000K stop exactly"
+            );
+        }
+        assert_eq!(fixture_device(&app, "s1").temp_slider, None, "strip untouched by temp");
+        let (_, _, _, t_label) = header_slider_tracks(&out);
+        assert_eq!(
+            value_on_label_line(&out, t_label).as_deref(),
+            Some("5000K"),
+            "header temp readout after the drag"
+        );
+    }
+
+    #[test]
+    fn gate_card_sliders_drive_one_member() {
+        // The comparison path: the same gesture on a CARD slider
+        // drives exactly that card's device (field-verified
+        // behaviour the header must match in effect).
+        let mut app = test_app(group_drive_fixture());
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let size = egui::vec2(1500.0, 1080.0);
+        let mut clock = 80.0;
+        let mut out = drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        for _ in 0..2 {
+            out = drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        }
+        let texts = drawn_texts(&out);
+        let (_, _, hb_label, _) = header_slider_tracks(&out);
+        // First card = "Desk Light" (name order): its Brightness
+        // label is the topmost one BELOW the header strip.
+        let card_b_label = texts
+            .iter()
+            .filter(|(t, p)| t == "Brightness" && p.y > hb_label.y + 70.0)
+            .min_by_key(|(_, p)| ((p.y * 10.0) as i32, (p.x * 10.0) as i32))
+            .map(|(_, p)| *p)
+            .expect("first card Brightness label");
+        let tracks = slider_track_rects(&out);
+        let b_track = widest_track(
+            &tracks
+                .iter()
+                .copied()
+                .filter(|r| {
+                    r.center().y >= card_b_label.y + 12.0
+                        && r.center().y <= card_b_label.y + 45.0
+                        && r.center().x >= card_b_label.x - 20.0
+                        && r.center().x <= card_b_label.x + 280.0
+                })
+                .collect::<Vec<_>>(),
+        );
+        // b1 starts at UI 100% (ratio 1.0); drag to UI 40%.
+        let _ = simulate_slider_drag(&mut app, &ctx, size, &mut clock, b_track, 1.0, 39.0 / 99.0);
+        assert_eq!(fixture_device(&app, "b1").brightness_pct, Some(brightness_ui_to_device(40)));
+        for (id, pct) in [("b2", 80), ("b3", 60), ("b4", 90), ("b5", 40)] {
+            assert_eq!(
+                fixture_device(&app, id).brightness_pct,
+                Some(pct),
+                "{id} must NOT be touched by a card drag"
+            );
+        }
     }
 
     #[test]
