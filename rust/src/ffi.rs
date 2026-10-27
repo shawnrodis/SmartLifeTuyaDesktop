@@ -616,10 +616,14 @@ pub extern "C" fn tuya_tray_actions(req_json: *const c_char) -> *mut c_char {
         // Store it in a process-lifetime static, and spawn the
         // event-draining thread once (Windows: menu + icon clicks;
         // macOS: menu clicks only — the shell polls the queue).
-        static TRAY_STATE: Mutex<Option<crate::system::TrayState>> =
-            Mutex::new(None);
-        if let Ok(mut slot) = TRAY_STATE.lock() {
-            if slot.is_none() {
+        // TrayIcon is Rc<RefCell<..>> on Windows, so it cannot live
+        // in a static Mutex (which requires Sync). Leak it instead,
+        // like the single-instance guard below: the icon stays alive
+        // for the process lifetime, and a bool flag (which IS Sync)
+        // ensures we only build it once.
+        static TRAY_ENSURED: Mutex<bool> = Mutex::new(false);
+        if let Ok(mut ensured) = TRAY_ENSURED.lock() {
+            if !*ensured {
                 if let Some(state) = crate::system::build_tray() {
                     #[cfg(target_os = "windows")]
                     let (open_id, quit_id) =
@@ -627,7 +631,9 @@ pub extern "C" fn tuya_tray_actions(req_json: *const c_char) -> *mut c_char {
                     #[cfg(target_os = "macos")]
                     let (open_id, quit_id) =
                         (state.open_id.clone(), state.quit_id.clone());
-                    *slot = Some(state);
+                    let _leaked: &'static crate::system::TrayState =
+                        Box::leak(Box::new(state));
+                    *ensured = true;
                     #[cfg(target_os = "windows")]
                     {
                         let _ = crate::system::spawn_tray_thread(open_id, quit_id);
