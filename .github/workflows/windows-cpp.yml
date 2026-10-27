@@ -1,0 +1,30 @@
+name: Build Windows C++
+
+on:
+  push:
+    branches: [windows-cpp]
+  workflow_dispatch:
+
+jobs:
+  build-windows-cpp:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Rust core (tuya_core.dll)
+        run: cargo build --release --manifest-path rust/Cargo.toml
+      - name: Build C++ frontend
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build --config Release
+      - name: Stage artifact (exe alone will not run)
+        run: |
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item -Force cpp/build/Release/smartlife_tuya_desktop.exe staging/
+          Copy-Item -Force rust/target/release/tuya_core.dll staging/
+          if (-not (Test-Path 'staging/tuya_core.dll')) { throw 'tuya_core.dll missing — Rust core build failed' }
+          Get-ChildItem staging/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smartlife-tuya-windows-cpp
+          path: staging/
