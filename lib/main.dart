@@ -60,13 +60,19 @@ import 'theme.dart';
 String _argvLaunchMode = 'normal';
 
 void _diagLog(String msg) {
-  try {
-    final f = File(
-        'C:\\Users\\Public\\SmartLifeTuyaDesktop-diag.log');
-    f.writeAsStringSync(
-        '${DateTime.now().toIso8601String()} $msg\n',
-        mode: FileMode.append);
-  } catch (_) {}
+  // Write to %TEMP% first (always writable for a per-user app) and
+  // to C:\\Users\\Public as a second copy. A non-admin app may not
+  // be able to write to Public at all, and a failed log must never
+  // silently become 'no log file' — so try both, ignore failures.
+  final line = '${DateTime.now().toIso8601String()} $msg\n';
+  for (final path in [
+    '${Directory.systemTemp.path}\\SmartLifeTuyaDesktop-diag.log',
+    'C:\\Users\\Public\\SmartLifeTuyaDesktop-diag.log',
+  ]) {
+    try {
+      File(path).writeAsStringSync(line, mode: FileMode.append);
+    } catch (_) {}
+  }
 }
 
 Future<void> main(List<String> args) async {
