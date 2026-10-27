@@ -71,6 +71,19 @@ HWND g_user = nullptr, g_pass = nullptr, g_region = nullptr,
 bool g_loggingIn = false;
 bool g_statusError = false;
 bool g_proxyShown = false;
+HWND g_mainWnd = nullptr;
+HWND g_emoji = nullptr, g_title = nullptr;
+HWND g_lblUser = nullptr, g_lblPass = nullptr, g_lblRegion = nullptr,
+     g_lblPlatform = nullptr;
+HWND g_explainer = nullptr, g_note = nullptr;
+HFONT g_fontEmoji = nullptr, g_fontTitle = nullptr, g_fontSubtitle = nullptr,
+      g_fontLabel = nullptr, g_fontField = nullptr, g_fontButton = nullptr,
+      g_fontNote = nullptr, g_fontProxy = nullptr;
+HBRUSH g_cardBrush = nullptr;
+RECT g_cardRect = {};
+int g_sepY = -1;
+
+void LayoutLogin();
 
 void StartLoginRequest(HWND hwnd, const std::string &req);
 
@@ -84,6 +97,7 @@ std::wstring GetEditText(HWND h) {
 void SetStatus(const std::wstring &s, bool error) {
   g_statusError = error;
   if (g_status != nullptr) SetWindowTextW(g_status, s.c_str());
+  LayoutLogin();
 }
 
 void SetLoginEnabled(bool enabled) {
@@ -205,100 +219,114 @@ void SaveProxyPrefs() {
   }
 }
 
+void LayoutLogin();
+
 void UpdateProxyCustomVisibility() {
-  const bool custom = ComboValue(g_proxy) == L"custom";
-  ShowWindow(g_proxyCustomLabel, custom ? SW_SHOW : SW_HIDE);
-  ShowWindow(g_proxyCustom, custom ? SW_SHOW : SW_HIDE);
+  LayoutLogin();
 }
 
 void ToggleProxy() {
   g_proxyShown = !g_proxyShown;
-  const int show = g_proxyShown ? SW_SHOW : SW_HIDE;
-  ShowWindow(g_proxyLabel, show);
-  ShowWindow(g_proxy, show);
-  UpdateProxyCustomVisibility();
   SetWindowTextW(g_proxyToggle,
-                 g_proxyShown ? L"Connection / proxy settings ▾"
-                              : L"Connection / proxy settings ▸");
+                 g_proxyShown ? L"Connection / proxy settings \u25be"
+                              : L"Connection / proxy settings \u25b8");
+  LayoutLogin();
 }
 
 void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
-  auto label = [&](int y, const wchar_t *text) {
-    return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, 16, y,
-                           600, 20, hwnd, nullptr, hInstance, nullptr);
+  auto mkfont = [](int px, bool bold, const wchar_t *face) {
+    return CreateFontW(px, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE,
+                       FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                       DEFAULT_PITCH, face);
   };
-  auto edit = [&](int id, int y, DWORD style) {
-    return CreateWindowExW(0, L"EDIT", L"",
-                           WS_CHILD | WS_VISIBLE | WS_BORDER | style, 16,
-                           y, 400, 24, hwnd, reinterpret_cast<HMENU>(id),
-                           hInstance, nullptr);
+  g_fontEmoji = mkfont(40, false, L"Segoe UI Emoji");
+  g_fontTitle = mkfont(23, true, L"Segoe UI");
+  g_fontSubtitle = mkfont(-18, false, L"Segoe UI");
+  g_fontLabel = mkfont(-17, true, L"Segoe UI");
+  g_fontField = mkfont(-19, false, L"Segoe UI");
+  g_fontButton = mkfont(-20, false, L"Segoe UI");
+  g_fontNote = mkfont(-16, false, L"Segoe UI");
+  g_fontProxy = mkfont(-19, false, L"Segoe UI");
+  auto label = [&](int id, const wchar_t *text, HFONT font) {
+    HWND h = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE,
+                             0, 0, 0, 0, hwnd, nullptr, hInstance, nullptr);
+    SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    (void)id;
+    return h;
   };
-  auto combo = [&](int id, int y) {
-    // Dropdown height 200: for a dropdown list this is the dropped
-    // list height, not the control height (24 would clip the list).
-    return CreateWindowExW(0, L"COMBOBOX", L"",
-                           WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 16, y,
-                           400, 200, hwnd, reinterpret_cast<HMENU>(id),
-                           hInstance, nullptr);
+  auto edit = [&](int id, DWORD style) {
+    HWND h = CreateWindowExW(0, L"EDIT", L"",
+                             WS_CHILD | WS_VISIBLE | WS_BORDER | style, 0, 0,
+                             0, 0, hwnd, reinterpret_cast<HMENU>(id),
+                             hInstance, nullptr);
+    SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontField), TRUE);
+    return h;
   };
-  // Egui login card header: house, app title, subtitle.
-  {
-    HWND title = CreateWindowExW(0, L"STATIC",
-                                 L"🏠 SmartLife & Tuya Desktop",
-                                 WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 16, 16,
-                                 600, 30, hwnd, nullptr, hInstance, nullptr);
-    HFONT bold = CreateFontW(23, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                             DEFAULT_PITCH, L"Segoe UI");
-    SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(bold), TRUE);
-    g_subtitle = CreateWindowExW(
-        0, L"STATIC",
-        L"Your Smart Life / Tuya devices, in one clean dashboard",
-        WS_CHILD | WS_VISIBLE, 16, 50, 600, 20, hwnd, nullptr, hInstance,
-        nullptr);
-  }
-  label(84, L"Smart Life / Tuya username");
-  g_user = edit(kIdUser, 106, ES_AUTOHSCROLL);
+  auto combo = [&](int id) {
+    // Height 200 is the dropped-list height, not the control height.
+    HWND h = CreateWindowExW(0, L"COMBOBOX", L"",
+                             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 0, 0,
+                             0, 200, hwnd, reinterpret_cast<HMENU>(id),
+                             hInstance, nullptr);
+    SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontField), TRUE);
+    return h;
+  };
+  g_emoji = CreateWindowExW(0, L"STATIC", L"🏠",
+                            WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 0, 0,
+                            hwnd, nullptr, hInstance, nullptr);
+  SendMessageW(g_emoji, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontEmoji), TRUE);
+  g_title = CreateWindowExW(0, L"STATIC", L"SmartLife & Tuya Desktop",
+                            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOPREFIX,
+                            0, 0, 0, 0, hwnd, nullptr, hInstance, nullptr);
+  SendMessageW(g_title, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontTitle), TRUE);
+  g_subtitle = CreateWindowExW(
+      0, L"STATIC",
+      L"Your Smart Life / Tuya devices, in one clean dashboard",
+      WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 0, 0, hwnd, nullptr,
+      hInstance, nullptr);
+  SendMessageW(g_subtitle, WM_SETFONT,
+               reinterpret_cast<WPARAM>(g_fontSubtitle), TRUE);
+  g_lblUser = label(0, L"Smart Life / Tuya username", g_fontLabel);
+  g_user = edit(kIdUser, ES_AUTOHSCROLL);
   SendMessageW(g_user, EM_SETCUEBANNER, TRUE,
                reinterpret_cast<LPARAM>(L"email or phone"));
-  label(138, L"Password");
-  g_pass = edit(kIdPass, 160, ES_PASSWORD | ES_AUTOHSCROLL);
+  g_lblPass = label(0, L"Password", g_fontLabel);
+  g_pass = edit(kIdPass, ES_PASSWORD | ES_AUTOHSCROLL);
   SendMessageW(g_pass, EM_SETCUEBANNER, TRUE,
                reinterpret_cast<LPARAM>(L"Your Smart Life password"));
-  label(192, L"Region (where your account was registered)");
-  g_region = combo(kIdRegion, 214);
+  g_lblRegion = label(0, L"Region (where your account was registered)", g_fontLabel);
+  g_region = combo(kIdRegion);
   AddComboItem(g_region, L"United States (US)", L"1");
   AddComboItem(g_region, L"Europe (EU)", L"44");
   AddComboItem(g_region, L"China (CN)", L"86");
   SendMessageW(g_region, CB_SETCURSEL, 0, 0);
-  label(248, L"App platform");
-  g_platform = combo(kIdPlatform, 270);
+  g_lblPlatform = label(0, L"App platform", g_fontLabel);
+  g_platform = combo(kIdPlatform);
   AddComboItem(g_platform, L"Smart Life", L"smart_life");
   AddComboItem(g_platform, L"Tuya Smart", L"tuya");
   SendMessageW(g_platform, CB_SETCURSEL, 0, 0);
   // Egui default: unchecked fresh; checked only when saved creds exist
   // (set in PrefillAndSilentLogin).
   g_keep = CreateWindowExW(0, L"BUTTON", L"Keep me logged in on this device",
-                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 306,
-                           400, 24, hwnd, reinterpret_cast<HMENU>(kIdKeep),
+                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0,
+                           0, hwnd, reinterpret_cast<HMENU>(kIdKeep),
                            hInstance, nullptr);
+  SendMessageW(g_keep, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontField), TRUE);
   g_loginBtn = CreateWindowExW(0, L"BUTTON", L"Log in",
-                               WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 16,
-                               338, 120, 30, hwnd,
-                               reinterpret_cast<HMENU>(kIdLoginBtn), hInstance,
-                               nullptr);
-  g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 16,
-                             378, 600, 32, hwnd,
-                             reinterpret_cast<HMENU>(kIdStatus), hInstance,
-                             nullptr);
+                               WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0,
+                               0, hwnd, reinterpret_cast<HMENU>(kIdLoginBtn),
+                               hInstance, nullptr);
+  g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0,
+                             0, 0, hwnd, reinterpret_cast<HMENU>(kIdStatus),
+                             hInstance, nullptr);
+  SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontNote), TRUE);
   g_proxyToggle = CreateWindowExW(
       0, L"BUTTON", L"Connection / proxy settings ▸",
-      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 16, 420, 300, 24, hwnd,
+      WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd,
       reinterpret_cast<HMENU>(kIdProxyToggle), hInstance, nullptr);
-  // Proxy controls start hidden (egui CollapsingHeader, closed).
-  g_proxyLabel = label(452, L"CORS proxy");
-  g_proxy = combo(kIdProxy, 474);
+  g_proxyLabel = label(0, L"CORS proxy", g_fontLabel);
+  g_proxy = combo(kIdProxy);
   AddComboItem(g_proxy, L"Auto — direct for US/EU, community proxy for CN (recommended)", L"auto");
   AddComboItem(g_proxy, L"SmartAtHome community proxy (all requests)", L"smartathome");
   AddComboItem(g_proxy, L"corsproxy.io (encoded URL)", L"corsproxy");
@@ -306,24 +334,22 @@ void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
   AddComboItem(g_proxy, L"None — direct connection", L"none");
   AddComboItem(g_proxy, L"Custom…", L"custom");
   SendMessageW(g_proxy, CB_SETCURSEL, 0, 0);
-  ShowWindow(g_proxyLabel, SW_HIDE);
-  ShowWindow(g_proxy, SW_HIDE);
-  g_proxyCustomLabel = label(506, L"Custom proxy prefix");
-  g_proxyCustom = edit(kIdProxyCustom, 528, ES_AUTOHSCROLL);
+  g_proxyCustomLabel = label(0, L"Custom proxy prefix", g_fontLabel);
+  g_proxyCustom = edit(kIdProxyCustom, ES_AUTOHSCROLL);
   SendMessageW(g_proxyCustom, EM_SETCUEBANNER, TRUE,
                reinterpret_cast<LPARAM>(
                    L"https://my-proxy.example/ or …?url={url}"));
-  ShowWindow(g_proxyCustomLabel, SW_HIDE);
-  ShowWindow(g_proxyCustom, SW_HIDE);
-  // Egui explanatory texts, verbatim in substance.
-  CreateWindowExW(0, L"STATIC",
-                  L"Most regions connect directly. A proxy is only needed where Tuya's servers don't accept direct browser/app calls (China region, some networks). See Help in Settings.",
-                  WS_CHILD | WS_VISIBLE, 16, 560, 600, 40, hwnd, nullptr,
-                  hInstance, nullptr);
-  CreateWindowExW(0, L"STATIC",
-                  L"Your credentials are only sent to Tuya's own servers and are stored only in this app's config on this device (and only if you tick “Keep me logged in”). Nothing is sent anywhere else.",
-                  WS_CHILD | WS_VISIBLE, 16, 612, 600, 40, hwnd, nullptr,
-                  hInstance, nullptr);
+  g_explainer = CreateWindowExW(
+      0, L"STATIC",
+      L"Most regions connect directly. A proxy is only needed where Tuya's servers don't accept direct browser/app calls (China region, some networks). See Help in Settings.",
+      WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, nullptr, hInstance, nullptr);
+  SendMessageW(g_explainer, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontNote), TRUE);
+  g_note = CreateWindowExW(
+      0, L"STATIC",
+      L"Your credentials are only sent to Tuya's own servers and are stored only in this app's config on this device (and only if you tick “Keep me logged in”). Nothing is sent anywhere else.",
+      WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, nullptr, hInstance, nullptr);
+  SendMessageW(g_note, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontNote), TRUE);
+  LayoutLogin();
 }
 
 void DoLogin(HWND hwnd) {
@@ -415,25 +441,95 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       RECT rc;
       GetClientRect(hwnd, &rc);
       FillRect(hdc, &rc, g_blackBrush);
+      if (g_cardRect.right > g_cardRect.left) {
+        HBRUSH card = g_cardBrush != nullptr ? g_cardBrush : g_blackBrush;
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x1f, 0x23, 0x2e));
+        HGDIOBJ oldBrush = SelectObject(hdc, card);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        RoundRect(hdc, g_cardRect.left, g_cardRect.top, g_cardRect.right,
+                  g_cardRect.bottom, 44, 44);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+        if (g_sepY >= 0) {
+          HPEN sep = CreatePen(PS_SOLID, 1, RGB(0x1f, 0x23, 0x2e));
+          HGDIOBJ oldSep = SelectObject(hdc, sep);
+          MoveToEx(hdc, g_cardRect.left + 28, g_sepY, nullptr);
+          LineTo(hdc, g_cardRect.right - 28, g_sepY);
+          SelectObject(hdc, oldSep);
+          DeleteObject(sep);
+        }
+      }
       EndPaint(hwnd, &ps);
       return 0;
     }
+    case WM_SIZE: {
+      LayoutLogin();
+      return 0;
+    }
+    case WM_DRAWITEM: {
+      LPDRAWITEMSTRUCT dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
+      if (dis->CtlID == kIdLoginBtn) {
+        const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+        HBRUSH fill = CreateSolidBrush(disabled ? RGB(0x5b, 0x64, 0x78)
+                                                : RGB(0x63, 0x66, 0xf1));
+        HPEN pen = CreatePen(PS_SOLID, 1, disabled ? RGB(0x5b, 0x64, 0x78)
+                                                  : RGB(0x63, 0x66, 0xf1));
+        HGDIOBJ oldBrush = SelectObject(dis->hDC, fill);
+        HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+        RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+                  dis->rcItem.right, dis->rcItem.bottom, 16, 16);
+        SelectObject(dis->hDC, oldBrush);
+        SelectObject(dis->hDC, oldPen);
+        DeleteObject(fill);
+        DeleteObject(pen);
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, RGB(0xff, 0xff, 0xff));
+        if (g_fontButton != nullptr)
+          SelectObject(dis->hDC, g_fontButton);
+        wchar_t text[64];
+        GetWindowTextW(dis->hwndItem, text, 64);
+        DrawTextW(dis->hDC, text, -1, &dis->rcItem,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return TRUE;
+      }
+      if (dis->CtlID == kIdProxyToggle) {
+        HBRUSH fill = g_cardBrush != nullptr ? g_cardBrush : g_blackBrush;
+        FillRect(dis->hDC, &dis->rcItem, fill);
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, RGB(0xe7, 0xeb, 0xf2));
+        if (g_fontProxy != nullptr)
+          SelectObject(dis->hDC, g_fontProxy);
+        wchar_t text[128];
+        GetWindowTextW(dis->hwndItem, text, 128);
+        DrawTextW(dis->hDC, text, -1, &dis->rcItem,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        return TRUE;
+      }
+      return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORBTN: {
-      // Black theme: white text on the window's black brush, except
-      // the subtitle (dim grey) and a login error (egui rose).
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLORLISTBOX: {
+      // Black theme, egui 1.4.0: text #e7ebf2, dim #8b94a7, error
+      // rose #fb7185, all on the card brush inside the login card.
       HDC hdc = reinterpret_cast<HDC>(wParam);
       HWND ctl = reinterpret_cast<HWND>(lParam);
-      if (ctl == g_subtitle) {
-        SetTextColor(hdc, RGB(180, 180, 180));
+      if (ctl == g_title) {
+        SetTextColor(hdc, RGB(0xe7, 0xeb, 0xf2));
       } else if (ctl == g_status && g_statusError) {
         SetTextColor(hdc, RGB(251, 113, 133));
+      } else if (ctl == g_status || ctl == g_keep || msg == WM_CTLCOLOREDIT ||
+                 msg == WM_CTLCOLORLISTBOX) {
+        SetTextColor(hdc, RGB(0xe7, 0xeb, 0xf2));
       } else {
-        SetTextColor(hdc, RGB(255, 255, 255));
+        SetTextColor(hdc, RGB(0x8b, 0x94, 0xa7));
       }
-      SetBkColor(hdc, RGB(0, 0, 0));
-      return reinterpret_cast<LRESULT>(g_blackBrush);
+      const COLORREF bk = 0x110d0c;  // card #0c0d11, as a COLORREF
+      SetBkColor(hdc, bk);
+      return reinterpret_cast<LRESULT>(
+          g_cardBrush != nullptr ? g_cardBrush : g_blackBrush);
     }
     case WM_COMMAND: {
       const int id = LOWORD(wParam);
@@ -476,6 +572,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     g_coreVersion = L"tuya_core.dll not found next to the exe";
   }
   g_blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+  g_cardBrush = CreateSolidBrush(RGB(0x0c, 0x0d, 0x11));
 
   WNDCLASSW wc = {};
   wc.lpfnWndProc = WndProc;
@@ -490,8 +587,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   HWND hwnd = CreateWindowExW(
       0, kClassName, kWindowTitle,
       WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 960,
-      760, nullptr, nullptr, hInstance, nullptr);
+      880, nullptr, nullptr, hInstance, nullptr);
   if (hwnd == nullptr) return 1;
+  g_mainWnd = hwnd;
   CreateLoginControls(hwnd, hInstance);
   PrefillAndSilentLogin(hwnd);
   ShowWindow(hwnd, nCmdShow);
@@ -499,6 +597,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    // Owner-drawn Log in is no longer a default pushbutton, so Enter
+    // in a login field must submit explicitly (egui submits on Enter).
+    if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+      HWND focus = GetFocus();
+      if (focus == g_user || focus == g_pass || focus == g_region ||
+          focus == g_platform || focus == g_proxyCustom) {
+        DoLogin(hwnd);
+        continue;
+      }
+    }
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }

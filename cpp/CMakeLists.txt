@@ -12,3 +12,10 @@ target_link_libraries(smartlife_tuya_desktop PRIVATE user32 gdi32 shell32)
 
 # The Rust core is loaded at runtime (LoadLibrary), never linked, so
 # no import library is needed from either toolchain.
+
+# Source files are UTF-8 (emoji, triangles, curly quotes in login
+# text). Without /utf-8, MSVC reads them in the ANSI codepage and
+# the login header renders as mojibake (the 2026-10-27 screenshot).
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
