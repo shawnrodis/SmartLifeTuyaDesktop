@@ -9,17 +9,16 @@ the Tuya API, config, device/section logic and ffmpeg camera pumps;
 possible, same functionality. The egui version (v1.4.1) is still the
 latest release and still on `main`; this branch has NOT been released,
 and the old dock-icon issue is deprioritised and not chased here.
-Known gaps in this branch (reported, not silently dropped): tray
-hide-on-close and snap-to-monitor / window move-maximize need the
-`window_manager` Flutter plugin (settings are saved, window actions
-show a GAP note); grid drag uses long-press + ↑/↓ instead of egui's
-measured-cell 8px drag; single-instance show delivery and the one-time
-tray balloon are split/gap as documented in `rust/README-API.md`.
-Windows + Mac builds require the staged workflows below — they cannot
-be pushed by automation (no `workflow` token scope), so add them via
-GitHub web UI when this branch is ready to build/release (see
-`.github/workflows/windows.yml` and
-`.github/workflows/release-mac-flutter.yml` in the working tree).
+Known gaps in this branch (reported, not silently dropped): grid drag
+uses long-press + ↑/↓ instead of egui's measured-cell 8px drag; the
+one-time tray balloon is cosmetic-only; auto-update download/install is
+untested, as documented in `rust/README-API.md`. Tray hide-on-close,
+snap-to-monitor / window move-maximize, launch states, and
+single-instance/tray-restore are now handled via the `window_manager`
+Flutter plugin plus Rust tray fixes.
+The Windows workflow is now on this branch; the Mac workflow
+(`.github/workflows/release-mac-flutter.yml`) is staged for main at
+release time, replacing the egui `release-mac.yml`.
 
   <img src="assets/icon.png" alt="SmartLife & Tuya Desktop icon" width="120">
 </p>
@@ -29,11 +28,11 @@ GitHub web UI when this branch is ready to build/release (see
 A clean, modern dashboard for your **Smart Life / Tuya** devices — lights,
 plugs, switches and scenes — in editions that look and behave the same:
 
-- **Windows app** (this repo's Rust + egui program): a small native app
-  with a per-user installer — no admin rights needed.
-- **macOS app** (the same program, since v1.4.0): a universal
-  (Apple Silicon + Intel) `.dmg`, built by CI on each release. It's
-  unsigned — see [Download](#download) for the one-time Gatekeeper
+- **Windows app** (this branch's Rust core + Flutter UI program): a small
+  native app with a per-user installer — no admin rights needed.
+- **macOS app** (the same Rust + Flutter program, coming with v1.5.0): a
+  universal (Apple Silicon + Intel) `.dmg`, built by CI on each release.
+  It's unsigned — see [Download](#download) for the one-time Gatekeeper
   bypass.
 - **Web app** (`web/SmartLife_Tuya_Desktop.html`): a single self-contained
   HTML file — open it in any modern browser, from disk or any static host.
