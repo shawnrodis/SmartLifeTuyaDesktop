@@ -12,7 +12,7 @@
 
 use eframe::egui;
 use egui::{
-    Align, Align2, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
+    Align, Align2, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, CornerRadius,
     ScrollArea, Sense, Stroke, TextEdit,
 };
 use serde::{Deserialize, Serialize};
@@ -82,10 +82,10 @@ const TOAST_BORDER: Color32 = Color32::from_rgb(0x33, 0x3f, 0x58);
 const ERR_BG: Color32 = Color32::from_rgb(0x4c, 0x11, 0x20);
 const ERR_BORDER: Color32 = Color32::from_rgb(0x88, 0x13, 0x37);
 
-const R_CARD: f32 = 18.0;
-const R_CARD_COMPACT: f32 = 14.0;
-const R_BTN: f32 = 11.0;
-const R_LOGIN: f32 = 22.0;
+const R_CARD: u8 = 18;
+const R_CARD_COMPACT: u8 = 14;
+const R_BTN: u8 = 11;
+const R_LOGIN: u8 = 22;
 
 const ACCENTS: [(&str, &str); 7] = [
     ("Indigo", "#6366f1"),
@@ -329,6 +329,16 @@ struct Prefs {
     /// "maximized" — carried as a flag in the Run command.
     #[serde(default = "default_launch_mode")]
     launch_mode: String,
+    /// Monitor the window was last on (v1.5.0): the OS device
+    /// identity ("\\.\DISPLAY2") of the display the window
+    /// most recently sat on, updated whenever the window moves
+    /// monitors. IDENTITY only — never geometry — so a restore
+    /// can never land a window off-screen (the v1.2.5 placement
+    /// memory's failure mode). Read ONLY on a Maximized launch:
+    /// the app reopens maximized on this display when it still
+    /// exists. "" = never recorded yet.
+    #[serde(default)]
+    last_monitor_device: String,
     /// Keep running in the system tray when the window is closed
     /// (v1.2.1) instead of quitting.
     #[serde(default)]
@@ -374,6 +384,7 @@ impl Default for Prefs {
             ffmpeg_path: String::new(),
             start_with_windows: false,
             launch_mode: default_launch_mode(),
+            last_monitor_device: String::new(),
             close_to_tray: false,
             tray_notice_shown: false,
         }
@@ -836,6 +847,7 @@ fn cam_size_of(layout: &LayoutCfg, item_id: &str) -> CamSize {
 /// Tapo templates (the source selection is unchanged by size);
 /// only the pump resolution grows (480×270 → 960×540). A Wide tile
 /// uses the card's own selected quality, like the big player.
+
 fn tile_feed(cam: &Camera, size: CamSize) -> (String, usize, usize) {
     match size {
         CamSize::Normal => (tile_rtsp_url(cam), TILE_W, TILE_H),
@@ -1124,7 +1136,7 @@ const CLOSE_TO_TRAY_LABEL: &str =
     "Keep running in the menu bar when the window is closed";
 
 #[cfg(not(target_os = "macos"))]
-const AUTOSTART_HELP: &str = "Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. The “Launch as” choice applies to every launch of the app — autostart, Start Menu, and shortcuts alike — not just the Windows-startup one; a launch that carries its own --minimized or --maximized flag (as the autostart entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a Windows-app feature; the web edition has no equivalent.";
+const AUTOSTART_HELP: &str = "Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. The “Launch as” choice applies to every launch of the app — autostart, Start Menu, and shortcuts alike — not just the Windows-startup one; a launch that carries its own --minimized or --maximized flag (as the autostart entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. When “Maximized” is chosen, the app reopens maximized on the monitor it was last on; if that display is no longer connected, it opens maximized where Windows puts it. This panel is a Windows-app feature; the web edition has no equivalent.";
 
 #[cfg(target_os = "macos")]
 const AUTOSTART_HELP: &str = "Start at login uses a per-user LaunchAgent in ~/Library/LaunchAgents — no administrator rights needed, and OFF means no LaunchAgent file exists at all. The “Launch as” choice applies to every launch of the app — login, Finder, and Dock alike — not just the login one; a launch that carries its own --minimized or --maximized flag (as the LaunchAgent entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the menu bar at the top of the screen, and clicking the icon (or “Open” on its menu) brings the window back. With “Keep running in the menu bar” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the icon's menu. The icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a native-app feature; the web edition has no equivalent.";
@@ -1465,6 +1477,9 @@ fn snap_next(phase: SnapPhase, f: SnapFacts, attempts: u8) -> (SnapPhase, SnapAc
 /// advanced per frame by App::advance_snap, dropped on success,
 /// failure or timeout. Never persisted.
 struct SnapJob {
+    /// Silent job (v1.5.0): a startup monitor restore, not a
+    /// menu click — it finishes and fails without toasts.
+    silent: bool,
     target: MonitorInfo,
     phase: SnapPhase,
     attempts: u8,
@@ -2689,11 +2704,12 @@ fn play_pause_chip(ui: &mut Ui, id: &str, rect: egui::Rect, paused: bool) -> egu
     } else {
         Color32::from_black_alpha(150)
     };
-    painter.rect_filled(rect, Rounding::same(9.0), fill);
+    painter.rect_filled(rect, CornerRadius::same(9), fill);
     painter.rect_stroke(
         rect,
-        Rounding::same(9.0),
+        CornerRadius::same(9),
         Stroke::new(1.0, Color32::from_white_alpha(60)),
+        egui::StrokeKind::Middle,
     );
     let c = rect.center();
     if paused {
@@ -2711,7 +2727,7 @@ fn play_pause_chip(ui: &mut Ui, id: &str, rect: egui::Rect, paused: bool) -> egu
         // Pause: two rounded bars.
         for dx in [-3.7, 3.7] {
             let bar = egui::Rect::from_center_size(pos2(c.x + dx, c.y), vec2(3.6, 12.0));
-            painter.rect_filled(bar, Rounding::same(1.8), Color32::WHITE);
+            painter.rect_filled(bar, CornerRadius::same(2), Color32::WHITE);
         }
     }
     resp
@@ -4113,7 +4129,7 @@ fn toggle_switch(ui: &mut Ui, on: bool, enabled: bool, accent: Color32, track: C
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(vec2(48.0, 27.0), sense);
     let p = ui.painter();
-    p.rect_filled(rect, Rounding::same(13.5), if on { accent } else { track });
+    p.rect_filled(rect, CornerRadius::same(14), if on { accent } else { track });
     let cx = if on { rect.right() - 13.5 } else { rect.left() + 13.5 };
     p.circle_filled(pos2(cx, rect.center().y), 10.5, Color32::WHITE);
     enabled && resp.clicked()
@@ -4165,7 +4181,7 @@ fn slim_slider(
         pos2(rect.left(), mid_y - 3.0),
         pos2(rect.right(), mid_y + 3.0),
     );
-    p.rect_filled(track_rect, Rounding::same(3.0), track);
+    p.rect_filled(track_rect, CornerRadius::same(3), track);
     // The PAINT ratio clamps to the track: a value below the
     // range (e.g. a device reporting under a slider's floor)
     // parks the thumb at the end instead of drawing it off the
@@ -4177,11 +4193,11 @@ fn slim_slider(
             pos2(rect.left(), mid_y - 3.0),
             pos2(thumb_x, mid_y + 3.0),
         );
-        p.rect_filled(fill_rect, Rounding::same(3.0), accent);
+        p.rect_filled(fill_rect, CornerRadius::same(3), accent);
     }
     p.circle_filled(pos2(thumb_x, mid_y), 9.0, Color32::WHITE);
     if !enabled {
-        p.rect_filled(rect, Rounding::same(3.0), Color32::from_rgba_unmultiplied(0, 0, 0, 60));
+        p.rect_filled(rect, CornerRadius::same(3), Color32::from_rgba_unmultiplied(0, 0, 0, 60));
     }
     out
 }
@@ -4274,9 +4290,20 @@ struct App {
     /// relaunch can neither flash nor stick open.
     launch_hidden_pending: bool,
     /// In-flight snap-to-monitor job (v1.3.1): created by a
-    /// Monitor-menu click, advanced one step per frame by
+    /// Monitor-menu click — or, silently, by the maximized-launch
+    /// monitor restore (v1.5.0) — advanced one step per frame by
     /// handle_window_chrome (see advance_snap), never persisted.
     snap_job: Option<SnapJob>,
+    /// One-shot maximized-launch monitor check (v1.5.0): once
+    /// true, the startup restore has run for this process (armed
+    /// a silent snap or decided none was needed) and never runs
+    /// again.
+    startup_monitor_checked: bool,
+    /// HMONITOR the window was last seen on (Windows; 0 =
+    /// unknown yet) — the remember side of the maximized-launch
+    /// monitor feature. Compared every frame; a change persists
+    /// the new display's device identity.
+    last_seen_monitor: isize,
     // rate-limit backoff (v1.2.0): while set, autorefresh skips
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
@@ -4337,19 +4364,19 @@ fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "dejavu".to_string(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/DejaVuSans.ttf")),
+        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/DejaVuSans.ttf"))),
     );
     fonts.font_data.insert(
         "noto-symbols".to_string(),
-        egui::FontData::from_static(include_bytes!(
+        Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/NotoSansSymbols-Regular.ttf"
-        )),
+        ))),
     );
     fonts.font_data.insert(
         "noto-symbols2".to_string(),
-        egui::FontData::from_static(include_bytes!(
+        Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/NotoSansSymbols2-Regular.ttf"
-        )),
+        ))),
     );
     for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let list = fonts.families.entry(fam).or_default();
@@ -4462,6 +4489,8 @@ impl App {
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
             snap_job: None,
+            startup_monitor_checked: false,
+            last_seen_monitor: 0,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -4567,7 +4596,7 @@ impl App {
         self.applied_style = Some(key);
         let pal = self.pal();
         let accent = self.accent();
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         let mut v = egui::Visuals::dark();
         v.panel_fill = pal.bg;
         v.window_fill = pal.card;
@@ -4577,14 +4606,14 @@ impl App {
         v.hyperlink_color = accent;
         v.selection.bg_fill = self.accent_soft();
         v.selection.stroke = Stroke::new(1.0, accent);
-        v.window_rounding = Rounding::same(R_CARD);
-        v.menu_rounding = Rounding::same(R_BTN);
+        v.window_corner_radius = CornerRadius::same(R_CARD);
+        v.menu_corner_radius = CornerRadius::same(R_BTN);
         let widget = |bg: Color32, stroke_c: Color32, fg: Color32| egui::style::WidgetVisuals {
             bg_fill: bg,
             weak_bg_fill: bg,
             bg_stroke: Stroke::new(1.0, stroke_c),
             fg_stroke: Stroke::new(1.0, fg),
-            rounding: Rounding::same(R_BTN),
+            corner_radius: CornerRadius::same(R_BTN),
             expansion: 0.0,
         };
         v.widgets.noninteractive = widget(pal.card, pal.border, pal.text);
@@ -4603,7 +4632,7 @@ impl App {
         .into();
         style.spacing.item_spacing = vec2(8.0, 8.0);
         style.spacing.button_padding = vec2(12.0, 6.0);
-        ctx.set_style(style);
+        ctx.set_global_style(style);
     }
 
     fn toast(&mut self, msg: impl Into<String>, err: bool) {
@@ -5390,6 +5419,78 @@ impl App {
         }
     }
 
+    /// One-shot maximized-launch monitor restore (v1.5.0,
+    /// Windows): on the first frame, if this launch is Maximized
+    /// and a monitor was remembered, and that display still
+    /// exists and is NOT the one the window opened on, start a
+    /// SILENT snap to it — the same restore -> physical-pixel
+    /// move -> verify -> maximize machine as a menu snap, so
+    /// the end state is maximized on a live monitor by OS
+    /// construction. No geometry is stored or restored, and a
+    /// missing display is a no-op, so the v1.2.5 off-screen
+    /// failure mode cannot recur.
+    #[cfg(target_os = "windows")]
+    fn maybe_restore_startup_monitor(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.startup_monitor_checked {
+            return;
+        }
+        self.startup_monitor_checked = true;
+        if self.launch_mode != LaunchMode::Maximized || self.snap_job.is_some() {
+            return;
+        }
+        let saved = self.cfg.prefs.last_monitor_device.clone();
+        if saved.is_empty() {
+            return;
+        }
+        let Some(hwnd) = main_hwnd(frame) else {
+            return;
+        };
+        let monitors = enumerate_monitors();
+        let Some(target) = monitors.iter().find(|m| m.device == saved) else {
+            return;
+        };
+        if win32_window_monitor(hwnd) == target.handle {
+            return;
+        }
+        self.snap_job = Some(SnapJob {
+            silent: true,
+            target: target.clone(),
+            phase: SnapPhase::LeaveStates,
+            attempts: 0,
+            deadline: Instant::now() + SNAP_TIMEOUT,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Remember which monitor the window is on (v1.5.0,
+    /// Windows): called every frame from handle_window_chrome
+    /// while no snap is in flight. A changed HMONITOR resolves
+    /// to its device identity and persists it — continuously, so
+    /// even a crash or forced kill leaves the right monitor
+    /// remembered. Never runs while a snap job exists: a move in
+    /// flight would otherwise record the monitor being left.
+    #[cfg(target_os = "windows")]
+    fn remember_window_monitor(&mut self, frame: &eframe::Frame) {
+        if self.snap_job.is_some() {
+            return;
+        }
+        let Some(hwnd) = main_hwnd(frame) else {
+            return;
+        };
+        let cur = win32_window_monitor(hwnd);
+        if cur == 0 || cur == self.last_seen_monitor {
+            return;
+        }
+        self.last_seen_monitor = cur;
+        let monitors = enumerate_monitors();
+        if let Some(m) = monitors.iter().find(|m| m.handle == cur) {
+            if self.cfg.prefs.last_monitor_device != m.device {
+                self.cfg.prefs.last_monitor_device = m.device.clone();
+                save_config(&self.cfg);
+            }
+        }
+    }
+
     /// Snap to monitor: act on a display chosen in the header
     /// menu. The list is RE-ENUMERATED here, at click time — a
     /// display unplugged since the menu opened turns the click
@@ -5408,6 +5509,7 @@ impl App {
             return;
         };
         self.snap_job = Some(SnapJob {
+            silent: false,
             target: m.clone(),
             phase: SnapPhase::LeaveStates,
             attempts: 0,
@@ -5425,11 +5527,12 @@ impl App {
     /// maximizes — the two things the v1.3.0 burst never did.
     fn advance_snap(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let Some(job) = &self.snap_job else { return };
-        let (phase, attempts, target, deadline) = (
+        let (phase, attempts, target, deadline, silent) = (
             job.phase,
             job.attempts,
             job.target.clone(),
             job.deadline,
+            job.silent,
         );
         let Some(hwnd) = main_hwnd(frame) else {
             ctx.request_repaint();
@@ -5459,15 +5562,19 @@ impl App {
             SnapAction::MaximizeAndFinish => {
                 win32_maximize_window(hwnd);
                 self.snap_job = None;
-                self.toast(format!("Snapped to {}", target.name), false);
+                if !silent {
+                    self.toast(format!("Snapped to {}", target.name), false);
+                }
                 return;
             }
             SnapAction::Fail => {
                 self.snap_job = None;
-                self.toast(
-                    format!("Couldn't move to {} — window left as-is", target.name),
-                    true,
-                );
+                if !silent {
+                    self.toast(
+                        format!("Couldn't move to {} — window left as-is", target.name),
+                        true,
+                    );
+                }
                 return;
             }
         }
@@ -5539,6 +5646,16 @@ impl App {
         // Snap to monitor (v1.3.1): advance an in-flight snap
         // one step per frame — the HWND was just published
         // above, fresh for this frame.
+        // Maximized-launch monitor memory (v1.5.0, Windows):
+        // one-shot restore check, then the every-frame remember
+        // side — in this order, so the first frame never records
+        // the monitor the window merely opened on over the one
+        // it should move to (the remember side skips while a
+        // snap job is in flight).
+        #[cfg(target_os = "windows")]
+        self.maybe_restore_startup_monitor(ctx, frame);
+        #[cfg(target_os = "windows")]
+        self.remember_window_monitor(frame);
         self.advance_snap(ctx, frame);
         // Focus regained (clicking back into the window) is a
         // backoff reset trigger for camera feeds (v1.2.2).
@@ -6051,7 +6168,7 @@ impl App {
         Self::field_label(ui, pal, "CORS proxy");
         let cur = self.cfg.prefs.proxy_preset.clone();
         let mut chosen: Option<String> = None;
-        ComboBox::from_id_source(format!("{}_proxy", id_prefix))
+        ComboBox::from_id_salt(format!("{}_proxy", id_prefix))
             .selected_text(label_of(&PROXY_PRESETS, &cur))
             .width(ui.available_width())
             .show_ui(ui, |ui| {
@@ -6084,11 +6201,11 @@ impl App {
         let accent = self.accent();
         ui.vertical_centered(|ui| {
             ui.add_space(36.0);
-            Frame::none()
+            Frame::new()
                 .fill(pal.card)
                 .stroke(Stroke::new(1.0, pal.border))
-                .rounding(Rounding::same(R_LOGIN))
-                .inner_margin(Margin { left: 28.0, right: 28.0, top: 30.0, bottom: 24.0 })
+                .corner_radius(CornerRadius::same(R_LOGIN))
+                .inner_margin(Margin { left: 28, right: 28, top: 30, bottom: 24 })
                 .show(ui, |ui| {
                     ui.set_width(344.0);
                     ui.vertical_centered(|ui| {
@@ -6102,11 +6219,11 @@ impl App {
                     });
                     ui.add_space(18.0);
                     if let Some(err) = self.login_error.clone() {
-                        Frame::none()
+                        Frame::new()
                             .fill(Color32::from_rgba_unmultiplied(0xf4, 0x3f, 0x5e, 30))
                             .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xf4, 0x3f, 0x5e, 102)))
-                            .rounding(Rounding::same(11.0))
-                            .inner_margin(Margin::symmetric(12.0, 9.0))
+                            .corner_radius(CornerRadius::same(11))
+                            .inner_margin(Margin::symmetric(12, 9))
                             .show(ui, |ui| {
                                 ui.set_width(320.0);
                                 ui.label(RichText::new(err).size(13.0).color(if self.cfg.prefs.theme == "light" {
@@ -6134,7 +6251,7 @@ impl App {
                     ui.add_space(10.0);
                     Self::field_label(ui, &pal, "Region (where your account was registered)");
                     let mut region = self.li_region.clone();
-                    ComboBox::from_id_source("li_region")
+                    ComboBox::from_id_salt("li_region")
                         .selected_text(label_of(&REGIONS, &region))
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
@@ -6146,7 +6263,7 @@ impl App {
                     ui.add_space(10.0);
                     Self::field_label(ui, &pal, "App platform");
                     let mut platform = self.li_platform.clone();
-                    ComboBox::from_id_source("li_platform")
+                    ComboBox::from_id_salt("li_platform")
                         .selected_text(label_of(&PLATFORMS, &platform))
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
@@ -6216,16 +6333,16 @@ impl App {
         self.toast("Logged out", false);
     }
 
-    fn header(&mut self, ctx: &egui::Context) {
+    fn header(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
         let accent = self.accent();
-        egui::TopBottomPanel::top("app-header")
+        egui::Panel::top("app-header")
             .frame(
-                Frame::none()
+                Frame::new()
                     .fill(pal.card)
-                    .inner_margin(Margin::symmetric(18.0, 12.0)),
+                    .inner_margin(Margin::symmetric(18, 12)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("🏠").size(22.0));
                     ui.label(RichText::new("SmartLife & Tuya Desktop").size(18.0).strong());
@@ -6265,7 +6382,7 @@ impl App {
                                     RichText::new("No displays found").color(pal.dim),
                                 );
                             }
-                            let centre = ctx.input(|i| {
+                            let centre = ui.ctx().input(|i| {
                                 i.viewport().outer_rect.map(|r| [r.center().x, r.center().y])
                             });
                             let current = centre.and_then(|c| monitor_index_at(&monitors, c));
@@ -6285,16 +6402,16 @@ impl App {
                                 let entry = format!("{}\n{}", m.name, line2);
                                 if ui.selectable_label(false, entry).clicked() {
                                     snap_choice = Some(m.device.clone());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
                         if let Some(dev) = snap_choice {
-                            self.snap_to_monitor(ctx, &dev);
+                            self.snap_to_monitor(ui.ctx(), &dev);
                         }
                         }
                         let mut interval = self.cfg.prefs.interval;
-                        ComboBox::from_id_source("hdr_interval")
+                        ComboBox::from_id_salt("hdr_interval")
                             .selected_text(interval_label(interval))
                             .width(74.0)
                             .show_ui(ui, |ui| {
@@ -6324,13 +6441,13 @@ impl App {
                 });
             });
         if self.editing {
-            egui::TopBottomPanel::top("edit-bar")
+            egui::Panel::top("edit-bar")
                 .frame(
-                    Frame::none()
+                    Frame::new()
                         .fill(self.accent_soft())
-                        .inner_margin(Margin::symmetric(18.0, 9.0)),
+                        .inner_margin(Margin::symmetric(18, 9)),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("✎ Edit mode — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.")
@@ -6390,11 +6507,11 @@ impl App {
                         && self.cfg.update.dismissed != info.version
                     {
                         let mut act: Option<&str> = None;
-                        Frame::none()
+                        Frame::new()
                             .fill(self.accent_soft())
                             .stroke(Stroke::new(1.0, self.accent()))
-                            .rounding(Rounding::same(14.0))
-                            .inner_margin(Margin::symmetric(16.0, 12.0))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(Margin::symmetric(16, 12))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     if let Some((got, total)) = self.update_dl {
@@ -6518,11 +6635,11 @@ impl App {
         let t_vals: Vec<i64> = devs.iter().filter_map(|d| d.temp_slider).collect();
         let has_color = devs.iter().any(|d| d.has_color);
         let sec2 = sec.clone();
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
-            .rounding(Rounding::same(R_CARD))
-            .inner_margin(Margin::symmetric(16.0, 12.0))
+            .corner_radius(CornerRadius::same(R_CARD))
+            .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.set_width((ui.available_width() - 32.0).max(200.0));
                 // v1.2.3 (Bug A): each control group is ONE
@@ -6758,11 +6875,11 @@ impl App {
             } else {
                 ui.label(RichText::new(sec.title.clone()).size(16.5).strong());
             }
-            Frame::none()
+            Frame::new()
                 .fill(pal.card)
                 .stroke(Stroke::new(1.0, pal.border))
-                .rounding(Rounding::same(10.0))
-                .inner_margin(Margin::symmetric(8.0, 1.0))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(8, 1))
                 .show(ui, |ui| {
                     ui.label(RichText::new(format!("{}", sec.ids.len())).size(12.0).color(pal.dim));
                 });
@@ -6926,8 +7043,8 @@ impl App {
                                 // other cards reflow around it.
                                 let r = ui.max_rect().shrink(1.0);
                                 let p = ui.painter();
-                                p.rect_filled(r, Rounding::same(R_CARD), self.accent_soft());
-                                p.rect_stroke(r, Rounding::same(R_CARD), Stroke::new(1.5, self.accent()));
+                                p.rect_filled(r, CornerRadius::same(R_CARD), self.accent_soft());
+                                p.rect_stroke(r, CornerRadius::same(R_CARD), Stroke::new(1.5, self.accent()), egui::StrokeKind::Middle);
                             }
                         },
                     );
@@ -7037,7 +7154,7 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                Frame::none()
+                Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(
                         pal.card.r(),
                         pal.card.g(),
@@ -7045,15 +7162,15 @@ impl App {
                         238,
                     ))
                     .stroke(Stroke::new(1.5, self.accent()))
-                    .rounding(Rounding::same(R_CARD))
-                    .inner_margin(Margin::symmetric(14.0, 12.0))
+                    .corner_radius(CornerRadius::same(R_CARD))
+                    .inner_margin(Margin::symmetric(14, 12))
                     .show(ui, |ui| {
                         ui.set_width((drag.size.x - 28.0).max(80.0));
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(icon).size(20.0));
                             ui.add(
                                 egui::Label::new(RichText::new(name).size(15.0).strong())
-                                    .truncate(true),
+                                    .truncate(),
                             );
                         });
                     });
@@ -7145,16 +7262,21 @@ impl App {
         };
         let border = if dev.state && dev.online { accent } else { pal.border };
         let pinned = self.cfg.layout.pins.contains(&dev.id);
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, border))
-            .rounding(Rounding::same(radius))
-            .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_top, bottom: pad_bot })
+            .corner_radius(CornerRadius::same(radius))
+            .inner_margin(Margin { left: pad_x as i8, right: pad_x as i8, top: pad_top as i8, bottom: pad_bot as i8 })
             .show(ui, |ui| {
                 ui.set_width((card_w - 2.0 * pad_x).max(80.0));
                 if fill_h > 0.0 {
                     // Stretch the frame to the row's full cell height.
-                    ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
+                    // egui 0.37 sizes a Frame as content + inner margin + 2*stroke +
+                    // outer margin (0.27 did not count the stroke), so enforce
+                    // row_h minus pads minus the 1.0 stroke on both sides,
+                    // or the measured card comes back as row_h + 2.0 and the
+                    // row-height cache ratchets +2.0 every frame, forever.
+                    ui.set_min_height((fill_h - pad_top - pad_bot - 2.0).max(0.0));
                 }
                 // ---------- top row ----------
                 let mut two_row = false;
@@ -7165,9 +7287,9 @@ impl App {
                     }
                     // icon box
                     let icon_size = if compact { 36.0 } else { 42.0 };
-                    Frame::none()
+                    Frame::new()
                         .fill(if dev.state && dev.online { self.accent_soft() } else { pal.track })
-                        .rounding(Rounding::same(if compact { 11.0 } else { 13.0 }))
+                        .corner_radius(CornerRadius::same(if compact { 11 } else { 13 }))
                         .show(ui, |ui| {
                             ui.allocate_ui_with_layout(
                                 vec2(icon_size, icon_size),
@@ -7220,13 +7342,13 @@ impl App {
                                     egui::Label::new(
                                         RichText::new(self.display(&dev)).size(15.0).strong(),
                                     )
-                                    .truncate(true),
+                                    .truncate(),
                                 );
                                 if !dev.online {
-                                    Frame::none()
+                                    Frame::new()
                                         .fill(Color32::from_rgb(0x64, 0x74, 0x8b))
-                                        .rounding(Rounding::same(6.0))
-                                        .inner_margin(Margin::symmetric(6.0, 2.0))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::symmetric(6, 2))
                                         .show(ui, |ui| {
                                             ui.label(RichText::new("OFFLINE").size(10.5).color(Color32::WHITE).strong());
                                         });
@@ -7239,7 +7361,7 @@ impl App {
                                     egui::Label::new(
                                         RichText::new(status_text(&dev)).size(12.5).color(pal.dim),
                                     )
-                                    .truncate(true),
+                                    .truncate(),
                                 );
                             });
                         },
@@ -7430,7 +7552,7 @@ impl App {
                             };
                             let mut chosen: Option<Option<String>> = None;
                             let combo_w = (ui.available_width() - 92.0).max(84.0);
-                            ComboBox::from_id_source(("grp", &dev.id))
+                            ComboBox::from_id_salt(("grp", &dev.id))
                                 .selected_text(cur_label)
                                 .width(combo_w)
                                 .show_ui(ui, |ui| {
@@ -7512,15 +7634,20 @@ impl App {
             (None, None, 0, None)
         };
         let in_player = self.player_for.as_deref() == Some(id);
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
-            .rounding(Rounding::same(radius))
-            .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_top, bottom: pad_bot })
+            .corner_radius(CornerRadius::same(radius))
+            .inner_margin(Margin { left: pad_x as i8, right: pad_x as i8, top: pad_top as i8, bottom: pad_bot as i8 })
             .show(ui, |ui| {
                 ui.set_width((card_w - 2.0 * pad_x).max(80.0));
                 if fill_h > 0.0 {
-                    ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
+                    // egui 0.37 sizes a Frame as content + inner margin + 2*stroke +
+                    // outer margin (0.27 did not count the stroke), so enforce
+                    // row_h minus pads minus the 1.0 stroke on both sides,
+                    // or the measured card comes back as row_h + 2.0 and the
+                    // row-height cache ratchets +2.0 every frame, forever.
+                    ui.set_min_height((fill_h - pad_top - pad_bot - 2.0).max(0.0));
                 }
                 // ---------- live video (replaces the icon header) ----------
                 if show_video {
@@ -7530,7 +7657,7 @@ impl App {
                         ui.allocate_exact_size(vec2(vw, vh), Sense::click());
                     // Cloned: the Retry buttons below need &mut ui.
                     let painter = ui.painter().clone();
-                    painter.rect_filled(rect, Rounding::same(8.0), Color32::BLACK);
+                    painter.rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
                     // Backoff presentation (v1.2.2): a clickable
                     // Retry (force-restart the pump now) instead of
                     // a bare "retrying" label, plus — after repeated
@@ -7665,9 +7792,9 @@ impl App {
                     }
                     let icon_size = if compact { 36.0 } else { 42.0 };
                     if !show_video {
-                        Frame::none()
+                        Frame::new()
                             .fill(pal.track)
-                            .rounding(Rounding::same(if compact { 11.0 } else { 13.0 }))
+                            .corner_radius(CornerRadius::same(if compact { 11 } else { 13 }))
                             .show(ui, |ui| {
                                 ui.allocate_ui_with_layout(
                                     vec2(icon_size, icon_size),
@@ -7700,13 +7827,13 @@ impl App {
                         |ui| {
                             ui.add(
                                 egui::Label::new(RichText::new(cam.name.clone()).size(15.0).strong())
-                                    .truncate(true),
+                                    .truncate(),
                             );
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(camera_status_text(&cam)).size(12.5).color(pal.dim),
                                 )
-                                .truncate(true),
+                                .truncate(),
                             );
                         },
                     );
@@ -7845,7 +7972,7 @@ impl App {
                         };
                         let mut chosen: Option<Option<String>> = None;
                         let combo_w = (ui.available_width() - 92.0).max(84.0);
-                        ComboBox::from_id_source(("grpcam", id))
+                        ComboBox::from_id_salt(("grpcam", id))
                             .selected_text(cur_label)
                             .width(combo_w)
                             .show_ui(ui, |ui| {
@@ -7994,11 +8121,11 @@ impl App {
         add: impl FnOnce(&mut Ui) -> R,
     ) -> R {
         let mut result = None;
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
-            .rounding(Rounding::same(R_CARD))
-            .inner_margin(Margin::symmetric(22.0, 20.0))
+            .corner_radius(CornerRadius::same(R_CARD))
+            .inner_margin(Margin::symmetric(22, 20))
             .show(ui, |ui| {
                 ui.set_width((ui.available_width() - 44.0).max(200.0));
                 ui.label(RichText::new(title).size(15.5).strong());
@@ -8025,7 +8152,7 @@ impl App {
                         Self::settings_panel(ui, &pal, "Appearance", |ui| {
                             Self::field_label(ui, &pal, "Theme");
                             let mut theme = self.cfg.prefs.theme.clone();
-                            ComboBox::from_id_source("set_theme")
+                            ComboBox::from_id_salt("set_theme")
                                 .selected_text(match theme.as_str() {
                                     "light" => "Light",
                                     "black" => "Black",
@@ -8063,7 +8190,7 @@ impl App {
                             ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Card density");
                             let mut density = self.cfg.prefs.density.clone();
-                            ComboBox::from_id_source("set_density")
+                            ComboBox::from_id_salt("set_density")
                                 .selected_text(if density == "compact" { "Compact" } else { "Comfortable" })
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
@@ -8259,7 +8386,7 @@ impl App {
                             ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Autorefresh interval");
                             let mut interval = self.cfg.prefs.interval;
-                            ComboBox::from_id_source("set_interval")
+                            ComboBox::from_id_salt("set_interval")
                                 .selected_text(interval_label(interval))
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
@@ -8331,7 +8458,7 @@ impl App {
                             ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Gateway type");
                             let mut gwt = self.cfg.prefs.gateway_type.clone();
-                            ComboBox::from_id_source("set_gw_type")
+                            ComboBox::from_id_salt("set_gw_type")
                                 .selected_text(if gwt == "mediamtx" { "MediaMTX (HLS)" } else { "go2rtc" })
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
@@ -8476,7 +8603,7 @@ impl App {
                 let vh = (vw * 9.0 / 16.0).min(540.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(vw, vh), Sense::hover());
                 let painter = ui.painter();
-                painter.rect_filled(rect, Rounding::same(8.0), Color32::BLACK);
+                painter.rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
                 if let Some(tid) = pump_tex {
                     painter.image(
                         tid,
@@ -8636,7 +8763,7 @@ impl App {
                     .find(|(k, _)| *k == form.template)
                     .map(|(_, l)| *l)
                     .unwrap_or("Tapo Stream 1 — High Quality");
-                ComboBox::from_id_source("cam_tpl")
+                ComboBox::from_id_salt("cam_tpl")
                     .selected_text(cur_label)
                     .width(ui.available_width() - 8.0)
                     .show_ui(ui, |ui| {
@@ -8784,11 +8911,11 @@ impl App {
                         } else {
                             (TOAST_BG_LIGHT, TOAST_BORDER)
                         };
-                        Frame::none()
+                        Frame::new()
                             .fill(fill)
                             .stroke(Stroke::new(1.0, stroke))
-                            .rounding(Rounding::same(13.0))
-                            .inner_margin(Margin::symmetric(17.0, 10.0))
+                            .corner_radius(CornerRadius::same(13))
+                            .inner_margin(Margin::symmetric(17, 10))
                             .show(ui, |ui| {
                                 ui.label(
                                     RichText::new(msg)
@@ -8851,21 +8978,21 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.apply_style(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.apply_style(ui.ctx());
         self.poll_net();
         // Tray + close behaviour (v1.2.1): poll tray events, turn a
         // close into a hide when close-to-tray is on.
-        self.handle_window_chrome(ctx, frame);
+        self.handle_window_chrome(ui.ctx(), frame);
         // Live previews (v1.2.0): reconcile pumps and upload the
         // latest frames as textures before anything renders.
-        self.sync_pumps(ctx);
+        self.sync_pumps(ui.ctx());
         // Drag & drop bookkeeping runs BEFORE rendering, hit-testing
         // against last frame's card geometry. It also runs while a
         // press is merely PENDING (v1.2.1), which is when promotion
         // (or quiet cancellation) happens.
         if self.drag.is_some() || self.drag_pending.is_some() {
-            self.update_drag(ctx);
+            self.update_drag(ui.ctx());
         }
         // A verified update download (v1.4.0: the install step is
         // platform-shaped — see UpdateInstall).
@@ -8878,7 +9005,7 @@ impl eframe::App for App {
                     // close-to-tray must not turn it into a hide.
                     self.quitting = true;
                     match Command::new(&path).spawn() {
-                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Ok(_) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
                         Err(e) => {
                             self.update_error = Some(format!(
                                 "The installer was downloaded but could not be started: {}",
@@ -8911,19 +9038,19 @@ impl eframe::App for App {
         match self.view {
             View::Login => {
                 egui::CentralPanel::default()
-                    .frame(Frame::none().fill(pal.bg))
-                    .show(ctx, |ui| self.view_login(ui));
+                    .frame(Frame::new().fill(pal.bg))
+                    .show(ui, |ui| self.view_login(ui));
             }
             View::Dashboard => {
-                self.header(ctx);
+                self.header(ui);
                 egui::CentralPanel::default()
-                    .frame(Frame::none().fill(pal.bg))
-                    .show(ctx, |ui| self.view_dashboard(ui));
+                    .frame(Frame::new().fill(pal.bg))
+                    .show(ui, |ui| self.view_dashboard(ui));
             }
             View::Settings => {
-                egui::TopBottomPanel::top("settings-header")
-                    .frame(Frame::none().fill(pal.card).inner_margin(Margin::symmetric(18.0, 12.0)))
-                    .show(ctx, |ui| {
+                egui::Panel::top("settings-header")
+                    .frame(Frame::new().fill(pal.card).inner_margin(Margin::symmetric(18, 12)))
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("⚙️").size(22.0));
                             ui.label(RichText::new("Settings").size(18.0).strong());
@@ -8935,8 +9062,8 @@ impl eframe::App for App {
                         });
                     });
                 egui::CentralPanel::default()
-                    .frame(Frame::none().fill(pal.bg))
-                    .show(ctx, |ui| self.view_settings(ui));
+                    .frame(Frame::new().fill(pal.bg))
+                    .show(ui, |ui| self.view_settings(ui));
             }
         }
         // Autorefresh — paused while editing, dragging, or typing.
@@ -8945,7 +9072,7 @@ impl eframe::App for App {
             && self.cfg.prefs.autorefresh
             && !self.editing
             && !self.dragging_slider
-            && !ctx.input(|i| i.pointer.primary_down())
+            && !ui.ctx().input(|i| i.pointer.primary_down())
         {
             let due = self
                 .last_fetch
@@ -8960,19 +9087,19 @@ impl eframe::App for App {
             if due && !self.disc_busy && !backed_off {
                 self.spawn_discovery(false);
             }
-            ctx.request_repaint_after(Duration::from_millis(500));
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
         }
         if self.new_group.is_some() {
-            self.new_group_window(ctx);
+            self.new_group_window(ui.ctx());
         }
         if self.cam_form.is_some() {
-            self.camera_window(ctx);
+            self.camera_window(ui.ctx());
         }
         if self.player_for.is_some() {
-            self.player_window(ctx);
+            self.player_window(ui.ctx());
         }
-        self.drag_ghost(ctx);
-        self.show_toasts(ctx);
+        self.drag_ghost(ui.ctx());
+        self.show_toasts(ui.ctx());
     }
 }
 
@@ -9026,7 +9153,11 @@ fn main() -> eframe::Result<()> {
     // restored in v1.3.0): the v1.2.5 placement memory was
     // field-rejected — a restored window could land slightly
     // off-screen with its title bar out of reach — so no saved
-    // geometry is read or written anywhere. (The snap-to-monitor
+    // geometry is read or written anywhere — the one exception
+    // (v1.5.0) is a monitor IDENTITY, never a rectangle: on a
+    // Maximized launch the window is moved to the remembered
+    // display by the snap machine and ends maximized, so the
+    // off-screen failure cannot recur. (The snap-to-monitor
     // header button is the supported way to place the window:
     // it acts at click time only and lets the OS own the result.)
     let mut viewport = egui::ViewportBuilder::default()
@@ -9053,7 +9184,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "SmartLife & Tuya Desktop",
         options,
-        Box::new(|cc| Box::new(App::new(cc))),
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
 }
 
@@ -9491,7 +9622,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.4.0");
+        assert_eq!(APP_VERSION, "1.5.0");
     }
 
     #[test]
@@ -10288,13 +10419,18 @@ mod tests {
     /// The viewport commands one headless frame of the launch
     /// hold produces (drives the REAL App::enforce_launch_hold).
     fn hold_frame_cmds(app: &App, ctx: &egui::Context) -> Vec<egui::ViewportCommand> {
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
             app.enforce_launch_hold(ctx)
         });
-        out.viewport_output
+        let cmds = out
+            .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.commands.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // egui 0.37 debug-asserts that a dropped TexturesDelta is
+        // empty; headless tests never apply it, so clear it.
+        out.textures_delta.clear();
+        cmds
     }
 
     /// The reboot/login regression (v1.2.4): Windows relaunches
@@ -10324,6 +10460,11 @@ mod tests {
         // Early frames: invisibility is re-asserted every frame —
         // the window is commanded invisible and stays so.
         let ctx = egui::Context::default();
+        // Warm-up frame (egui 0.37): a fresh context announces its
+        // theme once via ViewportCommand::SetTheme; that is egui's
+        // own first-frame command, not the launch hold's, so it is
+        // spent here and the loop below asserts the hold exactly.
+        let _ = hold_frame_cmds(&app, &ctx);
         for _ in 0..3 {
             assert_eq!(
                 hold_frame_cmds(&app, &ctx),
@@ -10335,7 +10476,7 @@ mod tests {
         // A real Show action (tray Open / single-instance summon
         // both land in show_from_tray): the window is commanded
         // visible and the hold is released.
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
+        let out = ctx.run_ui(egui::RawInput::default(), |ctx| {
             app.show_from_tray(ctx)
         });
         let cmds = out
@@ -10346,6 +10487,10 @@ mod tests {
         assert!(cmds.contains(&egui::ViewportCommand::Visible(true)));
         assert!(!app.window_hidden);
         assert!(!app.launch_hidden_pending);
+        // See hold_frame_cmds: 0.37 drops debug-assert on
+        // unconsumed texture deltas.
+        let mut out = out;
+        out.textures_delta.clear();
 
         // Later frames assert nothing: visible is left alone.
         assert!(hold_frame_cmds(&app, &ctx).is_empty());
@@ -10796,6 +10941,8 @@ mod tests {
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
             snap_job: None,
+            startup_monitor_checked: false,
+            last_seen_monitor: 0,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -10857,12 +11004,13 @@ mod tests {
                 time: Some(10.0 + i as f64 * 0.05),
                 ..Default::default()
             };
-            let out = ctx.run(input, |ctx| {
+            let mut out = ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none())
+                    .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
             });
             texts = drawn_texts(&out);
+            out.textures_delta.clear();
         }
         texts
     }
@@ -10902,11 +11050,13 @@ mod tests {
                 time: Some(30.0 + i as f64 * 0.05),
                 ..Default::default()
             };
-            out = Some(ctx.run(input, |ctx| {
+            let mut frame_out = ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none())
+                    .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
-            }));
+            });
+            frame_out.textures_delta.clear();
+            out = Some(frame_out);
         }
         out.expect("frames >= 1")
     }
@@ -11214,11 +11364,13 @@ mod tests {
             events,
             ..Default::default()
         };
-        ctx.run(input, |ctx| {
+        let mut out = ctx.run_ui(input, |ctx| {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none())
+                .frame(egui::Frame::new())
                 .show(ctx, |ui| app.view_dashboard(ui));
-        })
+        });
+        out.textures_delta.clear();
+        out
     }
 
     /// Slider track rects (h≈6) drawn in a frame.
