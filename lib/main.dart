@@ -2295,7 +2295,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
   /// (egui group_plan), offline members skipped, colour-only
   /// strips excluded from brightness (they report no brightness).
   Future<void> _groupBroadcast(
-      _Section sec, String kind, int num, String? hex) async {
+      _Section sec, String kind, int value, String? hex) async {
     final savedQuery = _queryText;
     _queryText = '';
     final full = _buildSections();
@@ -2318,11 +2318,11 @@ class _HomePageState extends State<HomePage> with WindowListener {
         setState(() => d['state'] = !anyOn);
       } else if (kind == 'brightness') {
         if (d['has_brightness'] != true) continue;
-        await _control(id, 'brightnessSet', brightnessUiToDevice(num));
+        await _control(id, 'brightnessSet', brightnessUiToDevice(value));
       } else if (kind == 'temp') {
         if (d['has_temp'] != true) continue;
         await _control(
-            id, 'colorTemperatureSet', num.clamp(1000, 10000));
+            id, 'colorTemperatureSet', value.clamp(1000, 10000));
       } else if (kind == 'color' && hex != null) {
         if (d['has_color'] != true) continue;
         final (h, s, _) = hexToHsv(hex);
@@ -4266,7 +4266,6 @@ class _LiveSliderState extends State<_LiveSlider> {
   @override
   void initState() {
     super.initState();
-    windowManager.addListener(this);
     _current = widget.value;
   }
 
@@ -4340,7 +4339,6 @@ class _ColorPickerRowState extends State<_ColorPickerRow> {
   @override
   void initState() {
     super.initState();
-    windowManager.addListener(this);
     _r = widget.initial.red.toDouble();
     _g = widget.initial.green.toDouble();
     _b = widget.initial.blue.toDouble();
@@ -4471,7 +4469,6 @@ class _CameraFormDialogState extends State<_CameraFormDialog> {
   @override
   void initState() {
     super.initState();
-    windowManager.addListener(this);
     final e = widget.existing;
     _name = TextEditingController(text: e?['name']?.toString() ?? '');
     _user = TextEditingController(text: e?['user']?.toString() ?? '');
@@ -4636,7 +4633,6 @@ class _WatchPlayerState extends State<_WatchPlayer> {
   @override
   void initState() {
     super.initState();
-    windowManager.addListener(this);
     _timer = Timer.periodic(const Duration(milliseconds: 500),
         (_) => _poll());
     _poll();

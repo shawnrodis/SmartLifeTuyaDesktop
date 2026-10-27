@@ -152,6 +152,7 @@
 
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:io';
 import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
@@ -173,10 +174,10 @@ class RustBridge {
     // header comment). If the Rust core has not been built yet,
     // this throws — the UI surfaces that error, it never pretends
     // the core exists.
-    if (ffi.Platform.isWindows) {
+    if (Platform.isWindows) {
       return ffi.DynamicLibrary.open('tuya_core.dll');
     }
-    if (ffi.Platform.isMacOS) {
+    if (Platform.isMacOS) {
       return ffi.DynamicLibrary.open('libtuya_core.dylib');
     }
     return ffi.DynamicLibrary.open('libtuya_core.so');
