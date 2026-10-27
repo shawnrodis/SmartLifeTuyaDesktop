@@ -48,3 +48,9 @@ windows-sys = { version = "0.59", features = [
 
 [profile.release]
 opt-level = 3
+
+[patch.crates-io]
+# Vendored winit 0.30.13 + the Win11 WM_DPICHANGED suggested-rect fix
+# (upstream winit#4341, not yet in a 0.30.x release). See
+# vendor/winit/TUYA-PATCH-README.md. Drop when upstream ships it.
+winit = { path = "vendor/winit" }
