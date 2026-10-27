@@ -12,7 +12,7 @@
 
 use eframe::egui;
 use egui::{
-    Align, Align2, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, Rounding,
+    Align, Align2, Button, Color32, ComboBox, FontId, Frame, Layout, Margin, RichText, CornerRadius,
     ScrollArea, Sense, Stroke, TextEdit,
 };
 use serde::{Deserialize, Serialize};
@@ -82,10 +82,10 @@ const TOAST_BORDER: Color32 = Color32::from_rgb(0x33, 0x3f, 0x58);
 const ERR_BG: Color32 = Color32::from_rgb(0x4c, 0x11, 0x20);
 const ERR_BORDER: Color32 = Color32::from_rgb(0x88, 0x13, 0x37);
 
-const R_CARD: f32 = 18.0;
-const R_CARD_COMPACT: f32 = 14.0;
-const R_BTN: f32 = 11.0;
-const R_LOGIN: f32 = 22.0;
+const R_CARD: u8 = 18;
+const R_CARD_COMPACT: u8 = 14;
+const R_BTN: u8 = 11;
+const R_LOGIN: u8 = 22;
 
 const ACCENTS: [(&str, &str); 7] = [
     ("Indigo", "#6366f1"),
@@ -2689,11 +2689,12 @@ fn play_pause_chip(ui: &mut Ui, id: &str, rect: egui::Rect, paused: bool) -> egu
     } else {
         Color32::from_black_alpha(150)
     };
-    painter.rect_filled(rect, Rounding::same(9.0), fill);
+    painter.rect_filled(rect, CornerRadius::same(9), fill);
     painter.rect_stroke(
         rect,
-        Rounding::same(9.0),
+        CornerRadius::same(9),
         Stroke::new(1.0, Color32::from_white_alpha(60)),
+        egui::StrokeKind::Middle,
     );
     let c = rect.center();
     if paused {
@@ -2711,7 +2712,7 @@ fn play_pause_chip(ui: &mut Ui, id: &str, rect: egui::Rect, paused: bool) -> egu
         // Pause: two rounded bars.
         for dx in [-3.7, 3.7] {
             let bar = egui::Rect::from_center_size(pos2(c.x + dx, c.y), vec2(3.6, 12.0));
-            painter.rect_filled(bar, Rounding::same(1.8), Color32::WHITE);
+            painter.rect_filled(bar, CornerRadius::same(2), Color32::WHITE);
         }
     }
     resp
@@ -4113,7 +4114,7 @@ fn toggle_switch(ui: &mut Ui, on: bool, enabled: bool, accent: Color32, track: C
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(vec2(48.0, 27.0), sense);
     let p = ui.painter();
-    p.rect_filled(rect, Rounding::same(13.5), if on { accent } else { track });
+    p.rect_filled(rect, CornerRadius::same(14), if on { accent } else { track });
     let cx = if on { rect.right() - 13.5 } else { rect.left() + 13.5 };
     p.circle_filled(pos2(cx, rect.center().y), 10.5, Color32::WHITE);
     enabled && resp.clicked()
@@ -4165,7 +4166,7 @@ fn slim_slider(
         pos2(rect.left(), mid_y - 3.0),
         pos2(rect.right(), mid_y + 3.0),
     );
-    p.rect_filled(track_rect, Rounding::same(3.0), track);
+    p.rect_filled(track_rect, CornerRadius::same(3), track);
     // The PAINT ratio clamps to the track: a value below the
     // range (e.g. a device reporting under a slider's floor)
     // parks the thumb at the end instead of drawing it off the
@@ -4177,11 +4178,11 @@ fn slim_slider(
             pos2(rect.left(), mid_y - 3.0),
             pos2(thumb_x, mid_y + 3.0),
         );
-        p.rect_filled(fill_rect, Rounding::same(3.0), accent);
+        p.rect_filled(fill_rect, CornerRadius::same(3), accent);
     }
     p.circle_filled(pos2(thumb_x, mid_y), 9.0, Color32::WHITE);
     if !enabled {
-        p.rect_filled(rect, Rounding::same(3.0), Color32::from_rgba_unmultiplied(0, 0, 0, 60));
+        p.rect_filled(rect, CornerRadius::same(3), Color32::from_rgba_unmultiplied(0, 0, 0, 60));
     }
     out
 }
@@ -4337,19 +4338,19 @@ fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "dejavu".to_string(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/DejaVuSans.ttf")),
+        Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/DejaVuSans.ttf"))),
     );
     fonts.font_data.insert(
         "noto-symbols".to_string(),
-        egui::FontData::from_static(include_bytes!(
+        Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/NotoSansSymbols-Regular.ttf"
-        )),
+        ))),
     );
     fonts.font_data.insert(
         "noto-symbols2".to_string(),
-        egui::FontData::from_static(include_bytes!(
+        Arc::new(egui::FontData::from_static(include_bytes!(
             "../assets/fonts/NotoSansSymbols2-Regular.ttf"
-        )),
+        ))),
     );
     for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let list = fonts.families.entry(fam).or_default();
@@ -4567,7 +4568,7 @@ impl App {
         self.applied_style = Some(key);
         let pal = self.pal();
         let accent = self.accent();
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         let mut v = egui::Visuals::dark();
         v.panel_fill = pal.bg;
         v.window_fill = pal.card;
@@ -4577,14 +4578,14 @@ impl App {
         v.hyperlink_color = accent;
         v.selection.bg_fill = self.accent_soft();
         v.selection.stroke = Stroke::new(1.0, accent);
-        v.window_rounding = Rounding::same(R_CARD);
-        v.menu_rounding = Rounding::same(R_BTN);
+        v.window_corner_radius = CornerRadius::same(R_CARD);
+        v.menu_corner_radius = CornerRadius::same(R_BTN);
         let widget = |bg: Color32, stroke_c: Color32, fg: Color32| egui::style::WidgetVisuals {
             bg_fill: bg,
             weak_bg_fill: bg,
             bg_stroke: Stroke::new(1.0, stroke_c),
             fg_stroke: Stroke::new(1.0, fg),
-            rounding: Rounding::same(R_BTN),
+            corner_radius: CornerRadius::same(R_BTN),
             expansion: 0.0,
         };
         v.widgets.noninteractive = widget(pal.card, pal.border, pal.text);
@@ -4603,7 +4604,7 @@ impl App {
         .into();
         style.spacing.item_spacing = vec2(8.0, 8.0);
         style.spacing.button_padding = vec2(12.0, 6.0);
-        ctx.set_style(style);
+        ctx.set_global_style(style);
     }
 
     fn toast(&mut self, msg: impl Into<String>, err: bool) {
@@ -6051,7 +6052,7 @@ impl App {
         Self::field_label(ui, pal, "CORS proxy");
         let cur = self.cfg.prefs.proxy_preset.clone();
         let mut chosen: Option<String> = None;
-        ComboBox::from_id_source(format!("{}_proxy", id_prefix))
+        ComboBox::from_id_salt(format!("{}_proxy", id_prefix))
             .selected_text(label_of(&PROXY_PRESETS, &cur))
             .width(ui.available_width())
             .show_ui(ui, |ui| {
@@ -6084,11 +6085,11 @@ impl App {
         let accent = self.accent();
         ui.vertical_centered(|ui| {
             ui.add_space(36.0);
-            Frame::none()
+            Frame::new()
                 .fill(pal.card)
                 .stroke(Stroke::new(1.0, pal.border))
-                .rounding(Rounding::same(R_LOGIN))
-                .inner_margin(Margin { left: 28.0, right: 28.0, top: 30.0, bottom: 24.0 })
+                .corner_radius(CornerRadius::same(R_LOGIN))
+                .inner_margin(Margin { left: 28, right: 28, top: 30, bottom: 24 })
                 .show(ui, |ui| {
                     ui.set_width(344.0);
                     ui.vertical_centered(|ui| {
@@ -6102,11 +6103,11 @@ impl App {
                     });
                     ui.add_space(18.0);
                     if let Some(err) = self.login_error.clone() {
-                        Frame::none()
+                        Frame::new()
                             .fill(Color32::from_rgba_unmultiplied(0xf4, 0x3f, 0x5e, 30))
                             .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xf4, 0x3f, 0x5e, 102)))
-                            .rounding(Rounding::same(11.0))
-                            .inner_margin(Margin::symmetric(12.0, 9.0))
+                            .corner_radius(CornerRadius::same(11))
+                            .inner_margin(Margin::symmetric(12, 9))
                             .show(ui, |ui| {
                                 ui.set_width(320.0);
                                 ui.label(RichText::new(err).size(13.0).color(if self.cfg.prefs.theme == "light" {
@@ -6134,7 +6135,7 @@ impl App {
                     ui.add_space(10.0);
                     Self::field_label(ui, &pal, "Region (where your account was registered)");
                     let mut region = self.li_region.clone();
-                    ComboBox::from_id_source("li_region")
+                    ComboBox::from_id_salt("li_region")
                         .selected_text(label_of(&REGIONS, &region))
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
@@ -6146,7 +6147,7 @@ impl App {
                     ui.add_space(10.0);
                     Self::field_label(ui, &pal, "App platform");
                     let mut platform = self.li_platform.clone();
-                    ComboBox::from_id_source("li_platform")
+                    ComboBox::from_id_salt("li_platform")
                         .selected_text(label_of(&PLATFORMS, &platform))
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
@@ -6216,16 +6217,16 @@ impl App {
         self.toast("Logged out", false);
     }
 
-    fn header(&mut self, ctx: &egui::Context) {
+    fn header(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
         let accent = self.accent();
-        egui::TopBottomPanel::top("app-header")
+        egui::Panel::top("app-header")
             .frame(
-                Frame::none()
+                Frame::new()
                     .fill(pal.card)
-                    .inner_margin(Margin::symmetric(18.0, 12.0)),
+                    .inner_margin(Margin::symmetric(18, 12)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("🏠").size(22.0));
                     ui.label(RichText::new("SmartLife & Tuya Desktop").size(18.0).strong());
@@ -6265,7 +6266,7 @@ impl App {
                                     RichText::new("No displays found").color(pal.dim),
                                 );
                             }
-                            let centre = ctx.input(|i| {
+                            let centre = ui.ctx().input(|i| {
                                 i.viewport().outer_rect.map(|r| [r.center().x, r.center().y])
                             });
                             let current = centre.and_then(|c| monitor_index_at(&monitors, c));
@@ -6285,16 +6286,16 @@ impl App {
                                 let entry = format!("{}\n{}", m.name, line2);
                                 if ui.selectable_label(false, entry).clicked() {
                                     snap_choice = Some(m.device.clone());
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
                         if let Some(dev) = snap_choice {
-                            self.snap_to_monitor(ctx, &dev);
+                            self.snap_to_monitor(ui.ctx(), &dev);
                         }
                         }
                         let mut interval = self.cfg.prefs.interval;
-                        ComboBox::from_id_source("hdr_interval")
+                        ComboBox::from_id_salt("hdr_interval")
                             .selected_text(interval_label(interval))
                             .width(74.0)
                             .show_ui(ui, |ui| {
@@ -6324,13 +6325,13 @@ impl App {
                 });
             });
         if self.editing {
-            egui::TopBottomPanel::top("edit-bar")
+            egui::Panel::top("edit-bar")
                 .frame(
-                    Frame::none()
+                    Frame::new()
                         .fill(self.accent_soft())
-                        .inner_margin(Margin::symmetric(18.0, 9.0)),
+                        .inner_margin(Margin::symmetric(18, 9)),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("✎ Edit mode — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.")
@@ -6390,11 +6391,11 @@ impl App {
                         && self.cfg.update.dismissed != info.version
                     {
                         let mut act: Option<&str> = None;
-                        Frame::none()
+                        Frame::new()
                             .fill(self.accent_soft())
                             .stroke(Stroke::new(1.0, self.accent()))
-                            .rounding(Rounding::same(14.0))
-                            .inner_margin(Margin::symmetric(16.0, 12.0))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(Margin::symmetric(16, 12))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     if let Some((got, total)) = self.update_dl {
@@ -6518,11 +6519,11 @@ impl App {
         let t_vals: Vec<i64> = devs.iter().filter_map(|d| d.temp_slider).collect();
         let has_color = devs.iter().any(|d| d.has_color);
         let sec2 = sec.clone();
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
-            .rounding(Rounding::same(R_CARD))
-            .inner_margin(Margin::symmetric(16.0, 12.0))
+            .corner_radius(CornerRadius::same(R_CARD))
+            .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.set_width((ui.available_width() - 32.0).max(200.0));
                 // v1.2.3 (Bug A): each control group is ONE
@@ -6758,11 +6759,11 @@ impl App {
             } else {
                 ui.label(RichText::new(sec.title.clone()).size(16.5).strong());
             }
-            Frame::none()
+            Frame::new()
                 .fill(pal.card)
                 .stroke(Stroke::new(1.0, pal.border))
-                .rounding(Rounding::same(10.0))
-                .inner_margin(Margin::symmetric(8.0, 1.0))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(8, 1))
                 .show(ui, |ui| {
                     ui.label(RichText::new(format!("{}", sec.ids.len())).size(12.0).color(pal.dim));
                 });
@@ -6926,8 +6927,8 @@ impl App {
                                 // other cards reflow around it.
                                 let r = ui.max_rect().shrink(1.0);
                                 let p = ui.painter();
-                                p.rect_filled(r, Rounding::same(R_CARD), self.accent_soft());
-                                p.rect_stroke(r, Rounding::same(R_CARD), Stroke::new(1.5, self.accent()));
+                                p.rect_filled(r, CornerRadius::same(R_CARD), self.accent_soft());
+                                p.rect_stroke(r, CornerRadius::same(R_CARD), Stroke::new(1.5, self.accent()), egui::StrokeKind::Middle);
                             }
                         },
                     );
@@ -7037,7 +7038,7 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                Frame::none()
+                Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(
                         pal.card.r(),
                         pal.card.g(),
@@ -7045,15 +7046,15 @@ impl App {
                         238,
                     ))
                     .stroke(Stroke::new(1.5, self.accent()))
-                    .rounding(Rounding::same(R_CARD))
-                    .inner_margin(Margin::symmetric(14.0, 12.0))
+                    .corner_radius(CornerRadius::same(R_CARD))
+                    .inner_margin(Margin::symmetric(14, 12))
                     .show(ui, |ui| {
                         ui.set_width((drag.size.x - 28.0).max(80.0));
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(icon).size(20.0));
                             ui.add(
                                 egui::Label::new(RichText::new(name).size(15.0).strong())
-                                    .truncate(true),
+                                    .truncate(),
                             );
                         });
                     });
@@ -7145,11 +7146,11 @@ impl App {
         };
         let border = if dev.state && dev.online { accent } else { pal.border };
         let pinned = self.cfg.layout.pins.contains(&dev.id);
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, border))
-            .rounding(Rounding::same(radius))
-            .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_top, bottom: pad_bot })
+            .corner_radius(CornerRadius::same(radius))
+            .inner_margin(Margin { left: pad_x as i8, right: pad_x as i8, top: pad_top as i8, bottom: pad_bot as i8 })
             .show(ui, |ui| {
                 ui.set_width((card_w - 2.0 * pad_x).max(80.0));
                 if fill_h > 0.0 {
@@ -7165,9 +7166,9 @@ impl App {
                     }
                     // icon box
                     let icon_size = if compact { 36.0 } else { 42.0 };
-                    Frame::none()
+                    Frame::new()
                         .fill(if dev.state && dev.online { self.accent_soft() } else { pal.track })
-                        .rounding(Rounding::same(if compact { 11.0 } else { 13.0 }))
+                        .corner_radius(CornerRadius::same(if compact { 11 } else { 13 }))
                         .show(ui, |ui| {
                             ui.allocate_ui_with_layout(
                                 vec2(icon_size, icon_size),
@@ -7220,13 +7221,13 @@ impl App {
                                     egui::Label::new(
                                         RichText::new(self.display(&dev)).size(15.0).strong(),
                                     )
-                                    .truncate(true),
+                                    .truncate(),
                                 );
                                 if !dev.online {
-                                    Frame::none()
+                                    Frame::new()
                                         .fill(Color32::from_rgb(0x64, 0x74, 0x8b))
-                                        .rounding(Rounding::same(6.0))
-                                        .inner_margin(Margin::symmetric(6.0, 2.0))
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::symmetric(6, 2))
                                         .show(ui, |ui| {
                                             ui.label(RichText::new("OFFLINE").size(10.5).color(Color32::WHITE).strong());
                                         });
@@ -7239,7 +7240,7 @@ impl App {
                                     egui::Label::new(
                                         RichText::new(status_text(&dev)).size(12.5).color(pal.dim),
                                     )
-                                    .truncate(true),
+                                    .truncate(),
                                 );
                             });
                         },
@@ -7430,7 +7431,7 @@ impl App {
                             };
                             let mut chosen: Option<Option<String>> = None;
                             let combo_w = (ui.available_width() - 92.0).max(84.0);
-                            ComboBox::from_id_source(("grp", &dev.id))
+                            ComboBox::from_id_salt(("grp", &dev.id))
                                 .selected_text(cur_label)
                                 .width(combo_w)
                                 .show_ui(ui, |ui| {
@@ -7512,11 +7513,11 @@ impl App {
             (None, None, 0, None)
         };
         let in_player = self.player_for.as_deref() == Some(id);
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
-            .rounding(Rounding::same(radius))
-            .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_top, bottom: pad_bot })
+            .corner_radius(CornerRadius::same(radius))
+            .inner_margin(Margin { left: pad_x as i8, right: pad_x as i8, top: pad_top as i8, bottom: pad_bot as i8 })
             .show(ui, |ui| {
                 ui.set_width((card_w - 2.0 * pad_x).max(80.0));
                 if fill_h > 0.0 {
@@ -7530,7 +7531,7 @@ impl App {
                         ui.allocate_exact_size(vec2(vw, vh), Sense::click());
                     // Cloned: the Retry buttons below need &mut ui.
                     let painter = ui.painter().clone();
-                    painter.rect_filled(rect, Rounding::same(8.0), Color32::BLACK);
+                    painter.rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
                     // Backoff presentation (v1.2.2): a clickable
                     // Retry (force-restart the pump now) instead of
                     // a bare "retrying" label, plus — after repeated
@@ -7665,9 +7666,9 @@ impl App {
                     }
                     let icon_size = if compact { 36.0 } else { 42.0 };
                     if !show_video {
-                        Frame::none()
+                        Frame::new()
                             .fill(pal.track)
-                            .rounding(Rounding::same(if compact { 11.0 } else { 13.0 }))
+                            .corner_radius(CornerRadius::same(if compact { 11 } else { 13 }))
                             .show(ui, |ui| {
                                 ui.allocate_ui_with_layout(
                                     vec2(icon_size, icon_size),
@@ -7700,13 +7701,13 @@ impl App {
                         |ui| {
                             ui.add(
                                 egui::Label::new(RichText::new(cam.name.clone()).size(15.0).strong())
-                                    .truncate(true),
+                                    .truncate(),
                             );
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(camera_status_text(&cam)).size(12.5).color(pal.dim),
                                 )
-                                .truncate(true),
+                                .truncate(),
                             );
                         },
                     );
@@ -7845,7 +7846,7 @@ impl App {
                         };
                         let mut chosen: Option<Option<String>> = None;
                         let combo_w = (ui.available_width() - 92.0).max(84.0);
-                        ComboBox::from_id_source(("grpcam", id))
+                        ComboBox::from_id_salt(("grpcam", id))
                             .selected_text(cur_label)
                             .width(combo_w)
                             .show_ui(ui, |ui| {
@@ -7994,11 +7995,11 @@ impl App {
         add: impl FnOnce(&mut Ui) -> R,
     ) -> R {
         let mut result = None;
-        Frame::none()
+        Frame::new()
             .fill(pal.card)
             .stroke(Stroke::new(1.0, pal.border))
-            .rounding(Rounding::same(R_CARD))
-            .inner_margin(Margin::symmetric(22.0, 20.0))
+            .corner_radius(CornerRadius::same(R_CARD))
+            .inner_margin(Margin::symmetric(22, 20))
             .show(ui, |ui| {
                 ui.set_width((ui.available_width() - 44.0).max(200.0));
                 ui.label(RichText::new(title).size(15.5).strong());
@@ -8025,7 +8026,7 @@ impl App {
                         Self::settings_panel(ui, &pal, "Appearance", |ui| {
                             Self::field_label(ui, &pal, "Theme");
                             let mut theme = self.cfg.prefs.theme.clone();
-                            ComboBox::from_id_source("set_theme")
+                            ComboBox::from_id_salt("set_theme")
                                 .selected_text(match theme.as_str() {
                                     "light" => "Light",
                                     "black" => "Black",
@@ -8063,7 +8064,7 @@ impl App {
                             ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Card density");
                             let mut density = self.cfg.prefs.density.clone();
-                            ComboBox::from_id_source("set_density")
+                            ComboBox::from_id_salt("set_density")
                                 .selected_text(if density == "compact" { "Compact" } else { "Comfortable" })
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
@@ -8259,7 +8260,7 @@ impl App {
                             ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Autorefresh interval");
                             let mut interval = self.cfg.prefs.interval;
-                            ComboBox::from_id_source("set_interval")
+                            ComboBox::from_id_salt("set_interval")
                                 .selected_text(interval_label(interval))
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
@@ -8331,7 +8332,7 @@ impl App {
                             ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Gateway type");
                             let mut gwt = self.cfg.prefs.gateway_type.clone();
-                            ComboBox::from_id_source("set_gw_type")
+                            ComboBox::from_id_salt("set_gw_type")
                                 .selected_text(if gwt == "mediamtx" { "MediaMTX (HLS)" } else { "go2rtc" })
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
@@ -8476,7 +8477,7 @@ impl App {
                 let vh = (vw * 9.0 / 16.0).min(540.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(vw, vh), Sense::hover());
                 let painter = ui.painter();
-                painter.rect_filled(rect, Rounding::same(8.0), Color32::BLACK);
+                painter.rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
                 if let Some(tid) = pump_tex {
                     painter.image(
                         tid,
@@ -8636,7 +8637,7 @@ impl App {
                     .find(|(k, _)| *k == form.template)
                     .map(|(_, l)| *l)
                     .unwrap_or("Tapo Stream 1 — High Quality");
-                ComboBox::from_id_source("cam_tpl")
+                ComboBox::from_id_salt("cam_tpl")
                     .selected_text(cur_label)
                     .width(ui.available_width() - 8.0)
                     .show_ui(ui, |ui| {
@@ -8784,11 +8785,11 @@ impl App {
                         } else {
                             (TOAST_BG_LIGHT, TOAST_BORDER)
                         };
-                        Frame::none()
+                        Frame::new()
                             .fill(fill)
                             .stroke(Stroke::new(1.0, stroke))
-                            .rounding(Rounding::same(13.0))
-                            .inner_margin(Margin::symmetric(17.0, 10.0))
+                            .corner_radius(CornerRadius::same(13))
+                            .inner_margin(Margin::symmetric(17, 10))
                             .show(ui, |ui| {
                                 ui.label(
                                     RichText::new(msg)
@@ -8851,21 +8852,21 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.apply_style(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.apply_style(ui.ctx());
         self.poll_net();
         // Tray + close behaviour (v1.2.1): poll tray events, turn a
         // close into a hide when close-to-tray is on.
-        self.handle_window_chrome(ctx, frame);
+        self.handle_window_chrome(ui.ctx(), frame);
         // Live previews (v1.2.0): reconcile pumps and upload the
         // latest frames as textures before anything renders.
-        self.sync_pumps(ctx);
+        self.sync_pumps(ui.ctx());
         // Drag & drop bookkeeping runs BEFORE rendering, hit-testing
         // against last frame's card geometry. It also runs while a
         // press is merely PENDING (v1.2.1), which is when promotion
         // (or quiet cancellation) happens.
         if self.drag.is_some() || self.drag_pending.is_some() {
-            self.update_drag(ctx);
+            self.update_drag(ui.ctx());
         }
         // A verified update download (v1.4.0: the install step is
         // platform-shaped — see UpdateInstall).
@@ -8878,7 +8879,7 @@ impl eframe::App for App {
                     // close-to-tray must not turn it into a hide.
                     self.quitting = true;
                     match Command::new(&path).spawn() {
-                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Ok(_) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
                         Err(e) => {
                             self.update_error = Some(format!(
                                 "The installer was downloaded but could not be started: {}",
@@ -8911,19 +8912,19 @@ impl eframe::App for App {
         match self.view {
             View::Login => {
                 egui::CentralPanel::default()
-                    .frame(Frame::none().fill(pal.bg))
-                    .show(ctx, |ui| self.view_login(ui));
+                    .frame(Frame::new().fill(pal.bg))
+                    .show(ui, |ui| self.view_login(ui));
             }
             View::Dashboard => {
-                self.header(ctx);
+                self.header(ui);
                 egui::CentralPanel::default()
-                    .frame(Frame::none().fill(pal.bg))
-                    .show(ctx, |ui| self.view_dashboard(ui));
+                    .frame(Frame::new().fill(pal.bg))
+                    .show(ui, |ui| self.view_dashboard(ui));
             }
             View::Settings => {
-                egui::TopBottomPanel::top("settings-header")
-                    .frame(Frame::none().fill(pal.card).inner_margin(Margin::symmetric(18.0, 12.0)))
-                    .show(ctx, |ui| {
+                egui::Panel::top("settings-header")
+                    .frame(Frame::new().fill(pal.card).inner_margin(Margin::symmetric(18, 12)))
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("⚙️").size(22.0));
                             ui.label(RichText::new("Settings").size(18.0).strong());
@@ -8935,8 +8936,8 @@ impl eframe::App for App {
                         });
                     });
                 egui::CentralPanel::default()
-                    .frame(Frame::none().fill(pal.bg))
-                    .show(ctx, |ui| self.view_settings(ui));
+                    .frame(Frame::new().fill(pal.bg))
+                    .show(ui, |ui| self.view_settings(ui));
             }
         }
         // Autorefresh — paused while editing, dragging, or typing.
@@ -8945,7 +8946,7 @@ impl eframe::App for App {
             && self.cfg.prefs.autorefresh
             && !self.editing
             && !self.dragging_slider
-            && !ctx.input(|i| i.pointer.primary_down())
+            && !ui.ctx().input(|i| i.pointer.primary_down())
         {
             let due = self
                 .last_fetch
@@ -8960,19 +8961,19 @@ impl eframe::App for App {
             if due && !self.disc_busy && !backed_off {
                 self.spawn_discovery(false);
             }
-            ctx.request_repaint_after(Duration::from_millis(500));
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
         }
         if self.new_group.is_some() {
-            self.new_group_window(ctx);
+            self.new_group_window(ui.ctx());
         }
         if self.cam_form.is_some() {
-            self.camera_window(ctx);
+            self.camera_window(ui.ctx());
         }
         if self.player_for.is_some() {
-            self.player_window(ctx);
+            self.player_window(ui.ctx());
         }
-        self.drag_ghost(ctx);
-        self.show_toasts(ctx);
+        self.drag_ghost(ui.ctx());
+        self.show_toasts(ui.ctx());
     }
 }
 
@@ -9053,7 +9054,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "SmartLife & Tuya Desktop",
         options,
-        Box::new(|cc| Box::new(App::new(cc))),
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
 }
 
@@ -10859,7 +10860,7 @@ mod tests {
             };
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none())
+                    .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
             });
             texts = drawn_texts(&out);
@@ -10904,7 +10905,7 @@ mod tests {
             };
             out = Some(ctx.run(input, |ctx| {
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none())
+                    .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
             }));
         }
@@ -11216,7 +11217,7 @@ mod tests {
         };
         ctx.run(input, |ctx| {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none())
+                .frame(egui::Frame::new())
                 .show(ctx, |ui| app.view_dashboard(ui));
         })
     }
