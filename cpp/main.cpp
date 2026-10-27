@@ -31,6 +31,12 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+// EM_SETCUEBANNER (0x1507) is not declared by the headers on some
+// MSVC/SDK combos (build 40466037329 failed on it) — define it when
+// the SDK does not, instead of depending on header quirks.
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER 0x1507
+#endif
 #include <string>
 #include <thread>
 

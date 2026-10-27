@@ -61,6 +61,33 @@ tests for every C++ milestone.
 - Updates: check on start, verified download + delayed installer launch
   (same pattern as Utility Closet / File Namer auto-install).
 
+## Dashboard visual spec (Shawn's screenshot, 2026-10-27, egui 1.4.0)
+
+The screenshot Shawn sent on 2026-10-27 IS the dashboard spec — do not
+redesign it, do not simplify it into a generic list. (The screenshot
+itself stays OUT of the repo: it shows his own camera view and home
+devices. This description is the spec, not the image.)
+
+- Header: house + app title, Updated timestamp, Search devices,
+  Autorefresh interval dropdown, Monitor / Refresh / Edit / Settings /
+  Log out pill buttons, all on black.
+- Camera section: one large card per camera with the live image,
+  stream address + quality line, Stream 1 HD / Stream 2 SD pills,
+  Watch, Copy URL, Open in external player, pin + close icons.
+- Section headers with counts: Lighting (6), Ungrouped (9), Scenes (3).
+- Lighting broadcast bar: All toggle, Brightness %, Colour temperature
+  slider, full colour-swatch row.
+- Light cards: icon, name, On + brightness + colour-temp status, pin,
+  close, indigo toggle when on, Brightness slider, Colour temperature
+  slider, two swatch rows.
+- Plug/switch cards: icon, name, On/Off status, pin, indigo toggle.
+- Scene cards: icon, name, "Scene — tap Start to run", indigo
+  Start scene button.
+- Look: black background, dark cards with thin indigo-tinted borders,
+  rounded corners, indigo accent for on-states and primary buttons.
+  Stock Win32 controls cannot reproduce this — the dashboard is
+  custom-painted, like the login header, or it is not 1:1.
+
 ## Milestones
 
 1. Scaffold (this commit): Win32 window shell, Black background,
