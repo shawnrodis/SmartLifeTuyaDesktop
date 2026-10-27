@@ -25,6 +25,7 @@ use crate::net::{fresh_session, http_client, is_rate_limit_code, net_auth, net_c
 use crate::obfuscate::{b64_encode, deobfuscate, obfuscate};
 use crate::registry::{registry_backoff_secs, registry_exists, registry_poll, registry_start, registry_stop};
 use crate::system::{apply_autostart, autostart_get, drain_tray_actions};
+use std::sync::Mutex;
 use crate::update::{parse_release, update_install_for, version_newer, RELEASES_API};
 use serde_json::{json, Map, Value};
 use std::ffi::{CStr, CString};
@@ -585,10 +586,127 @@ pub extern "C" fn tuya_tray_actions(req_json: *const c_char) -> *mut c_char {
     if action == "ensure" {
         // Best-effort: build the native tray icon if the platform has
         // one. On Linux there is none, and that is not an error.
-        let _ = crate::system::build_tray();
+        // The icon MUST be kept alive for the session: dropping the
+        // TrayState destroys the icon, so the previous code (which
+        // discarded the return value) could never receive a click.
+        // Store it in a process-lifetime static, and spawn the
+        // event-draining thread once (Windows: menu + icon clicks;
+        // macOS: menu clicks only — the shell polls the queue).
+        static TRAY_STATE: Mutex<Option<crate::system::TrayState>> =
+            Mutex::new(None);
+        if let Ok(mut slot) = TRAY_STATE.lock() {
+            if slot.is_none() {
+                if let Some(state) = crate::system::build_tray() {
+                    #[cfg(target_os = "windows")]
+                    let (open_id, quit_id) =
+                        (state.open_id.clone(), state.quit_id.clone());
+                    #[cfg(target_os = "macos")]
+                    let (open_id, quit_id) =
+                        (state.open_id.clone(), state.quit_id.clone());
+                    *slot = Some(state);
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = crate::system::spawn_tray_thread(open_id, quit_id);
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Drain MenuEvent receiver into the queue so
+                        // the Flutter shell's tuya_window_events
+                        // poll can actually see menu clicks.
+                        std::thread::Builder::new()
+                            .name("tray-menu-events".to_string())
+                            .spawn(move || loop {
+                                let rx = tray_icon::menu::MenuEvent::receiver();
+                                match rx.recv_timeout(
+                                    std::time::Duration::from_millis(40),
+                                ) {
+                                    Ok(ev) => {
+                                        if ev.id() == &open_id {
+                                            crate::system::push_tray_action(
+                                                crate::system::TrayAction::Show,
+                                            );
+                                        } else if ev.id() == &quit_id {
+                                            crate::system::push_tray_action(
+                                                crate::system::TrayAction::Quit,
+                                            );
+                                        }
+                                    }
+                                    Err(_) => {}
+                                }
+                                while let Ok(ev) = rx.try_recv() {
+                                    if ev.id() == &open_id {
+                                        crate::system::push_tray_action(
+                                            crate::system::TrayAction::Show,
+                                        );
+                                    } else if ev.id() == &quit_id {
+                                        crate::system::push_tray_action(
+                                            crate::system::TrayAction::Quit,
+                                        );
+                                    }
+                                }
+                            })
+                            .ok();
+                    }
+                }
+            }
+        }
     }
     let actions: Vec<String> = drain_tray_actions().iter().map(|a| a.as_str().to_string()).collect();
     json_to_cstring(json!({"ok": true, "actions": actions}))
+}
+
+#[no_mangle]
+pub extern "C" fn tuya_single_instance() -> *mut c_char {
+    // Called EXACTLY ONCE at startup by the Flutter shell, before
+    // any window is shown. The guard is intentionally leaked for
+    // the process lifetime: dropping it would release the mutex /
+    // file lock, and a second instance could then start. The OS
+    // releases the lock on process exit anyway. On secondary the
+    // acquire itself already signals the primary (Windows event /
+    // Unix show-request file), so the shell just exits.
+    let (role, guard_is_some) = match crate::system::acquire_single_instance() {
+        (crate::system::InstanceRole::Primary, g) => {
+            let some = g.is_some();
+            if let Some(g) = g {
+                Box::leak(Box::new(g));
+            }
+            ("primary", some)
+        }
+        (crate::system::InstanceRole::Secondary, _) => ("secondary", false),
+    };
+    // On platforms with no guard type the role is still primary
+    // (see system.rs fallback); guard_is_some is informational.
+    let _ = guard_is_some;
+    json_to_cstring(json!({"ok": true, "role": role}))
+}
+
+#[no_mangle]
+pub extern "C" fn tuya_window_events() -> *mut c_char {
+    // Everything the Flutter shell needs to act on a window event,
+    // in one poll: tray actions drained from the queue, plus the
+    // single-instance show request (Windows atomic flag, Unix
+    // show-request file — consumed, not just peeked).
+    let mut actions: Vec<String> =
+        drain_tray_actions().iter().map(|a| a.as_str().to_string()).collect();
+    let mut show_requested = false;
+    #[cfg(target_os = "windows")]
+    {
+        if crate::system::show_requested_take() {
+            show_requested = true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let path = crate::system::show_request_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+            show_requested = true;
+        }
+    }
+    if show_requested && !actions.iter().any(|a| a == "show") {
+        actions.push("show".to_string());
+    }
+    json_to_cstring(json!({"ok": true, "actions": actions, "show_requested": show_requested}))
 }
 
 #[no_mangle]

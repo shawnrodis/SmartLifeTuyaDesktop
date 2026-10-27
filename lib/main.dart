@@ -12,18 +12,16 @@
 // controls, camera form, watch player, settings, update flow.
 //
 // GAP NOTES (explicit, not pretended):
-//   TODO(GAP) tray hide-on-close: Flutter cannot intercept the
-//     window close button or hide the window without the
-//     window_manager plugin (not in this app's dependency set).
-//     The setting is saved and the Rust tray icon is registered
-//     via tuya_tray_actions, but closing the window currently
-//     quits the app. The Settings panel says so in plain text.
-//   TODO(GAP) snap-to-monitor / window move / maximize: moving
-//     the Flutter window onto a chosen monitor, and the
-//     launch-as Maximized/Minimized behaviours, need
-//     window_manager. The 🖥 Monitor menu lists live displays
-//     from tuya_monitors (when present) but selecting one only
-//     explains the gap — it does not move the window.
+//   Window control (formerly GAPs, closed with window_manager):
+//     tray hide-on-close, snap-to-monitor / window move /
+//     maximize, launch-as Minimized/Maximized, and
+//     single-instance / tray-icon click-to-restore are all wired
+//     in _HomePageState via package:window_manager plus the Rust
+//     tray/single-instance endpoints (tuya_tray_actions,
+//     tuya_single_instance, tuya_window_events). The Rust tray
+//     icon is kept alive for the session; the Flutter shell owns
+//     hiding/showing its window, so a missing Rust build can
+//     never silently become a tray-less app again.
 //   TODO(GAP) native window drag: Flutter windows are dragged by
 //     the OS title bar, not by app code; there is no Dart API to
 //     reproduce egui/winit's drag handling. Not a UI feature gap:
@@ -34,10 +32,8 @@
 //     Draggable, so cards use LongPressDraggable (long-press to
 //     start) + DragTarget, with the ↑/↓ buttons as the exact
 //     secondary method. The reorder effects are identical.
-//   TODO(GAP) single-instance / tray-icon click-to-restore: the
-//     egui Win32 mutex + tray menu live in the native shell, not
-//     in the Flutter window. Rust tray_actions covers the icon;
-//     click-to-restore needs window_manager and is not wired.
+//   (single-instance / tray-icon click-to-restore: see the
+//   window-control note above — wired, not a gap.)
 //   TODO(GAP) colour picker: egui used its native sRGB colour
 //     editor. Flutter has no built-in colour editor, so "More
 //     colours…" opens RGB sliders + a hex field + Apply colour
@@ -51,11 +47,42 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'rust_bridge.dart';
 import 'theme.dart';
 
-void main() {
+/// Launch mode requested on THIS launch's command line, if any
+/// (--minimized wins over --maximized, matching the Rust core's
+/// launch_mode_from_args). An explicit flag overrides the saved
+/// Settings launch mode for this launch only; otherwise the saved
+/// mode applies to every launch (see _applyLaunchWindow).
+String _argvLaunchMode = 'normal';
+
+Future<void> main(List<String> args) async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (args.contains('--minimized')) {
+    _argvLaunchMode = 'minimized';
+  } else if (args.contains('--maximized')) {
+    _argvLaunchMode = 'maximized';
+  }
+  // Native window control must be initialised before the first
+  // window is shown, so close interception works from the start.
+  try {
+    await windowManager.ensureInitialized();
+  } catch (_) {}
+  // Single-instance gate: called exactly once, before runApp.
+  // On secondary the Rust acquire already signalled the primary
+  // (Windows event / Unix show-request file), so this process
+  // just exits without ever showing a window. If the Rust core
+  // is unavailable, start anyway (the UI surfaces that error,
+  // as before) — a missing core must not brick the app launch.
+  try {
+    final role = RustBridge.singleInstance();
+    if (role['role'] == 'secondary') {
+      exit(0);
+    }
+  } catch (_) {}
   runApp(const TuyaApp());
 }
 
@@ -131,7 +158,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WindowListener {
   // ---- config (whole egui Config JSON, Rust is the file owner) --
   Map<String, dynamic> _config = {};
   bool _configLoaded = false;
@@ -211,6 +238,11 @@ class _HomePageState extends State<HomePage> {
 
   Timer? _tickTimer;
   Timer? _frameTimer;
+  Timer? _trayTimer;
+
+  // ---- native window control (window_manager) ----
+  bool _quitting = false;
+  bool _windowApplied = false;
 
   // Section cache: rebuilt when devices/layout/query/editing change.
   List<_Section>? _sectionsCache;
@@ -219,6 +251,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
     _query.addListener(() {
       if (_queryText != _query.text) {
         setState(() => _queryText = _query.text);
@@ -228,12 +261,22 @@ class _HomePageState extends State<HomePage> {
     _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
     _frameTimer =
         Timer.periodic(const Duration(milliseconds: 500), (_) => _pollFrames());
+    // Tray / single-instance show polling: cheap local Rust
+    // calls, independent of the dashboard refresh tick (which
+    // early-returns on the login/settings views and while
+    // editing) — a tray click must restore the window from any
+    // view, and a second instance must show this window even
+    // while the dashboard is paused.
+    _trayTimer = Timer.periodic(
+        const Duration(seconds: 1), (_) => _pollWindowEvents());
   }
 
   @override
   void dispose() {
+    windowManager.removeListener(this);
     _tickTimer?.cancel();
     _frameTimer?.cancel();
+    _trayTimer?.cancel();
     _liUser.dispose();
     _liPass.dispose();
     _query.dispose();
@@ -314,6 +357,10 @@ class _HomePageState extends State<HomePage> {
           platforms.any((e) => e.$1 == platform) ? platform : 'smart_life';
     }
     if (mounted) setState(() {});
+    // Apply the launch window (normal / minimized-to-tray /
+    // maximized) and the close policy now that prefs are known,
+    // before any silent login or refresh can flash the window.
+    await _applyLaunchWindow();
     // Silent re-login when a login is saved (egui: session token
     // refresh / saved-login sign-in on startup). Dart never sees
     // the stored password: Rust uses its own stored creds.
@@ -854,6 +901,207 @@ class _HomePageState extends State<HomePage> {
         DateTime.now().difference(_lastFetch!).inSeconds >= _interval;
     if (due && !_discBusy && !backedOff) {
       _refresh();
+    }
+  }
+
+
+  // ================= native window control =================
+  // window_manager owns the Flutter window; the Rust core owns
+  // the tray icon, autostart store and single-instance guard.
+  // Nothing here re-implements Tuya/cloud/camera logic.
+
+  @override
+  void onWindowClose() async {
+    if (_quitting) return;
+    if (_prefs['close_to_tray'] == true) {
+      // Hide, do not quit: refresh and camera previews keep
+      // running, and Quit lives on the tray icon's menu.
+      try {
+        await windowManager.hide();
+      } catch (_) {}
+      try {
+        RustBridge.trayActions('ensure');
+      } catch (_) {}
+      return;
+    }
+    await _quitApp();
+  }
+
+  Future<void> _applyWindowPolicy() async {
+    try {
+      await windowManager
+          .setPreventClose(_prefs['close_to_tray'] == true && !_quitting);
+    } catch (_) {}
+  }
+
+  /// Effective launch mode for this process: an explicit argv
+  /// flag wins, otherwise the saved Settings mode applies to
+  /// every launch (matching the Rust core's resolve_launch_mode
+  /// and the Settings help text). Minimized starts hidden with
+  /// the tray icon present; maximized shows maximised; normal
+  /// shows a normal window. A failure here must never leave the
+  /// app invisible: fall back to showing the window.
+  Future<void> _applyLaunchWindow() async {
+    if (_windowApplied) return;
+    try {
+      final mode = _argvLaunchMode != 'normal'
+          ? _argvLaunchMode
+          : (_prefs['launch_mode'] as String? ?? 'normal');
+      if (mode == 'minimized') {
+        try {
+          RustBridge.trayActions('ensure');
+        } catch (_) {}
+        await windowManager.hide();
+      } else if (mode == 'maximized') {
+        await windowManager.show();
+        await windowManager.maximize();
+        await windowManager.focus();
+      } else {
+        await windowManager.show();
+        await windowManager.focus();
+      }
+    } catch (_) {
+      try {
+        await windowManager.show();
+      } catch (_) {}
+    }
+    await _applyWindowPolicy();
+    _windowApplied = true;
+  }
+
+  Future<void> _showWindow() async {
+    try {
+      await windowManager.show();
+    } catch (_) {}
+    try {
+      if (await windowManager.isMinimized()) {
+        await windowManager.restore();
+      }
+    } catch (_) {}
+    try {
+      await windowManager.focus();
+    } catch (_) {}
+  }
+
+  /// Quit for real: release the close interception first, or
+  /// onWindowClose would hide the window instead of quitting.
+  Future<void> _quitApp() async {
+    if (_quitting) return;
+    _quitting = true;
+    try {
+      await windowManager.setPreventClose(false);
+    } catch (_) {}
+    try {
+      await windowManager.destroy();
+    } catch (_) {
+      exit(0);
+    }
+  }
+
+  /// Drain Rust window events ~1s: tray Show/Quit and the
+  /// single-instance show request. Quit wins over Show in the
+  /// same poll. Runs from any view, even while the dashboard
+  /// refresh tick is paused (editing / searching / login).
+  Future<void> _pollWindowEvents() async {
+    if (_quitting || !mounted) return;
+    try {
+      final res = RustBridge.windowEvents();
+      final actions = res['actions'];
+      final list = actions is List
+          ? actions.map((e) => e.toString()).toList()
+          : <String>[];
+      if (list.contains('quit')) {
+        await _quitApp();
+        return;
+      }
+      if (list.contains('show') || res['show_requested'] == true) {
+        await _showWindow();
+      }
+    } catch (_) {}
+  }
+
+  /// One axis of the Rust snap target (monitor.rs snap_axis,
+  /// ported verbatim in maths, not approximated): origin +
+  /// inset, clamped so the point — and the whole window when it
+  /// fits — stays inside [origin, origin+len) with margin.
+  double _snapAxis(
+      double origin, double len, double winLen, double inset, double margin) {
+    if (len <= 2.0 * margin) return origin + len / 2.0;
+    final hi = winLen + 2.0 * margin <= len
+        ? origin + len - margin - winLen
+        : origin + len - margin - 1.0;
+    final lo = origin + margin;
+    return (origin + inset).clamp(lo, hi);
+  }
+
+  /// Move the window onto the chosen monitor and maximise it
+  /// there — the egui v1.3.1 sequence (move, verify, maximise),
+  /// done with window_manager: unmaximise, setPosition to the
+  /// Rust snap target point (monitor.rs snap_target_point_px:
+  /// top-left inset by 60pt at the target monitor's own scale,
+  /// clamped with an 8pt margin), then maximise so the OS owns
+  /// the geometry to that monitor's work area. The move is
+  /// VERIFIED afterwards against the target monitor's logical
+  /// rect; on a miss the window is left visible where it is and
+  /// the user is told — never pretended to have moved. Snap is
+  /// a Windows mechanism (the Rust enumeration returns [] off
+  /// Windows, exactly as the original), so on macOS the menu
+  /// shows "No displays found" as before.
+  Future<void> _snapToMonitor(Map<String, dynamic> mon) async {
+    final rect = mon['rect_px'];
+    if (rect is! List || rect.length < 4) {
+      _toast('That display has no usable position.', isError: true);
+      return;
+    }
+    final px = rect.map((e) => (e as num).toDouble()).toList();
+    final scale = (mon['scale'] is num && (mon['scale'] as num) > 0)
+        ? (mon['scale'] as num).toDouble()
+        : 1.0;
+    try {
+      // Unmaximise first: a maximised window cannot be moved
+      // meaningfully, and maximise-after-move is what pins the
+      // window to the target monitor's work area.
+      try {
+        if (await windowManager.isMaximized()) {
+          await windowManager.unmaximize();
+        }
+      } catch (_) {}
+      final size = await windowManager.getSize();
+      final winPxW = size.width * scale;
+      final winPxH = size.height * scale;
+      final inset = 60.0 * scale;
+      final margin = 8.0 * scale;
+      final tx = _snapAxis(px[0], px[2], winPxW, inset, margin);
+      final ty = _snapAxis(px[1], px[3], winPxH, inset, margin);
+      // window_manager positions are logical points: the
+      // physical target point divided by the TARGET monitor's
+      // own scale (the Rust snap maths are physical end-to-end).
+      await windowManager.setPosition(Offset(tx / scale, ty / scale));
+      await windowManager.show();
+      await windowManager.focus();
+      await windowManager.maximize();
+      // Verify: the window's logical position must fall inside
+      // the target monitor's logical rect. A mixed-DPI
+      // conversion miss (the egui v1.3.0 failure mode) is
+      // reported, not hidden.
+      try {
+        final pos = await windowManager.getPosition();
+        final lx = px[0] / scale;
+        final ly = px[1] / scale;
+        final lw = px[2] / scale;
+        final lh = px[3] / scale;
+        final inside = pos.dx >= lx &&
+            pos.dx < lx + lw &&
+            pos.dy >= ly &&
+            pos.dy < ly + lh;
+        if (!inside) {
+          _toast(
+              'Could not move to ${mon['name']} — the window stayed on its current monitor.',
+              isError: true);
+        }
+      } catch (_) {}
+    } catch (e) {
+      _toast('Could not move the window: $e', isError: true);
     }
   }
 
@@ -1492,18 +1740,18 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _monitorMenu() {
-    // TODO(GAP) snap-to-monitor: the dialog lists live displays
-    // from tuya_monitors, but moving the Flutter window onto the
-    // chosen monitor needs the window_manager plugin, which this
-    // app does not depend on. Selecting a display explains that
-    // instead of pretending the window moved.
+    // Lists live displays from tuya_monitors; choosing one
+    // moves the window onto that display and maximises it
+    // there (_snapToMonitor). Snap is a Windows mechanism: the
+    // Rust enumeration returns [] off Windows, so on macOS the
+    // menu shows "No displays found", exactly as the original.
     return OutlinedButton(
       onPressed: () async {
         final res = await RustBridge.monitors();
         if (!mounted) return;
         final mons = res['monitors'];
         final list = mons is List ? mons : [];
-        final chosen = await showDialog<String>(
+        final chosen = await showDialog<Map<String, dynamic>>(
           context: context,
           builder: (context) => AlertDialog(
             backgroundColor: _pal.card,
@@ -1526,8 +1774,10 @@ class _HomePageState extends State<HomePage> {
                             '${m['name']} — $w × $h${m['primary'] == true ? ' · Primary' : ''}',
                             style:
                                 TextStyle(color: _pal.text)),
-                        onTap: () => Navigator.of(context)
-                            .pop(m['device']?.toString() ?? ''),
+                        onTap: () => Navigator.of(context).pop(
+                            m is Map<String, dynamic>
+                                ? m
+                                : Map<String, dynamic>.from(m as Map)),
                       );
                     }).toList(),
                   ),
@@ -1539,10 +1789,8 @@ class _HomePageState extends State<HomePage> {
             ],
           ),
         );
-        if (chosen != null && chosen.isNotEmpty) {
-          _toast(
-              'Moving the window to another monitor needs the window_manager plugin (GAP) — the window stays where it is.',
-              isError: true);
+        if (chosen != null) {
+          await _snapToMonitor(chosen);
         }
       },
       child: const Text('🖥 Monitor'),
@@ -3623,7 +3871,7 @@ class _HomePageState extends State<HomePage> {
                                   value:
                                       _prefs['close_to_tray'] == true,
                                   activeColor: _accent,
-                                  onChanged: (v) {
+                                  onChanged: (v) async {
                                     final on = v ?? false;
                                     _mutPrefs('close_to_tray', on);
                                     if (on) {
@@ -3632,6 +3880,7 @@ class _HomePageState extends State<HomePage> {
                                             'ensure');
                                       } catch (_) {}
                                     }
+                                    await _applyWindowPolicy();
                                   },
                                 ),
                                 Expanded(
@@ -3646,18 +3895,12 @@ class _HomePageState extends State<HomePage> {
                             Text(_autostartHelp,
                                 style: TextStyle(
                                     fontSize: 12.5, color: pal.dim)),
-                            // TODO(GAP) tray hide-on-close: see the
-                            // file header. The setting above is
-                            // saved and the Rust tray icon is
-                            // registered, but Flutter cannot hide
-                            // its window on close without the
-                            // window_manager plugin.
                             const SizedBox(height: 8),
                             Text(
-                              'Note: hiding the window on close needs the window_manager plugin (GAP) — until that is wired, closing the window quits the app even with this setting on. The setting itself is saved and the tray icon is registered.',
+                              'With this on, closing the window hides it instead of quitting — device refresh and camera previews keep running, and Quit lives on the tray icon\'s menu. Clicking the tray icon brings the window back.',
                               style: TextStyle(
                                   fontSize: 12.5,
-                                  color: dangerColor),
+                                  color: pal.dim),
                             ),
                           ],
                         )),
@@ -4023,6 +4266,7 @@ class _LiveSliderState extends State<_LiveSlider> {
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
     _current = widget.value;
   }
 
@@ -4096,6 +4340,7 @@ class _ColorPickerRowState extends State<_ColorPickerRow> {
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
     _r = widget.initial.red.toDouble();
     _g = widget.initial.green.toDouble();
     _b = widget.initial.blue.toDouble();
@@ -4226,6 +4471,7 @@ class _CameraFormDialogState extends State<_CameraFormDialog> {
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
     final e = widget.existing;
     _name = TextEditingController(text: e?['name']?.toString() ?? '');
     _user = TextEditingController(text: e?['user']?.toString() ?? '');
@@ -4390,6 +4636,7 @@ class _WatchPlayerState extends State<_WatchPlayer> {
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
     _timer = Timer.periodic(const Duration(milliseconds: 500),
         (_) => _poll());
     _poll();

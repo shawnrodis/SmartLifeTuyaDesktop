@@ -32,6 +32,7 @@
 //   tuya_refresh, tuya_control, tuya_build_sections,
 //   tuya_camera_start, tuya_camera_frame, tuya_camera_stop,
 //   tuya_find_ffmpeg, tuya_update_check, tuya_tray_actions,
+//   tuya_single_instance, tuya_window_events,
 //   tuya_autostart_get, tuya_autostart_set, tuya_monitors,
 //   tuya_free_string.
 //
@@ -114,9 +115,20 @@
 //     (SmartLifeTuyaDesktop-Setup-vX.exe / -vX.dmg).
 //   tuya_tray_actions(req) -> {"ok":true}. req: {"action":
 //     "ensure"|"hide"|"show"|"quit"} — registers/uses the native
-//     tray or menu-bar icon. NOTE: actually hiding the Flutter
-//     window on close is a GAP (see main.dart); this call only
-//     manages the Rust-side tray icon/menu.
+//     tray or menu-bar icon. The icon is kept alive by Rust for
+//     the session (a previous version dropped it immediately, so
+//     clicks could never arrive); the Flutter shell hides/shows
+//     its window via window_manager and drains events with
+//     tuya_window_events below.
+//   tuya_single_instance() -> {"ok":true,"role":
+//     "primary"|"secondary"} — MUST be called exactly once at
+//     startup, before any window is shown. On secondary the
+//     acquire itself already signals the primary (Windows event
+//     / Unix show-request file), so the shell just exits.
+//   tuya_window_events() -> {"ok":true,"actions":["show"|
+//     "quit",…],"show_requested":bool} — tray actions drained
+//     from the queue plus the single-instance show request
+//     (consumed, not peeked). The shell polls this ~1s.
 //   tuya_autostart_get() -> {"ok":true,"enabled":bool,
 //     "launch_mode":"normal"|"minimized"|"maximized"} — the OS
 //     store is the source of truth, as in egui.
@@ -126,8 +138,12 @@
 //     rect_px:[x,y,w,h], primary:bool}]} — present only where the
 //     Rust core implements enumeration; Dart treats a missing
 //     symbol as "no displays found", never as an error to retry.
-//     Moving the Flutter window onto a chosen monitor is a GAP
-//     (needs the window_manager plugin; see main.dart).
+//     Moving the Flutter window onto a chosen monitor is done by
+//     the shell with window_manager (see main.dart): unmaximize,
+//     setPosition to the Rust snap target point (monitor.rs
+//     snap_target_point_px maths, converted to logical pixels),
+//     then maximize — the same move-then-maximize sequence as
+//     egui v1.3.1, verified afterwards against the monitor rect.
 //
 // Library file names (must match the Rust cdylib output, which
 // the Actions workflow copies next to the Flutter exe / .app):
@@ -362,6 +378,18 @@ class RustBridge {
     final json = await Isolate.run(
         () => _updateCheckIsolate(jsonEncode(request)));
     return _decode(json);
+  }
+
+  /// Single-instance role. Runs directly (fast, local only).
+  /// Call exactly once at startup; see the contract above.
+  static Map<String, dynamic> singleInstance() {
+    return _decode(_callNoArg(_open(), 'tuya_single_instance'));
+  }
+
+  /// Window events (tray actions + single-instance show).
+  /// Runs directly (fast, local only); polled ~1s by the shell.
+  static Map<String, dynamic> windowEvents() {
+    return _decode(_callNoArg(_open(), 'tuya_window_events'));
   }
 
   /// Tray / menu-bar icon actions. Runs directly (fast).

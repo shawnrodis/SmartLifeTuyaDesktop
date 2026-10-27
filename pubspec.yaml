@@ -16,6 +16,10 @@ dependencies:
   # frames arrive as RGBA bytes rendered with decodeImageFromPixels
   # (no video-player plugin — the Rust ffmpeg pump stays in charge).
   ffi: ^2.1.0
+  # Native window control only: intercept close, hide/show,
+  # move/maximize, launch state. The tray icon itself, config,
+  # Tuya API and camera pumps stay in the Rust core.
+  window_manager: ^0.5.0
 
 dev_dependencies:
   flutter_test:
