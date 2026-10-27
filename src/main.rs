@@ -10419,13 +10419,18 @@ mod tests {
     /// The viewport commands one headless frame of the launch
     /// hold produces (drives the REAL App::enforce_launch_hold).
     fn hold_frame_cmds(app: &App, ctx: &egui::Context) -> Vec<egui::ViewportCommand> {
-        let out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
             app.enforce_launch_hold(ctx)
         });
-        out.viewport_output
+        let cmds = out
+            .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.commands.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // egui 0.37 debug-asserts that a dropped TexturesDelta is
+        // empty; headless tests never apply it, so clear it.
+        out.textures_delta.clear();
+        cmds
     }
 
     /// The reboot/login regression (v1.2.4): Windows relaunches
@@ -10455,6 +10460,11 @@ mod tests {
         // Early frames: invisibility is re-asserted every frame —
         // the window is commanded invisible and stays so.
         let ctx = egui::Context::default();
+        // Warm-up frame (egui 0.37): a fresh context announces its
+        // theme once via ViewportCommand::SetTheme; that is egui's
+        // own first-frame command, not the launch hold's, so it is
+        // spent here and the loop below asserts the hold exactly.
+        let _ = hold_frame_cmds(&app, &ctx);
         for _ in 0..3 {
             assert_eq!(
                 hold_frame_cmds(&app, &ctx),
@@ -10477,6 +10487,10 @@ mod tests {
         assert!(cmds.contains(&egui::ViewportCommand::Visible(true)));
         assert!(!app.window_hidden);
         assert!(!app.launch_hidden_pending);
+        // See hold_frame_cmds: 0.37 drops debug-assert on
+        // unconsumed texture deltas.
+        let mut out = out;
+        out.textures_delta.clear();
 
         // Later frames assert nothing: visible is left alone.
         assert!(hold_frame_cmds(&app, &ctx).is_empty());
@@ -10990,12 +11004,13 @@ mod tests {
                 time: Some(10.0 + i as f64 * 0.05),
                 ..Default::default()
             };
-            let out = ctx.run_ui(input, |ctx| {
+            let mut out = ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
             });
             texts = drawn_texts(&out);
+            out.textures_delta.clear();
         }
         texts
     }
@@ -11035,11 +11050,13 @@ mod tests {
                 time: Some(30.0 + i as f64 * 0.05),
                 ..Default::default()
             };
-            out = Some(ctx.run_ui(input, |ctx| {
+            let mut frame_out = ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
-            }));
+            });
+            frame_out.textures_delta.clear();
+            out = Some(frame_out);
         }
         out.expect("frames >= 1")
     }
@@ -11347,11 +11364,13 @@ mod tests {
             events,
             ..Default::default()
         };
-        ctx.run_ui(input, |ctx| {
+        let mut out = ctx.run_ui(input, |ctx| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new())
                 .show(ctx, |ui| app.view_dashboard(ui));
-        })
+        });
+        out.textures_delta.clear();
+        out
     }
 
     /// Slider track rects (h≈6) drawn in a frame.
