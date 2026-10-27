@@ -1,10 +1,20 @@
-; SmartLife & Tuya Desktop installer (NSIS 3.x)
-; Per-user install — no administrator rights required.
-; Installs to %LOCALAPPDATA%\SmartLifeTuyaDesktop and creates an
+; SmartLife & Tuya Desktop installer (NSIS 3.x) — Rust/Flutter version.
+; Per-user install — no administrator rights required, matching the
+; egui installer it replaces. Installs to
+; %LOCALAPPDATA%\SmartLifeTuyaDesktop and creates an
 ; Add/Remove Programs entry.
+;
+; Flutter build: the exe plus tuya_core.dll (Rust core), flutter_windows.dll,
+; plugin DLLs, and the data/ folder (app.so, icudtl.dat, flutter_assets)
+; must all be installed together. Bundled FFmpeg (gyan.dev essentials
+; build, GPL v3 — see the licenses folder) is installed NEXT TO the
+; app exe, which is where the Rust core looks for it first, so live
+; camera previews just work. The old egui binary name
+; (SmartLifeTuyaDesktop.exe) is removed on install, so an update in
+; place does not leave two app exes behind.
 
 !define APP_NAME "SmartLife & Tuya Desktop"
-!define APP_VERSION "1.4.1"
+!define APP_VERSION "1.5.0"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/SmartLifeTuyaDesktop"
 
@@ -22,7 +32,7 @@ ShowInstDetails show
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_RUN "$INSTDIR\SmartLifeTuyaDesktop.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\smartlife_tuya_desktop.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch SmartLife & Tuya Desktop"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -32,15 +42,16 @@ ShowInstDetails show
 Section "SmartLife & Tuya Desktop" SecApp
   SectionIn RO  ; required — cannot be unchecked
   SetOutPath "$INSTDIR"
-  File "SmartLifeTuyaDesktop.exe"
-  ; Bundled FFmpeg 7.1.1 (gyan.dev essentials build, GPL v3 — see the
-  ; licenses folder): installed NEXT TO the app exe, which is where
-  ; the app looks for it first, so live camera previews just work.
+  ; All files from the Flutter Windows Release folder, including data/.
+  File /r "staging\*.*"
+  ; Bundled FFmpeg + licenses (copied into staging by the workflow).
   File "..\assets\ffmpeg.exe"
   SetOutPath "$INSTDIR\licenses"
   File "..\licenses\FFmpeg-LICENSE.txt"
   File "..\LICENSE"
   SetOutPath "$INSTDIR"
+  ; Remove the old egui binary on an update in place.
+  Delete "$INSTDIR\SmartLifeTuyaDesktop.exe"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   ; Add/Remove Programs entry (per-user).
@@ -49,17 +60,17 @@ Section "SmartLife & Tuya Desktop" SecApp
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "Publisher" "${APP_PUBLISHER}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "URLInfoAbout" "${APP_URL}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "DisplayIcon" "$INSTDIR\SmartLifeTuyaDesktop.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "DisplayIcon" "$INSTDIR\smartlife_tuya_desktop.exe"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop" "EstimatedSize" 104923
 
   ; Start Menu shortcuts (per-user).
   CreateDirectory "$SMPROGRAMS\SmartLife & Tuya Desktop"
-  CreateShortcut "$SMPROGRAMS\SmartLife & Tuya Desktop\SmartLife & Tuya Desktop.lnk" "$INSTDIR\SmartLifeTuyaDesktop.exe"
+  CreateShortcut "$SMPROGRAMS\SmartLife & Tuya Desktop\SmartLife & Tuya Desktop.lnk" "$INSTDIR\smartlife_tuya_desktop.exe"
   CreateShortcut "$SMPROGRAMS\SmartLife & Tuya Desktop\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
 
 Section "Desktop Icon" SecDesktop
-  CreateShortcut "$DESKTOP\SmartLife & Tuya Desktop.lnk" "$INSTDIR\SmartLifeTuyaDesktop.exe"
+  CreateShortcut "$DESKTOP\SmartLife & Tuya Desktop.lnk" "$INSTDIR\smartlife_tuya_desktop.exe"
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
@@ -68,12 +79,16 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
+  Delete "$INSTDIR\smartlife_tuya_desktop.exe"
   Delete "$INSTDIR\SmartLifeTuyaDesktop.exe"
+  Delete "$INSTDIR\tuya_core.dll"
+  Delete "$INSTDIR\flutter_windows.dll"
   Delete "$INSTDIR\ffmpeg.exe"
+  Delete "$INSTDIR\Uninstall.exe"
+  RMDir /r "$INSTDIR\data"
   Delete "$INSTDIR\licenses\FFmpeg-LICENSE.txt"
   Delete "$INSTDIR\licenses\LICENSE"
   RMDir "$INSTDIR\licenses"
-  Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
 
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SmartLifeTuyaDesktop"

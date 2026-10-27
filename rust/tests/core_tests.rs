@@ -195,16 +195,15 @@ fn ffi_smoke() {
     use tuya_core::ffi::*;
     unsafe {
         let v = tuya_version();
-        assert_eq!(CStr::from_ptr(v).to_str().unwrap(), "1.5.0-rust");
+        assert!(CStr::from_ptr(v).to_str().unwrap().contains("1.5.0"));
         tuya_free_string(v);
         // build_sections via FFI
         let devices = CString::new(r#"[{"id":"dev-a","name":"Bulb","dev_type":"light","data":{"state":true,"brightness":"800"}},{"id":"cam-9","name":"Porch","user":"admin","password":"KTo=","host":"10.0.0.5","port":554,"template":"tapo1","path":""}]"#).unwrap();
         // password "KTo=" is obfuscate("pw")? verify via core: obfuscate("pw") - use it dynamically instead
         let _ = devices;
         let dev_json = format!(r#"[{{"id":"dev-a","name":"Bulb","dev_type":"light","data":{{"state":true,"brightness":"800"}}}},{{"id":"cam-9","name":"Porch","user":"admin","password":"{}","host":"10.0.0.5","port":554,"template":"tapo1","path":""}}]"#, tuya_core::obfuscate("pw"));
-        let devices = CString::new(dev_json).unwrap();
-        let layout = CString::new(r#"{"pins":["dev-a"]}"#).unwrap();
-        let out = tuya_build_sections(devices.as_ptr(), layout.as_ptr());
+        let req = CString::new(format!(r#"{{"devices":{},"layout":{{"pins":["dev-a"]}}}}"#, dev_json)).unwrap();
+        let out = tuya_build_sections(req.as_ptr());
         let s = CStr::from_ptr(out).to_str().unwrap().to_string();
         tuya_free_string(out);
         let val: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -213,10 +212,11 @@ fn ffi_smoke() {
         assert!(sections.iter().any(|s| s["order_key"] == "cameras"));
         // tray actions drained via FFI
         tuya_core::push_tray_action(tuya_core::TrayAction::Show);
-        let out = tuya_tray_actions();
+        let act = CString::new(r#"{"action":""}"#).unwrap();
+        let out = tuya_tray_actions(act.as_ptr());
         let s = CStr::from_ptr(out).to_str().unwrap().to_string();
         tuya_free_string(out);
-        assert_eq!(s, r#"{"actions":["show"]}"#);
+        assert!(s.contains("\"show\""));
         // monitors (Linux: empty, faithful to original non-Windows stub)
         let out = tuya_monitors();
         let s = CStr::from_ptr(out).to_str().unwrap().to_string();
@@ -229,9 +229,8 @@ fn ffi_smoke() {
         tuya_free_string(out);
         assert!(s.contains("\"path\""));
         // malformed command JSON returns a JSON error without any network call
-        let dev = CString::new("dev-a").unwrap();
         let cmd = CString::new(r#"not json"#).unwrap();
-        let out = tuya_control(dev.as_ptr(), cmd.as_ptr());
+        let out = tuya_control(cmd.as_ptr());
         let s = CStr::from_ptr(out).to_str().unwrap().to_string();
         tuya_free_string(out);
         assert!(s.contains("error"));

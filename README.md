@@ -1,4 +1,26 @@
 <p align="center">
+
+## Rust/Flutter version — in progress (branch `flutter-rust`, no release yet)
+
+The next version (1.5.0) is Rust core + Flutter UI, RustDesk-style:
+`rust/` (`tuya_core`, manual C-ABI FFI, no flutter_rust_bridge) holds
+the Tuya API, config, device/section logic and ffmpeg camera pumps;
+`lib/` (Flutter) holds the UI, 1:1 with the egui version as technically
+possible, same functionality. The egui version (v1.4.1) is still the
+latest release and still on `main`; this branch has NOT been released,
+and the old dock-icon issue is deprioritised and not chased here.
+Known gaps in this branch (reported, not silently dropped): tray
+hide-on-close and snap-to-monitor / window move-maximize need the
+`window_manager` Flutter plugin (settings are saved, window actions
+show a GAP note); grid drag uses long-press + ↑/↓ instead of egui's
+measured-cell 8px drag; single-instance show delivery and the one-time
+tray balloon are split/gap as documented in `rust/README-API.md`.
+Windows + Mac builds require the staged workflows below — they cannot
+be pushed by automation (no `workflow` token scope), so add them via
+GitHub web UI when this branch is ready to build/release (see
+`.github/workflows/windows.yml` and
+`.github/workflows/release-mac-flutter.yml` in the working tree).
+
   <img src="assets/icon.png" alt="SmartLife & Tuya Desktop icon" width="120">
 </p>
 

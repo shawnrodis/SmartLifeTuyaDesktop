@@ -1,3 +1,54 @@
+## FFI contract — single-JSON API (matches lib/rust_bridge.dart, 2026-10-27 fix)
+
+Every exported function takes AT MOST ONE string argument, and that
+argument is always a single JSON object (or, for no-arg functions,
+nothing). Sections below that describe multi-arg signatures are
+SUPERSEDED by this contract — do not use them. Dart's bridge uses one typedef for all string functions
+(`Pointer<Utf8> Function(Pointer<Utf8>)`), so a multi-argument C ABI
+would corrupt the call — the original multi-arg exports were replaced
+for exactly that reason. Do NOT reintroduce multi-arg exports.
+
+- `tuya_version()` -> `{"ok":true,"version":"1.5.0"}`
+- `tuya_load_config()` -> `{"ok":true,"config":{...}}` where creds/session
+  are presence markers only (`user_name`/`country_code`/`platform`/
+  `has_password`, `region`/`expires_at_ms`/`has_token`) — tokens and
+  passwords NEVER cross into Dart. Dart holds the marker, Rust holds
+  the secret in config.json.
+- `tuya_save_config(config)` -> `{"ok":true}`. Preserves stored
+  creds/session on marker objects, clears them on explicit null
+  (logout), replaces them only on a full object with access_token.
+- `tuya_login({username,password,region,platform,keep} | {silent:true})`
+  -> `{"ok":true,"session":<stripped>,"devices":[parsed Device...]}` or
+  `{"ok":false,"error":"no_saved_login"}`. Devices are PARSED Device
+  objects (id, name, dev_type, kind, icon_kind, is_scene, online,
+  state, has_brightness, has_temp, has_color, brightness_pct,
+  temp_slider, hue, saturation, color_mode), NOT raw Tuya payloads.
+  Session + cache_devices are persisted by Rust on success; creds
+  only when keep=true.
+- `tuya_refresh({force})` -> ok/session/devices, or
+  `{"ok":true,"rate_limited":true,"session":...}` (DiscFrequent).
+- `tuya_control({id,command,value})` -> `{"ok":true,"outcome":"ok"}`.
+- `tuya_build_sections({devices,cameras,layout,query})` ->
+  `{"ok":true,"sections":[{key,order_key,title,kind,group_id,ids,items}]}`.
+  Camera items additionally carry `rtsp_url`, `tile_rtsp_url`,
+  `gateway_watch_url` (computed by Rust, which deobfuscates).
+- `tuya_camera_start({camera_id,mode})`, mode tile|player|gateway|external.
+  Pump keys are `{item_id}:{mode}` (e.g. `cam:{id}:tile`), so tile and
+  player pumps for one camera do not collide. Tile = 480x270 Stream 2
+  (Tapo), player = 960x540 card quality.
+- `tuya_camera_frame({camera_id,pump})` ->
+  `{"ok":true,"state":"live|connecting|backoff","width":N,"height":N,
+  "rgba_base64":"..."}` with rgba_base64 OMITTED when no frame is ready
+  yet; unknown pump -> `{"ok":false,"state":"ended","error":...}`.
+- `tuya_camera_stop({camera_id,pump})` -> `{"ok":true}`.
+- `tuya_update_check({action:"check"|"download"|"install",...})` ->
+  check returns `{"ok":true,"info":{...}}`; download returns
+  `{"ok":true,"downloaded_path":"...","asset_name":"..."}` after exact
+  asset-name verification; install runs/opens the verified file.
+- `tuya_tray_actions({action:"ensure"|""})` -> `{"ok":true,"actions":[...]}`.
+  "ensure" best-effort builds the native tray icon (no-op on Linux).
+
+
 # tuya_core — Rust core for SmartLifeTuyaDesktop (Flutter edition)
 
 Version **1.5.0**. A Rust library crate (`cdylib` + `rlib`, library name
