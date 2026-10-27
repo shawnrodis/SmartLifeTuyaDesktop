@@ -233,6 +233,79 @@ void ToggleProxy() {
   LayoutLogin();
 }
 
+void LayoutLogin() {
+  if (g_mainWnd == nullptr || g_user == nullptr) return;
+  RECT rc;
+  GetClientRect(g_mainWnd, &rc);
+  const int cw = rc.right - rc.left;
+  int cardX = (cw - 400) / 2;
+  if (cardX < 16) cardX = 16;
+  const int x = cardX + 28;
+  int y = 36 + 30;  // card top + top margin
+  auto place = [&](HWND h, int yy, int hh) {
+    if (h != nullptr) MoveWindow(h, x, yy, 344, hh, TRUE);
+  };
+  place(g_emoji, y, 40); y += 44;
+  place(g_title, y, 30); y += 32;
+  place(g_subtitle, y, 20); y += 38;  // 20 + 18 gap
+  const bool err = g_statusError && GetWindowTextLengthW(g_status) > 0;
+  if (err) {
+    place(g_status, y, 44);
+    ShowWindow(g_status, SW_SHOW);
+    y += 56;
+  }
+  place(g_lblUser, y, 18); y += 18;
+  place(g_user, y, 30); y += 40;
+  place(g_lblPass, y, 18); y += 18;
+  place(g_pass, y, 30); y += 40;
+  place(g_lblRegion, y, 18); y += 18;
+  place(g_region, y, 200); y += 40;
+  place(g_lblPlatform, y, 18); y += 18;
+  place(g_platform, y, 200); y += 38;  // 30 + 8 gap
+  place(g_keep, y, 24); y += 36;  // 24 + 12 gap
+  if (g_loginBtn != nullptr) MoveWindow(g_loginBtn, x, y, 120, 34, TRUE);
+  y += 48;  // 34 + 14 gap
+  if (!err) {
+    if (GetWindowTextLengthW(g_status) > 0) {
+      place(g_status, y, 20);
+      ShowWindow(g_status, SW_SHOW);
+      y += 34;
+    } else {
+      ShowWindow(g_status, SW_HIDE);
+    }
+  }
+  g_sepY = y;
+  y += 13;  // separator line + 12 gap
+  if (g_proxyToggle != nullptr) MoveWindow(g_proxyToggle, x, y, 344, 24, TRUE);
+  y += 24;
+  const int pshow = g_proxyShown ? SW_SHOW : SW_HIDE;
+  ShowWindow(g_proxyLabel, pshow);
+  ShowWindow(g_proxy, pshow);
+  if (g_proxyShown) {
+    y += 6;
+    place(g_proxyLabel, y, 18); y += 18;
+    place(g_proxy, y, 200); y += 40;
+    const bool custom = ComboValue(g_proxy) == L"custom";
+    ShowWindow(g_proxyCustomLabel, custom ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_proxyCustom, custom ? SW_SHOW : SW_HIDE);
+    if (custom) {
+      place(g_proxyCustomLabel, y, 18); y += 18;
+      place(g_proxyCustom, y, 30); y += 40;
+    }
+    place(g_explainer, y, 54); y += 60;
+  } else {
+    ShowWindow(g_proxyCustomLabel, SW_HIDE);
+    ShowWindow(g_proxyCustom, SW_HIDE);
+  }
+  y += 10;
+  place(g_note, y, 54); y += 54;
+  g_cardRect.left = cardX;
+  g_cardRect.top = 36;
+  g_cardRect.right = cardX + 400;
+  g_cardRect.bottom = y + 24;  // bottom margin
+  InvalidateRect(g_mainWnd, nullptr, TRUE);
+}
+
 void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
   auto mkfont = [](int px, bool bold, const wchar_t *face) {
     return CreateFontW(px, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE,
