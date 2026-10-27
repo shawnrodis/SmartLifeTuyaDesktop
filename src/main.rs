@@ -836,6 +836,35 @@ fn cam_size_of(layout: &LayoutCfg, item_id: &str) -> CamSize {
 /// Tapo templates (the source selection is unchanged by size);
 /// only the pump resolution grows (480×270 → 960×540). A Wide tile
 /// uses the card's own selected quality, like the big player.
+
+/// Layout-debug logging (temporary debug build only): appends a line to
+/// `tuya-layout-debug.log` next to the exe, but only when the line for
+/// `key` CHANGED, so a ratcheting value shows up as a climbing series
+/// instead of a flood. Remove before any release.
+fn dbg_log_line(key: &str, line: String) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut m = map.lock().unwrap();
+    if m.get(key) != Some(&line) {
+        m.insert(key.to_string(), line.clone());
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let path = dir.join("tuya-layout-debug.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] {}", key, line);
+                }
+            }
+        }
+    }
+}
+
 fn tile_feed(cam: &Camera, size: CamSize) -> (String, usize, usize) {
     match size {
         CamSize::Normal => (tile_rtsp_url(cam), TILE_W, TILE_H),
@@ -6828,6 +6857,10 @@ impl App {
         let (min_w, gap) = if compact { (198.0, 10.0) } else { (238.0, 14.0) };
         let cols = (((avail + gap) / (min_w + gap)).floor() as usize).max(1);
         let card_w = (avail - (cols as f32 - 1.0) * gap) / cols as f32;
+        dbg_log_line(
+            "grid",
+            format!("sec={} avail={:.1} cols={} card_w={:.1}", sec.key, avail, cols, card_w),
+        );
         let display = self.display_ids(sec);
         if display.is_empty() {
             if self.editing {
@@ -6937,6 +6970,10 @@ impl App {
                         .push((sec.key.clone(), item_owned, alloc.response.rect));
                 }
             });
+            dbg_log_line(
+                &format!("row:{}", sig),
+                format!("row_h={:.1} actual_h={:.1}", row_h, actual_h),
+            );
             if row_h == 0.0 || actual_h > row_h + 0.5 {
                 self.row_heights.insert(sig, actual_h);
                 ui.ctx().request_repaint();
@@ -8853,6 +8890,16 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        dbg_log_line("build", "tuya-layout-debug winit-fix".to_string());
+        {
+            let ctx = ui.ctx();
+            let inner = ctx.input(|i| i.viewport().inner_rect);
+            let (w, h) = inner.map(|r| (r.width(), r.height())).unwrap_or((-1.0, -1.0));
+            dbg_log_line(
+                "viewport",
+                format!("inner={:.1}x{:.1} ppp={:.3}", w, h, ctx.pixels_per_point()),
+            );
+        }
         self.apply_style(ui.ctx());
         self.poll_net();
         // Tray + close behaviour (v1.2.1): poll tray events, turn a
