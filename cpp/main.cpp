@@ -90,44 +90,61 @@ void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
                            y, 400, 24, hwnd, reinterpret_cast<HMENU>(id),
                            hInstance, nullptr);
   };
-  label(72, L"Username");
-  g_user = edit(kIdUser, 94, ES_AUTOHSCROLL);
-  label(126, L"Password");
-  g_pass = edit(kIdPass, 148, ES_PASSWORD | ES_AUTOHSCROLL);
-  label(182, L"Region (where your account was registered)");
+  // "Sign in to Tuya" heads the form (egui hover text, Flutter heading).
+  {
+    HWND heading = CreateWindowExW(0, L"STATIC", L"Sign in to Tuya",
+                                  WS_CHILD | WS_VISIBLE, 16, 72, 400, 22,
+                                  hwnd, nullptr, hInstance, nullptr);
+    HFONT bold = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                             DEFAULT_PITCH, L"Segoe UI");
+    SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(bold), TRUE);
+  }
+  label(102, L"Smart Life / Tuya username");
+  g_user = edit(kIdUser, 124, ES_AUTOHSCROLL);
+  SendMessageW(g_user, EM_SETCUEBANNER, TRUE,
+               reinterpret_cast<LPARAM>(L"email or phone"));
+  label(156, L"Password");
+  g_pass = edit(kIdPass, 178, ES_PASSWORD | ES_AUTOHSCROLL);
+  SendMessageW(g_pass, EM_SETCUEBANNER, TRUE,
+               reinterpret_cast<LPARAM>(L"Your Smart Life password"));
+  label(212, L"Region (where your account was registered)");
   g_region = CreateWindowExW(0, L"COMBOBOX", L"",
                              WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 16,
-                             204, 400, 24, hwnd,
+                             234, 400, 24, hwnd,
                              reinterpret_cast<HMENU>(kIdRegion), hInstance,
                              nullptr);
   AddComboItem(g_region, L"United States (US)", L"1");
   AddComboItem(g_region, L"Europe (EU)", L"44");
   AddComboItem(g_region, L"China (CN)", L"86");
   SendMessageW(g_region, CB_SETCURSEL, 0, 0);
-  label(238, L"App platform");
+  label(268, L"App platform");
   g_platform = CreateWindowExW(0, L"COMBOBOX", L"",
                                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 16,
-                               260, 400, 24, hwnd,
+                               290, 400, 24, hwnd,
                                reinterpret_cast<HMENU>(kIdPlatform),
                                hInstance, nullptr);
   AddComboItem(g_platform, L"Smart Life", L"smart_life");
   AddComboItem(g_platform, L"Tuya Smart", L"tuya");
   SendMessageW(g_platform, CB_SETCURSEL, 0, 0);
   g_keep = CreateWindowExW(0, L"BUTTON", L"Keep me logged in on this device",
-                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 296,
+                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 16, 326,
                            400, 24, hwnd, reinterpret_cast<HMENU>(kIdKeep),
                            hInstance, nullptr);
   SendMessageW(g_keep, BM_SETCHECK, BST_CHECKED, 0);
   g_loginBtn = CreateWindowExW(0, L"BUTTON", L"Login",
                                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 16,
-                               330, 120, 30, hwnd,
+                               360, 120, 30, hwnd,
                                reinterpret_cast<HMENU>(kIdLoginBtn), hInstance,
                                nullptr);
   g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 16,
-                             372, 600, 40, hwnd,
+                             402, 600, 40, hwnd,
                              reinterpret_cast<HMENU>(kIdStatus), hInstance,
                              nullptr);
 }
+
+void StartLoginRequest(HWND hwnd, const std::string &req);
 
 void DoLogin(HWND hwnd) {
   if (g_loggingIn || g_core.login == nullptr) return;
@@ -141,21 +158,60 @@ void DoLogin(HWND hwnd) {
     SetStatus(L"Enter your username and password.");
     return;
   }
+  const std::string req = "{\"username\":\"" + core::JsonEscape(user) +
+                          "\",\"password\":\"" + core::JsonEscape(pass) +
+                          "\",\"region\":\"" + core::JsonEscape(region) +
+                          "\",\"platform\":\"" + core::JsonEscape(platform) +
+                          "\",\"keep\":" + (keep ? "true" : "false") + "}";
+  StartLoginRequest(hwnd, req);
   g_loggingIn = true;
   SetLoginEnabled(false);
   SetStatus(L"Signing in…");
+}
+
+void StartLoginRequest(HWND hwnd, const std::string &req) {
   // Network on a worker thread; result comes back as kMsgLoginDone
   // with a heap string the window procedure frees.
-  std::thread([hwnd, user, pass, region, platform, keep]() {
-    const std::string req = "{\"username\":\"" + core::JsonEscape(user) +
-                            "\",\"password\":\"" + core::JsonEscape(pass) +
-                            "\",\"region\":\"" + core::JsonEscape(region) +
-                            "\",\"platform\":\"" +
-                            core::JsonEscape(platform) +
-                            "\",\"keep\":" + (keep ? "true" : "false") + "}";
+  std::thread([hwnd, req]() {
     std::string *resp = new std::string(g_core.Call(g_core.login, req));
     PostMessageW(hwnd, kMsgLoginDone, 0, reinterpret_cast<LPARAM>(resp));
   }).detach();
+}
+
+// Prefill from saved config + silent re-login, like egui/Flutter on
+// launch. load_config returns presence markers plus the saved
+// user_name / country_code / platform (no password, no token).
+void PrefillAndSilentLogin(HWND hwnd) {
+  if (g_core.loadConfig == nullptr) return;
+  const std::string cfg = g_core.Call(g_core.loadConfig);
+  if (cfg.empty()) return;
+  // The markers live under "config": {"creds": {...}} in the core
+  // response; the flat helpers below search the whole string, which
+  // is enough for these three fields.
+  const std::string user = core::JsonString(cfg, "user_name");
+  const std::string region = core::JsonString(cfg, "country_code");
+  const std::string platform = core::JsonString(cfg, "platform");
+  if (!user.empty()) SetWindowTextW(g_user, core::Utf8ToWide(user).c_str());
+  auto selectCombo = [](HWND combo, const std::string &value) {
+    if (value.empty()) return;
+    const std::wstring wv = core::Utf8ToWide(value);
+    const int count = (int)SendMessageW(combo, CB_GETCOUNT, 0, 0);
+    for (int i = 0; i < count; i++) {
+      const std::wstring item = reinterpret_cast<const wchar_t *>(
+          SendMessageW(combo, CB_GETITEMDATA, i, 0));
+      if (item == wv) {
+        SendMessageW(combo, CB_SETCURSEL, i, 0);
+        break;
+      }
+    }
+  };
+  selectCombo(g_region, region);
+  selectCombo(g_platform, platform);
+  // Silent login only makes sense if something was saved; otherwise
+  // the core just answers no_saved_login and the form stays.
+  if (!user.empty() || !region.empty()) {
+    StartLoginRequest(hwnd, "{\"silent\":true}");
+  }
 }
 
 void OnLoginDone(const std::string &resp) {
@@ -251,6 +307,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
       640, nullptr, nullptr, hInstance, nullptr);
   if (hwnd == nullptr) return 1;
   CreateLoginControls(hwnd, hInstance);
+  PrefillAndSilentLogin(hwnd);
   ShowWindow(hwnd, nCmdShow);
   UpdateWindow(hwnd);
 
