@@ -6,11 +6,17 @@ not deleted and not published as v1.5.0.
 
 ## 1:1 rule (Shawn, 2026-10-27 — applies here in full)
 
-Looks and functionality must match the egui/Flutter app 1:1 as far as
-technically possible. A genuine gap is reported as a blocker, never
-silently dropped. That rule is why this is NOT a stock grey Win32 dialog
-app: the UI is custom-painted (dark Black theme by default, indigo accent
+Looks and functionality must match egui 1.4.0 1:1 as far as technically
+possible — 1.4.0 is the build that worked great (tag v1.4.0; verified
+by diff, v1.4.1 changed only the renderer Glow -> wgpu, no UI or
+features). A genuine gap is reported as a blocker, never silently
+dropped. That rule is why this is NOT a stock grey Win32 dialog app:
+the UI is custom-painted (dark Black theme by default, indigo accent
 #6366f1) to match the existing app's look, not the system default.
+EXCLUDED from 1:1: 1.4.0's window trailing and moving-to-another-monitor
+glitches. Those are egui bugs to fix with the native window, not
+behaviour to copy — smooth drag and clean monitor moves are pass/fail
+tests for every C++ milestone.
 
 ## Architecture: Rust core stays, C++ owns the window
 

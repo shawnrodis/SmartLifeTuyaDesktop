@@ -22,6 +22,7 @@ struct Core {
   NoArgFn version = nullptr;
   NoArgFn loadConfig = nullptr;
   JsonFn login = nullptr;
+  JsonFn saveConfig = nullptr;
   JsonFn refresh = nullptr;
   JsonFn control = nullptr;
   JsonFn buildSections = nullptr;
@@ -36,6 +37,8 @@ struct Core {
     loadConfig =
         reinterpret_cast<NoArgFn>(GetProcAddress(dll, "tuya_load_config"));
     login = reinterpret_cast<JsonFn>(GetProcAddress(dll, "tuya_login"));
+    saveConfig = reinterpret_cast<JsonFn>(
+        GetProcAddress(dll, "tuya_save_config"));
     refresh = reinterpret_cast<JsonFn>(GetProcAddress(dll, "tuya_refresh"));
     control = reinterpret_cast<JsonFn>(GetProcAddress(dll, "tuya_control"));
     buildSections = reinterpret_cast<JsonFn>(
