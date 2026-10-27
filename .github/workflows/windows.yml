@@ -21,6 +21,9 @@ jobs:
           flutter create --platforms=windows --project-name smartlife_tuya_desktop app
           Copy-Item -Force -Recurse lib/* app/lib/
           Copy-Item -Force pubspec.yaml app/pubspec.yaml
+          if (Test-Path assets/SmartLifeTuyaDesktop.ico) {
+            Copy-Item -Force assets/SmartLifeTuyaDesktop.ico app/windows/runner/resources/app_icon.ico
+          }
           # Window title: flutter create names the native window after the
           # project (smartlife_tuya_desktop) — replace it with the app name.
           $mainCpp = 'app/windows/runner/main.cpp'
