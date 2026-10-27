@@ -15,7 +15,13 @@ target_link_libraries(smartlife_tuya_desktop PRIVATE user32 gdi32 shell32)
 
 # Source files are UTF-8 (emoji, triangles, curly quotes in login
 # text). Without /utf-8, MSVC reads them in the ANSI codepage and
-# the login header renders as mojibake (the 2026-10-27 screenshot).
+# the login header renders as mojibake (the 2026-10-27 screenshots).
+# NOTE: this must be target_compile_options, not add_compile_options
+# after the target — directory options added after add_executable
+# do not reach the target, which is exactly how the first /utf-8
+# attempt silently failed to fix the mojibake. The literals are
+# also written as \u escapes now, so rendering no longer depends
+# on the flag alone.
 if(MSVC)
-  add_compile_options(/utf-8)
+  target_compile_options(smartlife_tuya_desktop PRIVATE /utf-8)
 endif()

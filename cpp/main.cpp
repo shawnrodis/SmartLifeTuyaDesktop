@@ -1,24 +1,24 @@
-// SmartLife Tuya Desktop — Windows C++ frontend.
+// SmartLife Tuya Desktop \u2014 Windows C++ frontend.
 //
 // 1:1 REFERENCE (Shawn, 2026-10-27): egui 1.4.0 (tag v1.4.0), the build
-// that worked great — NOT the Flutter port, and NOT v1.4.1 (verified
+// that worked great \u2014 NOT the Flutter port, and NOT v1.4.1 (verified
 // by diff: v1.4.0 -> v1.4.1 changed ONLY the renderer Glow -> wgpu,
 // no UI or features, so the 1.4.0 UI is the spec). Flutter is only a
 // secondary cross-check where egui is silent. Where this file differs
 // from 1.4.0, that is a bug to fix, never a shortcut to keep.
 // EXCLUDED from 1:1 on purpose: 1.4.0's window trailing and
 // moving-to-another-monitor glitches. Those are egui renderer/window
-// bugs, not features — the native Win32 window must drag smooth and
+// bugs, not features \u2014 the native Win32 window must drag smooth and
 // move monitors cleanly, and that is a pass/fail test, not a copy.
 //
 // Native Win32 window, custom-painted to match the app's Black theme
-// (black background, white text) — NOT a stock grey dialog. The Tuya
+// (black background, white text) \u2014 NOT a stock grey dialog. The Tuya
 // logic lives in the Rust core (tuya_core.dll), loaded at runtime via
 // cpp/core.h; this file owns only the window and controls.
 // Tokens/passwords never leave Rust (same presence-marker contract
 // as rust/README-API.md).
 //
-// Milestone 2: login view from egui view_login — card header, username,
+// Milestone 2: login view from egui view_login \u2014 card header, username,
 // password, region, platform, keep-me-logged-in, "Log in" button,
 // Connection/proxy settings, credentials note, error box, saved-config
 // prefill + silent re-login on launch.
@@ -32,7 +32,7 @@
 #define _UNICODE
 #include <windows.h>
 // EM_SETCUEBANNER (0x1507) is not declared by the headers on some
-// MSVC/SDK combos (build 40466037329 failed on it) — define it when
+// MSVC/SDK combos (build 40466037329 failed on it) \u2014 define it when
 // the SDK does not, instead of depending on header quirks.
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1507
@@ -247,7 +247,7 @@ void LayoutLogin() {
   };
   place(g_emoji, y, 40); y += 44;
   place(g_title, y, 30); y += 32;
-  place(g_subtitle, y, 20); y += 38;  // 20 + 18 gap
+  place(g_subtitle, y, 40); y += 58;  // 40 (2 lines) + 18 gap
   const bool err = g_statusError && GetWindowTextLengthW(g_status) > 0;
   if (err) {
     place(g_status, y, 44);
@@ -292,13 +292,13 @@ void LayoutLogin() {
       place(g_proxyCustomLabel, y, 18); y += 18;
       place(g_proxyCustom, y, 30); y += 40;
     }
-    place(g_explainer, y, 54); y += 60;
+    place(g_explainer, y, 72); y += 78;
   } else {
     ShowWindow(g_proxyCustomLabel, SW_HIDE);
     ShowWindow(g_proxyCustom, SW_HIDE);
   }
   y += 10;
-  place(g_note, y, 54); y += 54;
+  place(g_note, y, 72); y += 72;
   g_cardRect.left = cardX;
   g_cardRect.top = 36;
   g_cardRect.right = cardX + 400;
@@ -345,7 +345,7 @@ void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontField), TRUE);
     return h;
   };
-  g_emoji = CreateWindowExW(0, L"STATIC", L"🏠",
+  g_emoji = CreateWindowExW(0, L"STATIC", L"\U0001F3E0",
                             WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 0, 0,
                             hwnd, nullptr, hInstance, nullptr);
   SendMessageW(g_emoji, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontEmoji), TRUE);
@@ -382,7 +382,7 @@ void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
   // Egui default: unchecked fresh; checked only when saved creds exist
   // (set in PrefillAndSilentLogin).
   g_keep = CreateWindowExW(0, L"BUTTON", L"Keep me logged in on this device",
-                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0,
+                           WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0,
                            0, hwnd, reinterpret_cast<HMENU>(kIdKeep),
                            hInstance, nullptr);
   SendMessageW(g_keep, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontField), TRUE);
@@ -395,23 +395,23 @@ void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
                              hInstance, nullptr);
   SendMessageW(g_status, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontNote), TRUE);
   g_proxyToggle = CreateWindowExW(
-      0, L"BUTTON", L"Connection / proxy settings ▸",
+      0, L"BUTTON", L"Connection / proxy settings \u25B8",
       WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hwnd,
       reinterpret_cast<HMENU>(kIdProxyToggle), hInstance, nullptr);
   g_proxyLabel = label(0, L"CORS proxy", g_fontLabel);
   g_proxy = combo(kIdProxy);
-  AddComboItem(g_proxy, L"Auto — direct for US/EU, community proxy for CN (recommended)", L"auto");
+  AddComboItem(g_proxy, L"Auto \u2014 direct for US/EU, community proxy for CN (recommended)", L"auto");
   AddComboItem(g_proxy, L"SmartAtHome community proxy (all requests)", L"smartathome");
   AddComboItem(g_proxy, L"corsproxy.io (encoded URL)", L"corsproxy");
   AddComboItem(g_proxy, L"cors-anywhere.herokuapp.com (may need activation)", L"cors-anywhere");
-  AddComboItem(g_proxy, L"None — direct connection", L"none");
-  AddComboItem(g_proxy, L"Custom…", L"custom");
+  AddComboItem(g_proxy, L"None \u2014 direct connection", L"none");
+  AddComboItem(g_proxy, L"Custom\u2026", L"custom");
   SendMessageW(g_proxy, CB_SETCURSEL, 0, 0);
   g_proxyCustomLabel = label(0, L"Custom proxy prefix", g_fontLabel);
   g_proxyCustom = edit(kIdProxyCustom, ES_AUTOHSCROLL);
   SendMessageW(g_proxyCustom, EM_SETCUEBANNER, TRUE,
                reinterpret_cast<LPARAM>(
-                   L"https://my-proxy.example/ or …?url={url}"));
+                   L"https://my-proxy.example/ or \u2026?url={url}"));
   g_explainer = CreateWindowExW(
       0, L"STATIC",
       L"Most regions connect directly. A proxy is only needed where Tuya's servers don't accept direct browser/app calls (China region, some networks). See Help in Settings.",
@@ -419,7 +419,7 @@ void CreateLoginControls(HWND hwnd, HINSTANCE hInstance) {
   SendMessageW(g_explainer, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontNote), TRUE);
   g_note = CreateWindowExW(
       0, L"STATIC",
-      L"Your credentials are only sent to Tuya's own servers and are stored only in this app's config on this device (and only if you tick “Keep me logged in”). Nothing is sent anywhere else.",
+      L"Your credentials are only sent to Tuya's own servers and are stored only in this app's config on this device (and only if you tick \u201CKeep me logged in\u201D). Nothing is sent anywhere else.",
       WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, nullptr, hInstance, nullptr);
   SendMessageW(g_note, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontNote), TRUE);
   LayoutLogin();
@@ -446,7 +446,7 @@ void DoLogin(HWND hwnd) {
   StartLoginRequest(hwnd, req);
   g_loggingIn = true;
   SetLoginEnabled(false);
-  SetStatus(L"Signing in…", false);
+  SetStatus(L"Signing in\u2026", false);
 }
 
 void StartLoginRequest(HWND hwnd, const std::string &req) {
@@ -460,7 +460,7 @@ void StartLoginRequest(HWND hwnd, const std::string &req) {
 
 // Prefill from saved config + silent re-login, like egui on launch.
 // load_config returns the saved user_name / country_code / platform
-// (no password, no token — see the gap note at the top of this file).
+// (no password, no token \u2014 see the gap note at the top of this file).
 void PrefillAndSilentLogin(HWND hwnd) {
   if (g_core.loadConfig == nullptr) return;
   const std::string cfg = g_core.Call(g_core.loadConfig);
@@ -472,7 +472,7 @@ void PrefillAndSilentLogin(HWND hwnd) {
   const std::string proxyCustom = core::JsonString(cfg, "proxy_custom");
   if (!user.empty()) {
     SetWindowTextW(g_user, core::Utf8ToWide(user).c_str());
-    // Saved creds exist → egui checks Keep me logged in.
+    // Saved creds exist \u2192 egui checks Keep me logged in.
     SendMessageW(g_keep, BM_SETCHECK, BST_CHECKED, 0);
   }
   SelectComboValue(g_region, region);
@@ -491,7 +491,7 @@ void OnLoginDone(const std::string &resp) {
   g_loggingIn = false;
   SetLoginEnabled(true);
   if (resp.empty()) {
-    SetStatus(L"Login failed — no response from the core.", true);
+    SetStatus(L"Login failed \u2014 no response from the core.", true);
     return;
   }
   if (core::JsonBool(resp, "ok", false)) {
@@ -500,7 +500,7 @@ void OnLoginDone(const std::string &resp) {
   } else {
     std::string err = core::JsonString(resp, "error");
     if (err.empty()) {
-      err = "Login failed — check username, password and region.";
+      err = "Login failed \u2014 check username, password and region.";
     }
     SetStatus(core::Utf8ToWide(err), true);
   }
@@ -579,6 +579,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         return TRUE;
       }
+      if (dis->CtlID == kIdKeep) {
+        HBRUSH fill = g_cardBrush != nullptr ? g_cardBrush : g_blackBrush;
+        FillRect(dis->hDC, &dis->rcItem, fill);
+        const int top = dis->rcItem.top + (dis->rcItem.bottom - dis->rcItem.top - 16) / 2;
+        RECT box = {dis->rcItem.left, top, dis->rcItem.left + 16, top + 16};
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x8b, 0x94, 0xa7));
+        HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+        HGDIOBJ oldBrush = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+        Rectangle(dis->hDC, box.left, box.top, box.right, box.bottom);
+        SelectObject(dis->hDC, oldPen);
+        SelectObject(dis->hDC, oldBrush);
+        DeleteObject(pen);
+        if (SendMessageW(dis->hwndItem, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+          SetBkMode(dis->hDC, TRANSPARENT);
+          SetTextColor(dis->hDC, RGB(0xe7, 0xeb, 0xf2));
+          if (g_fontField != nullptr) SelectObject(dis->hDC, g_fontField);
+          DrawTextW(dis->hDC, L"\u2713", 1, &box, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, RGB(0xe7, 0xeb, 0xf2));
+        if (g_fontField != nullptr) SelectObject(dis->hDC, g_fontField);
+        RECT tr = dis->rcItem;
+        tr.left += 24;
+        wchar_t text[128];
+        GetWindowTextW(dis->hwndItem, text, 128);
+        DrawTextW(dis->hDC, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        return TRUE;
+      }
       return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
     case WM_CTLCOLORSTATIC:
@@ -609,6 +637,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       const int code = HIWORD(wParam);
       if (id == kIdLoginBtn && code == BN_CLICKED) {
         DoLogin(hwnd);
+      } else if (id == kIdKeep && code == BN_CLICKED) {
+        const bool checked =
+            SendMessageW(g_keep, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        SendMessageW(g_keep, BM_SETCHECK, checked ? BST_UNCHECKED : BST_CHECKED, 0);
       } else if (id == kIdProxyToggle && code == BN_CLICKED) {
         ToggleProxy();
       } else if (id == kIdProxy && code == CBN_SELCHANGE) {
@@ -651,7 +683,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   wc.lpfnWndProc = WndProc;
   wc.hInstance = hInstance;
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-  // Icon from the embedded resource (cpp/app.rc) — the taskbar icon.
+  // Icon from the embedded resource (cpp/app.rc) \u2014 the taskbar icon.
   wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
   wc.lpszClassName = kClassName;
   wc.hbrBackground = g_blackBrush;
@@ -660,7 +692,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   HWND hwnd = CreateWindowExW(
       0, kClassName, kWindowTitle,
       WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 960,
-      880, nullptr, nullptr, hInstance, nullptr);
+      920, nullptr, nullptr, hInstance, nullptr);
   if (hwnd == nullptr) return 1;
   g_mainWnd = hwnd;
   CreateLoginControls(hwnd, hInstance);
