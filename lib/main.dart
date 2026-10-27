@@ -59,8 +59,24 @@ import 'theme.dart';
 /// mode applies to every launch (see _applyLaunchWindow).
 String _argvLaunchMode = 'normal';
 
+void _diagLog(String msg) {
+  try {
+    final f = File(
+        'C:\\Users\\Public\\SmartLifeTuyaDesktop-diag.log');
+    f.writeAsStringSync(
+        '${DateTime.now().toIso8601String()} $msg\n',
+        mode: FileMode.append);
+  } catch (_) {}
+}
+
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+  _diagLog('main start args=$args');
+  FlutterError.onError = (details) {
+    _diagLog('FLUTTER ERROR: ${details.exceptionAsString()}');
+    _diagLog('STACK: ${details.stack}');
+    FlutterError.presentError(details);
+  };
   if (args.contains('--minimized')) {
     _argvLaunchMode = 'minimized';
   } else if (args.contains('--maximized')) {
@@ -70,7 +86,10 @@ Future<void> main(List<String> args) async {
   // window is shown, so close interception works from the start.
   try {
     await windowManager.ensureInitialized();
-  } catch (_) {}
+    _diagLog('windowManager ok');
+  } catch (e) {
+    _diagLog('windowManager FAIL: $e');
+  }
   // Single-instance gate: called exactly once, before runApp.
   // On secondary the Rust acquire already signalled the primary
   // (Windows event / Unix show-request file), so this process
@@ -79,10 +98,14 @@ Future<void> main(List<String> args) async {
   // as before) — a missing core must not brick the app launch.
   try {
     final role = RustBridge.singleInstance();
+    _diagLog('singleInstance role=${role['role']}');
     if (role['role'] == 'secondary') {
       exit(0);
     }
-  } catch (_) {}
+  } catch (e) {
+    _diagLog('singleInstance FAIL: $e');
+  }
+  _diagLog('runApp');
   runApp(const TuyaApp());
 }
 
@@ -331,14 +354,17 @@ class _HomePageState extends State<HomePage> with WindowListener {
   }
 
   Future<void> _init() async {
+    _diagLog('init start');
     try {
       final res = RustBridge.loadConfig();
+      _diagLog('loadConfig ok=${res['ok']}');
       if (res['ok'] == true && res['config'] is Map<String, dynamic>) {
         _config = res['config'] as Map<String, dynamic>;
       } else {
         _config = _defaultConfig();
       }
     } catch (e) {
+      _diagLog('loadConfig FAIL: $e');
       // The Rust core is not built yet (or the library is absent).
       // The UI still renders so the gap is visible, never hidden.
       _bridgeError = 'Rust core unavailable: $e';
@@ -1307,8 +1333,15 @@ class _HomePageState extends State<HomePage> with WindowListener {
 
   // ================= scaffold =================
 
+  bool _buildLogged = false;
+
   @override
   Widget build(BuildContext context) {
+    if (!_buildLogged) {
+      _buildLogged = true;
+      _diagLog(
+          'build first configLoaded=$_configLoaded view=$_view loggedIn=$_loggedIn bridgeError=$_bridgeError');
+    }
     final pal = _pal;
     Widget body;
     if (!_configLoaded) {
