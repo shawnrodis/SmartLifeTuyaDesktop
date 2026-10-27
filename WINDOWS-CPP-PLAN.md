@@ -74,6 +74,10 @@ Mac egui is already rock solid and needs no feature work. Its only
 change is a version bump to match Windows: when Windows C++ ships as
 v1.5.0, Mac gets a v1.5.0 release from the same egui code on `main`
 with only the version strings changed. No Mac Flutter/C++ port.
+Correction (Shawn, 2026-10-27, verified against GitHub releases):
+Mac's latest released version is 1.4.0 — v1.4.1 shipped a Windows
+setup exe only, no Mac DMG. So the Mac bump is 1.4.0 → 1.5.0, and
+"latest release v1.4.1" must never be read as a Mac version.
 
 ## What is NOT happening
 
