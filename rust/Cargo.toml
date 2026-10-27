@@ -1,0 +1,36 @@
+[package]
+name = "tuya_core"
+version = "1.5.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Rust core for SmartLifeTuyaDesktop (Flutter UI edition): config, Tuya API, device/section model, camera pumps, tray/autostart — no UI framework"
+
+[lib]
+name = "tuya_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = "0.19"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+fs2 = "0.4"
+
+[profile.release]
+opt-level = 3
