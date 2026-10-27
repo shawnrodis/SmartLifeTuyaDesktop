@@ -329,6 +329,16 @@ struct Prefs {
     /// "maximized" — carried as a flag in the Run command.
     #[serde(default = "default_launch_mode")]
     launch_mode: String,
+    /// Monitor the window was last on (v1.5.0): the OS device
+    /// identity ("\\.\DISPLAY2") of the display the window
+    /// most recently sat on, updated whenever the window moves
+    /// monitors. IDENTITY only — never geometry — so a restore
+    /// can never land a window off-screen (the v1.2.5 placement
+    /// memory's failure mode). Read ONLY on a Maximized launch:
+    /// the app reopens maximized on this display when it still
+    /// exists. "" = never recorded yet.
+    #[serde(default)]
+    last_monitor_device: String,
     /// Keep running in the system tray when the window is closed
     /// (v1.2.1) instead of quitting.
     #[serde(default)]
@@ -374,6 +384,7 @@ impl Default for Prefs {
             ffmpeg_path: String::new(),
             start_with_windows: false,
             launch_mode: default_launch_mode(),
+            last_monitor_device: String::new(),
             close_to_tray: false,
             tray_notice_shown: false,
         }
@@ -1125,7 +1136,7 @@ const CLOSE_TO_TRAY_LABEL: &str =
     "Keep running in the menu bar when the window is closed";
 
 #[cfg(not(target_os = "macos"))]
-const AUTOSTART_HELP: &str = "Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. The “Launch as” choice applies to every launch of the app — autostart, Start Menu, and shortcuts alike — not just the Windows-startup one; a launch that carries its own --minimized or --maximized flag (as the autostart entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a Windows-app feature; the web edition has no equivalent.";
+const AUTOSTART_HELP: &str = "Start with Windows uses the current-user registry Run key — no administrator rights needed, and OFF means no autostart entry exists at all. The “Launch as” choice applies to every launch of the app — autostart, Start Menu, and shortcuts alike — not just the Windows-startup one; a launch that carries its own --minimized or --maximized flag (as the autostart entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the notification area by the Windows clock, and clicking the icon (or “Open” on its right-click menu) brings the window back. With “Keep running in the system tray” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the tray icon's right-click menu. The tray icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. When “Maximized” is chosen, the app reopens maximized on the monitor it was last on; if that display is no longer connected, it opens maximized where Windows puts it. This panel is a Windows-app feature; the web edition has no equivalent.";
 
 #[cfg(target_os = "macos")]
 const AUTOSTART_HELP: &str = "Start at login uses a per-user LaunchAgent in ~/Library/LaunchAgents — no administrator rights needed, and OFF means no LaunchAgent file exists at all. The “Launch as” choice applies to every launch of the app — login, Finder, and Dock alike — not just the login one; a launch that carries its own --minimized or --maximized flag (as the LaunchAgent entry does) overrides it for that launch only. “Minimized (to tray)” starts the app hidden: its icon sits in the menu bar at the top of the screen, and clicking the icon (or “Open” on its menu) brings the window back. With “Keep running in the menu bar” on, closing the window hides it instead of quitting — device refresh and camera previews keep running in the background — and Quit lives on the icon's menu. The icon appears when the app starts minimized or while close-to-tray is on, and then stays for the session. Logging out doesn't quit the app either way. This panel is a native-app feature; the web edition has no equivalent.";
@@ -1466,6 +1477,9 @@ fn snap_next(phase: SnapPhase, f: SnapFacts, attempts: u8) -> (SnapPhase, SnapAc
 /// advanced per frame by App::advance_snap, dropped on success,
 /// failure or timeout. Never persisted.
 struct SnapJob {
+    /// Silent job (v1.5.0): a startup monitor restore, not a
+    /// menu click — it finishes and fails without toasts.
+    silent: bool,
     target: MonitorInfo,
     phase: SnapPhase,
     attempts: u8,
@@ -4276,9 +4290,20 @@ struct App {
     /// relaunch can neither flash nor stick open.
     launch_hidden_pending: bool,
     /// In-flight snap-to-monitor job (v1.3.1): created by a
-    /// Monitor-menu click, advanced one step per frame by
+    /// Monitor-menu click — or, silently, by the maximized-launch
+    /// monitor restore (v1.5.0) — advanced one step per frame by
     /// handle_window_chrome (see advance_snap), never persisted.
     snap_job: Option<SnapJob>,
+    /// One-shot maximized-launch monitor check (v1.5.0): once
+    /// true, the startup restore has run for this process (armed
+    /// a silent snap or decided none was needed) and never runs
+    /// again.
+    startup_monitor_checked: bool,
+    /// HMONITOR the window was last seen on (Windows; 0 =
+    /// unknown yet) — the remember side of the maximized-launch
+    /// monitor feature. Compared every frame; a change persists
+    /// the new display's device identity.
+    last_seen_monitor: isize,
     // rate-limit backoff (v1.2.0): while set, autorefresh skips
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
@@ -4464,6 +4489,8 @@ impl App {
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
             snap_job: None,
+            startup_monitor_checked: false,
+            last_seen_monitor: 0,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -5392,6 +5419,78 @@ impl App {
         }
     }
 
+    /// One-shot maximized-launch monitor restore (v1.5.0,
+    /// Windows): on the first frame, if this launch is Maximized
+    /// and a monitor was remembered, and that display still
+    /// exists and is NOT the one the window opened on, start a
+    /// SILENT snap to it — the same restore -> physical-pixel
+    /// move -> verify -> maximize machine as a menu snap, so
+    /// the end state is maximized on a live monitor by OS
+    /// construction. No geometry is stored or restored, and a
+    /// missing display is a no-op, so the v1.2.5 off-screen
+    /// failure mode cannot recur.
+    #[cfg(target_os = "windows")]
+    fn maybe_restore_startup_monitor(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.startup_monitor_checked {
+            return;
+        }
+        self.startup_monitor_checked = true;
+        if self.launch_mode != LaunchMode::Maximized || self.snap_job.is_some() {
+            return;
+        }
+        let saved = self.cfg.prefs.last_monitor_device.clone();
+        if saved.is_empty() {
+            return;
+        }
+        let Some(hwnd) = main_hwnd(frame) else {
+            return;
+        };
+        let monitors = enumerate_monitors();
+        let Some(target) = monitors.iter().find(|m| m.device == saved) else {
+            return;
+        };
+        if win32_window_monitor(hwnd) == target.handle {
+            return;
+        }
+        self.snap_job = Some(SnapJob {
+            silent: true,
+            target: target.clone(),
+            phase: SnapPhase::LeaveStates,
+            attempts: 0,
+            deadline: Instant::now() + SNAP_TIMEOUT,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Remember which monitor the window is on (v1.5.0,
+    /// Windows): called every frame from handle_window_chrome
+    /// while no snap is in flight. A changed HMONITOR resolves
+    /// to its device identity and persists it — continuously, so
+    /// even a crash or forced kill leaves the right monitor
+    /// remembered. Never runs while a snap job exists: a move in
+    /// flight would otherwise record the monitor being left.
+    #[cfg(target_os = "windows")]
+    fn remember_window_monitor(&mut self, frame: &eframe::Frame) {
+        if self.snap_job.is_some() {
+            return;
+        }
+        let Some(hwnd) = main_hwnd(frame) else {
+            return;
+        };
+        let cur = win32_window_monitor(hwnd);
+        if cur == 0 || cur == self.last_seen_monitor {
+            return;
+        }
+        self.last_seen_monitor = cur;
+        let monitors = enumerate_monitors();
+        if let Some(m) = monitors.iter().find(|m| m.handle == cur) {
+            if self.cfg.prefs.last_monitor_device != m.device {
+                self.cfg.prefs.last_monitor_device = m.device.clone();
+                save_config(&self.cfg);
+            }
+        }
+    }
+
     /// Snap to monitor: act on a display chosen in the header
     /// menu. The list is RE-ENUMERATED here, at click time — a
     /// display unplugged since the menu opened turns the click
@@ -5410,6 +5509,7 @@ impl App {
             return;
         };
         self.snap_job = Some(SnapJob {
+            silent: false,
             target: m.clone(),
             phase: SnapPhase::LeaveStates,
             attempts: 0,
@@ -5427,11 +5527,12 @@ impl App {
     /// maximizes — the two things the v1.3.0 burst never did.
     fn advance_snap(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let Some(job) = &self.snap_job else { return };
-        let (phase, attempts, target, deadline) = (
+        let (phase, attempts, target, deadline, silent) = (
             job.phase,
             job.attempts,
             job.target.clone(),
             job.deadline,
+            job.silent,
         );
         let Some(hwnd) = main_hwnd(frame) else {
             ctx.request_repaint();
@@ -5461,15 +5562,19 @@ impl App {
             SnapAction::MaximizeAndFinish => {
                 win32_maximize_window(hwnd);
                 self.snap_job = None;
-                self.toast(format!("Snapped to {}", target.name), false);
+                if !silent {
+                    self.toast(format!("Snapped to {}", target.name), false);
+                }
                 return;
             }
             SnapAction::Fail => {
                 self.snap_job = None;
-                self.toast(
-                    format!("Couldn't move to {} — window left as-is", target.name),
-                    true,
-                );
+                if !silent {
+                    self.toast(
+                        format!("Couldn't move to {} — window left as-is", target.name),
+                        true,
+                    );
+                }
                 return;
             }
         }
@@ -5541,6 +5646,16 @@ impl App {
         // Snap to monitor (v1.3.1): advance an in-flight snap
         // one step per frame — the HWND was just published
         // above, fresh for this frame.
+        // Maximized-launch monitor memory (v1.5.0, Windows):
+        // one-shot restore check, then the every-frame remember
+        // side — in this order, so the first frame never records
+        // the monitor the window merely opened on over the one
+        // it should move to (the remember side skips while a
+        // snap job is in flight).
+        #[cfg(target_os = "windows")]
+        self.maybe_restore_startup_monitor(ctx, frame);
+        #[cfg(target_os = "windows")]
+        self.remember_window_monitor(frame);
         self.advance_snap(ctx, frame);
         // Focus regained (clicking back into the window) is a
         // backoff reset trigger for camera feeds (v1.2.2).
@@ -9038,7 +9153,11 @@ fn main() -> eframe::Result<()> {
     // restored in v1.3.0): the v1.2.5 placement memory was
     // field-rejected — a restored window could land slightly
     // off-screen with its title bar out of reach — so no saved
-    // geometry is read or written anywhere. (The snap-to-monitor
+    // geometry is read or written anywhere — the one exception
+    // (v1.5.0) is a monitor IDENTITY, never a rectangle: on a
+    // Maximized launch the window is moved to the remembered
+    // display by the snap machine and ends maximized, so the
+    // off-screen failure cannot recur. (The snap-to-monitor
     // header button is the supported way to place the window:
     // it acts at click time only and lets the OS own the result.)
     let mut viewport = egui::ViewportBuilder::default()
@@ -9503,7 +9622,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.4.0");
+        assert_eq!(APP_VERSION, "1.4.1");
     }
 
     #[test]
@@ -10300,7 +10419,7 @@ mod tests {
     /// The viewport commands one headless frame of the launch
     /// hold produces (drives the REAL App::enforce_launch_hold).
     fn hold_frame_cmds(app: &App, ctx: &egui::Context) -> Vec<egui::ViewportCommand> {
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
+        let out = ctx.run_ui(egui::RawInput::default(), |ctx| {
             app.enforce_launch_hold(ctx)
         });
         out.viewport_output
@@ -10347,7 +10466,7 @@ mod tests {
         // A real Show action (tray Open / single-instance summon
         // both land in show_from_tray): the window is commanded
         // visible and the hold is released.
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
+        let out = ctx.run_ui(egui::RawInput::default(), |ctx| {
             app.show_from_tray(ctx)
         });
         let cmds = out
@@ -10808,6 +10927,8 @@ mod tests {
             launch_mode: LaunchMode::Normal,
             launch_hidden_pending: false,
             snap_job: None,
+            startup_monitor_checked: false,
+            last_seen_monitor: 0,
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -10869,7 +10990,7 @@ mod tests {
                 time: Some(10.0 + i as f64 * 0.05),
                 ..Default::default()
             };
-            let out = ctx.run(input, |ctx| {
+            let out = ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
@@ -10914,7 +11035,7 @@ mod tests {
                 time: Some(30.0 + i as f64 * 0.05),
                 ..Default::default()
             };
-            out = Some(ctx.run(input, |ctx| {
+            out = Some(ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
@@ -11226,7 +11347,7 @@ mod tests {
             events,
             ..Default::default()
         };
-        ctx.run(input, |ctx| {
+        ctx.run_ui(input, |ctx| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new())
                 .show(ctx, |ui| app.view_dashboard(ui));
