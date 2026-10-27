@@ -34,7 +34,7 @@ env:
 
 jobs:
   build-dmg:
-    runs-on: macos-15
+    runs-on: macos-14
     steps:
       - name: Resolve the release tag
         id: rel
