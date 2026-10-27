@@ -541,6 +541,11 @@ pub extern "C" fn tuya_update_check(req_json: *const c_char) -> *mut c_char {
         let bytes = match client.get(&asset_url).header("User-Agent", "SmartLifeTuyaDesktop").send().and_then(|r| r.bytes()) {
             Ok(b) => b, Err(e) => return err_json(format!("download failed: {}", e)),
         };
+        // Verify before returning a path: an error page or truncated
+        // file must never be run as an installer.
+        if bytes.is_empty() || (std::env::consts::OS == "windows" && (bytes.len() < 2 || bytes[0] != 0x4D || bytes[1] != 0x5A)) {
+            return err_json("download verification failed");
+        }
         if std::fs::write(&dest, &bytes).is_err() { return err_json("could not write downloaded file"); }
         return json_to_cstring(json!({"ok": true, "downloaded_path": dest.to_string_lossy().into_owned(), "asset_name": want}));
     }
@@ -551,7 +556,26 @@ pub extern "C" fn tuya_update_check(req_json: *const c_char) -> *mut c_char {
         let file_name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if !file_name.starts_with("SmartLifeTuyaDesktop-") { return err_json("downloaded file name did not verify"); }
         #[cfg(target_os = "windows")]
-        { let _ = std::process::Command::new(&path).spawn(); return json_to_cstring(json!({"ok": true})); }
+        {
+            // Delayed launcher: running the installer directly would
+            // try to replace the still-running app exe, and Dart
+            // exits immediately after this call. A .bat that waits
+            // 2s, runs the installer, then deletes itself survives
+            // the app exit and runs after the app is fully closed.
+            let clean = path.replace('"', "");
+            let mut bat_text = String::from("@echo off\r\n");
+            bat_text.push_str("timeout /t 2 /nobreak >nul\r\n");
+            bat_text.push_str("start \"\" \"");
+            bat_text.push_str(&clean);
+            bat_text.push_str("\"\r\n");
+            bat_text.push_str("del \"%~f0\"\r\n");
+            let mut bat = std::env::temp_dir();
+            bat.push("SmartLifeTuyaDesktop-update.bat");
+            let ok = std::fs::write(&bat, bat_text).is_ok()
+                && std::process::Command::new("cmd").arg("/C").arg(bat.to_string_lossy().as_ref()).spawn().is_ok();
+            if !ok { return err_json("installer launch failed"); }
+            return json_to_cstring(json!({"ok": true}));
+        }
         #[cfg(target_os = "macos")]
         { let _ = std::process::Command::new("open").arg(&path).spawn(); return json_to_cstring(json!({"ok": true})); }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
