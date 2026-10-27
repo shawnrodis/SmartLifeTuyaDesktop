@@ -1,6 +1,6 @@
 [package]
 name = "smartlife-tuya-desktop"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "SmartLife & Tuya Desktop - a clean dashboard for Smart Life / Tuya devices (native desktop editions: Windows & macOS)"

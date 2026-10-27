@@ -132,6 +132,21 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.5.0
+
+- **Fixed: dragging the window between monitors.** On a mixed-DPI desk
+  (for example a 1440p landscape monitor beside a 4K portrait one) the
+  window used to grow and get stuck on the wrong monitor mid-drag.
+  It now follows the drag cleanly onto the other monitor. (The
+  underlying interface toolkit was also updated, which fixed a
+  related bug where dashboard tiles slowly grew taller on their own.)
+- **New: Maximized launches remember their monitor.** If Settings →
+  Startup & background → Launch as is set to Maximized, the app
+  reopens maximized on the monitor it was last on — after a reboot,
+  for example — instead of wherever Windows happens to put it. If
+  that display is no longer connected, it just opens maximized where
+  Windows puts it. Normal and minimized launches are unchanged.
+
 ## What's new in 1.4.0
 
 - **New: a native macOS app joins every release.** Each release now

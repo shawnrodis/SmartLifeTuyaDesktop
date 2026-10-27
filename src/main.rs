@@ -9622,7 +9622,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.4.1");
+        assert_eq!(APP_VERSION, "1.5.0");
     }
 
     #[test]
