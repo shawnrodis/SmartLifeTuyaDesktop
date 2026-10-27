@@ -83,6 +83,21 @@ HBRUSH g_cardBrush = nullptr;
 RECT g_cardRect = {};
 int g_sepY = -1;
 
+
+// Set the Keep-me-logged-in check state AND repaint it. An
+// owner-drawn button does not redraw itself on BM_SETCHECK, so
+// without the InvalidateRect the box kept showing its old state:
+// prefill could set CHECKED while the box still looked empty, and
+// a click that flipped the state left the visual unchanged — the
+// user saw a button that "doesn't work", and a click meant to turn
+// keep ON actually turned it OFF (wiping saved creds on login).
+void SetKeepChecked(bool checked) {
+  if (g_keep == nullptr) return;
+  SendMessageW(g_keep, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+  InvalidateRect(g_keep, nullptr, TRUE);
+  UpdateWindow(g_keep);
+}
+
 void LayoutLogin();
 
 void StartLoginRequest(HWND hwnd, const std::string &req);
@@ -247,7 +262,7 @@ void LayoutLogin() {
   };
   place(g_emoji, y, 40); y += 44;
   place(g_title, y, 30); y += 32;
-  place(g_subtitle, y, 40); y += 58;  // 40 (2 lines) + 18 gap
+  place(g_subtitle, y, 44); y += 62;  // 44 (2 lines) + 18 gap
   const bool err = g_statusError && GetWindowTextLengthW(g_status) > 0;
   if (err) {
     place(g_status, y, 44);
@@ -298,7 +313,7 @@ void LayoutLogin() {
     ShowWindow(g_proxyCustom, SW_HIDE);
   }
   y += 10;
-  place(g_note, y, 72); y += 72;
+  place(g_note, y, 88); y += 88;
   g_cardRect.left = cardX;
   g_cardRect.top = 36;
   g_cardRect.right = cardX + 400;
@@ -473,7 +488,7 @@ void PrefillAndSilentLogin(HWND hwnd) {
   if (!user.empty()) {
     SetWindowTextW(g_user, core::Utf8ToWide(user).c_str());
     // Saved creds exist \u2192 egui checks Keep me logged in.
-    SendMessageW(g_keep, BM_SETCHECK, BST_CHECKED, 0);
+    SetKeepChecked(true);
   }
   SelectComboValue(g_region, region);
   SelectComboValue(g_platform, platform);
@@ -640,7 +655,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       } else if (id == kIdKeep && code == BN_CLICKED) {
         const bool checked =
             SendMessageW(g_keep, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        SendMessageW(g_keep, BM_SETCHECK, checked ? BST_UNCHECKED : BST_CHECKED, 0);
+        SetKeepChecked(!checked);
       } else if (id == kIdProxyToggle && code == BN_CLICKED) {
         ToggleProxy();
       } else if (id == kIdProxy && code == CBN_SELCHANGE) {
@@ -692,7 +707,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
   HWND hwnd = CreateWindowExW(
       0, kClassName, kWindowTitle,
       WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 960,
-      920, nullptr, nullptr, hInstance, nullptr);
+      940, nullptr, nullptr, hInstance, nullptr);
   if (hwnd == nullptr) return 1;
   g_mainWnd = hwnd;
   CreateLoginControls(hwnd, hInstance);
