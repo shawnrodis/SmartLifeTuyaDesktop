@@ -1,0 +1,49 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main, flutter-rust]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Build Rust core (tuya_core.dll)
+        run: cargo build --release --manifest-path rust/Cargo.toml
+      - name: Generate Windows runner and use repo app code
+        run: |
+          flutter create --platforms=windows --project-name smartlife_tuya_desktop app
+          Copy-Item -Force -Recurse lib/* app/lib/
+          Copy-Item -Force pubspec.yaml app/pubspec.yaml
+      - name: Build Windows release
+        run: |
+          cd app
+          flutter pub get
+          flutter build windows --release
+      - name: Copy Rust core DLL into the Release folder
+        run: |
+          Copy-Item -Force rust/target/release/tuya_core.dll app/build/windows/x64/runner/Release/
+          if (-not (Test-Path 'app/build/windows/x64/runner/Release/tuya_core.dll')) { throw 'tuya_core.dll missing — Rust core build failed, do not ship a pure-Dart build' }
+          Get-ChildItem app/build/windows/x64/runner/Release/
+      - name: Zip the Release folder (exe alone will not run)
+        run: |
+          Compress-Archive -Path app/build/windows/x64/runner/Release/* -DestinationPath SmartLifeTuyaDesktop-Windows.zip
+      - name: Build NSIS installer
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y }
+          $env:PATH += ';C:\Program Files (x86)\NSIS'
+          Copy-Item -Recurse -Force app/build/windows/x64/runner/Release installer/staging
+          cd installer
+          makensis installer.nsi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smartlife-tuya-windows
+          path: |
+            SmartLifeTuyaDesktop-Windows.zip
+            installer/SmartLifeTuyaDesktop-Setup-v1.5.0.exe
