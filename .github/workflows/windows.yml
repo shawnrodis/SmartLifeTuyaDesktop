@@ -22,9 +22,13 @@ jobs:
       - name: Install MinGW (windres + GNU linker)
         run: |
           choco install mingw -y
-          $windres = "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin\windres.exe"
-          if (-not (Test-Path $windres)) { throw "windres not found after mingw install" }
-          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" >> $env:GITHUB_PATH
+          # The chocolatey mingw package's install dir varies by
+          # version (16.1.0 lands under C:\ProgramData\mingw64),
+          # so locate windres instead of assuming a path — a
+          # hardcoded path failed the first run.
+          $windres = Get-ChildItem -Path C:\ProgramData\mingw64 -Recurse -Filter windres.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $windres) { throw "windres not found after mingw install" }
+          $windres.Directory.FullName >> $env:GITHUB_PATH
       - name: Build the egui app (Windows, GNU target)
         run: cargo build --release --target x86_64-pc-windows-gnu
       - name: Build NSIS installer
