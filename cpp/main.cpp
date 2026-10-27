@@ -37,7 +37,11 @@ std::wstring ToWide(const std::string &s) {
 
 void LoadCoreVersion() {
   // DLL sits next to the exe, exactly like the egui/Flutter installs.
+  // Try the exact runtime name first; a test delivery once renamed it
+  // to tuya_core-cpp-test.dll and the load failed on the name alone,
+  // so fall back to that name rather than reporting "not found".
   HMODULE core = LoadLibraryW(L"tuya_core.dll");
+  if (core == nullptr) core = LoadLibraryW(L"tuya_core-cpp-test.dll");
   if (core == nullptr) {
     g_coreVersion = L"tuya_core.dll not found next to the exe";
     return;
