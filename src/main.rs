@@ -837,34 +837,6 @@ fn cam_size_of(layout: &LayoutCfg, item_id: &str) -> CamSize {
 /// only the pump resolution grows (480×270 → 960×540). A Wide tile
 /// uses the card's own selected quality, like the big player.
 
-/// Layout-debug logging (temporary debug build only): appends a line to
-/// `tuya-layout-debug.log` next to the exe, but only when the line for
-/// `key` CHANGED, so a ratcheting value shows up as a climbing series
-/// instead of a flood. Remove before any release.
-fn dbg_log_line(key: &str, line: String) {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static LAST: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut m = map.lock().unwrap();
-    if m.get(key) != Some(&line) {
-        m.insert(key.to_string(), line.clone());
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let path = dir.join("tuya-layout-debug.log");
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] {}", key, line);
-                }
-            }
-        }
-    }
-}
-
 fn tile_feed(cam: &Camera, size: CamSize) -> (String, usize, usize) {
     match size {
         CamSize::Normal => (tile_rtsp_url(cam), TILE_W, TILE_H),
@@ -6857,10 +6829,6 @@ impl App {
         let (min_w, gap) = if compact { (198.0, 10.0) } else { (238.0, 14.0) };
         let cols = (((avail + gap) / (min_w + gap)).floor() as usize).max(1);
         let card_w = (avail - (cols as f32 - 1.0) * gap) / cols as f32;
-        dbg_log_line(
-            "grid",
-            format!("sec={} avail={:.1} cols={} card_w={:.1}", sec.key, avail, cols, card_w),
-        );
         let display = self.display_ids(sec);
         if display.is_empty() {
             if self.editing {
@@ -6970,10 +6938,6 @@ impl App {
                         .push((sec.key.clone(), item_owned, alloc.response.rect));
                 }
             });
-            dbg_log_line(
-                &format!("row:{}", sig),
-                format!("row_h={:.1} actual_h={:.1}", row_h, actual_h),
-            );
             if row_h == 0.0 || actual_h > row_h + 0.5 {
                 self.row_heights.insert(sig, actual_h);
                 ui.ctx().request_repaint();
@@ -7192,7 +7156,12 @@ impl App {
                 ui.set_width((card_w - 2.0 * pad_x).max(80.0));
                 if fill_h > 0.0 {
                     // Stretch the frame to the row's full cell height.
-                    ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
+                    // egui 0.37 sizes a Frame as content + inner margin + 2*stroke +
+                    // outer margin (0.27 did not count the stroke), so enforce
+                    // row_h minus pads minus the 1.0 stroke on both sides,
+                    // or the measured card comes back as row_h + 2.0 and the
+                    // row-height cache ratchets +2.0 every frame, forever.
+                    ui.set_min_height((fill_h - pad_top - pad_bot - 2.0).max(0.0));
                 }
                 // ---------- top row ----------
                 let mut two_row = false;
@@ -7558,7 +7527,12 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width((card_w - 2.0 * pad_x).max(80.0));
                 if fill_h > 0.0 {
-                    ui.set_min_height((fill_h - pad_top - pad_bot).max(0.0));
+                    // egui 0.37 sizes a Frame as content + inner margin + 2*stroke +
+                    // outer margin (0.27 did not count the stroke), so enforce
+                    // row_h minus pads minus the 1.0 stroke on both sides,
+                    // or the measured card comes back as row_h + 2.0 and the
+                    // row-height cache ratchets +2.0 every frame, forever.
+                    ui.set_min_height((fill_h - pad_top - pad_bot - 2.0).max(0.0));
                 }
                 // ---------- live video (replaces the icon header) ----------
                 if show_video {
@@ -8890,16 +8864,6 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        dbg_log_line("build", "tuya-layout-debug winit-fix".to_string());
-        {
-            let ctx = ui.ctx();
-            let inner = ctx.input(|i| i.viewport().inner_rect);
-            let (w, h) = inner.map(|r| (r.width(), r.height())).unwrap_or((-1.0, -1.0));
-            dbg_log_line(
-                "viewport",
-                format!("inner={:.1}x{:.1} ppp={:.3}", w, h, ctx.pixels_per_point()),
-            );
-        }
         self.apply_style(ui.ctx());
         self.poll_net();
         // Tray + close behaviour (v1.2.1): poll tray events, turn a
