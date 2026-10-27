@@ -1,0 +1,26 @@
+name: smartlife_tuya_desktop
+description: "SmartLife & Tuya Desktop — Rust core + Flutter UI. Smart Life / Tuya devices and RTSP cameras in one clean dashboard."
+publish_to: 'none'
+version: 1.5.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Manual C-ABI bridge to the Rust core (rust/ -> tuya_core.dll /
+  # libtuya_core.dylib / libtuya_core.so). No codegen, no other
+  # native plugins: the update check, config file, gateway URLs,
+  # autostart store and tray actions all live in Rust, and camera
+  # frames arrive as RGBA bytes rendered with decodeImageFromPixels
+  # (no video-player plugin — the Rust ffmpeg pump stays in charge).
+  ffi: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
