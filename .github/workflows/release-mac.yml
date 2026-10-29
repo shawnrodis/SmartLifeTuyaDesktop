@@ -1,9 +1,20 @@
 # SmartLife & Tuya Desktop — macOS DMG builder.
 #
-# STAGED FILE (see MAC_BUILD.md next to it): this workflow is not
-# in the repo yet because pushing workflow files needs the
-# `workflow` token scope. When that lands, copy this file to
-# .github/workflows/release-mac.yml in the repo — unchanged.
+# Runner note (2026-10-29): runs-on is macos-15-intel, NOT
+# macos-latest/macos-15/macos-14. Those three all resolve to the
+# Apple Silicon (arm64) hosted pool, which GitHub reported as
+# capacity-constrained on 2026-10-27/28: seven macOS jobs queued
+# ~15 minutes, never got a runner, and were cancelled with
+# GitHub's own annotation "The job was not acquired by Runner of
+# type hosted even after multiple attempts" (runs 40528074853,
+# 40531365646, 40540814443, 40544032020, 40546759765,
+# 40728018417, probe 40734678864). The Intel pool is separate
+# and the build is host-arch-independent (it cross-compiles
+# both Apple targets, lipos them, and packages with hdiutil),
+# so the produced universal .dmg is identical. Revisit if
+# arm64 capacity recovers, and before macos-15-intel retires
+# (GitHub ends Intel macOS support when the macos-15 image
+# retires, Fall 2027).
 #
 # Trigger: every published GitHub release (plus manual dispatch
 # against an existing tag). It builds the app for both Apple
@@ -34,7 +45,7 @@ env:
 
 jobs:
   build-dmg:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - name: Resolve the release tag
         id: rel
