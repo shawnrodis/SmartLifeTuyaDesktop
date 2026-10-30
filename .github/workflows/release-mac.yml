@@ -186,10 +186,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Toolbox-style versioned file, plus the classic name: the web
-          # edition's updater matches SmartLife_Tuya_Desktop.html exactly,
-          # so the versioned name alone would break in-app updates.
+          # Versioned file only: the web edition's updater pattern-matches
+          # SmartLifeTuyaDesktop-v*.html (the classic name survives only as
+          # a fallback for older releases).
           TAG="${{ steps.rel.outputs.tag }}"
           VERSION="${TAG#v}"
           cp web/SmartLife_Tuya_Desktop.html "SmartLifeTuyaDesktop-v${VERSION}.html"
-          gh release upload "$TAG" "SmartLifeTuyaDesktop-v${VERSION}.html" web/SmartLife_Tuya_Desktop.html --clobber
+          gh release upload "$TAG" "SmartLifeTuyaDesktop-v${VERSION}.html" --clobber

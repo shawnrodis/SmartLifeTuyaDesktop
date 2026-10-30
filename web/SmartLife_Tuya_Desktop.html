@@ -983,11 +983,15 @@ function isNewerVersion(latest, current) {
 /* Extract what's needed from a GitHub "latest release" response. */
 function pickReleaseAssets(json) {
   if (!json || !json.tag_name) return null;
-  var html = null, exe = null;
+  var html = null, legacyHtml = null, exe = null;
   (json.assets || []).forEach(function (a) {
-    if (a.name === "SmartLife_Tuya_Desktop.html") html = a;
+    // Releases carry the versioned HTML only (SmartLifeTuyaDesktop-v*.html);
+    // the old unversioned name is kept as a fallback for older releases.
+    if (/^SmartLifeTuyaDesktop-v.+\.html$/.test(a.name || "")) html = a;
+    else if (a.name === "SmartLife_Tuya_Desktop.html") legacyHtml = a;
     if (/^SmartLifeTuyaDesktop-Setup-.*\.exe$/.test(a.name || "")) exe = a;
   });
+  if (!html) html = legacyHtml;
   if (!html) return null;
   return {
     version: String(json.tag_name).replace(/^v/, ""),

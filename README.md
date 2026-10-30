@@ -66,7 +66,7 @@ universal binary covers both Apple Silicon and Intel Macs.
 
 The installers are larger than they used to be (~100 MB) because they
 bundle ffmpeg for live camera video — see [Camera video](#camera-video)
-below. The web edition is the `SmartLife_Tuya_Desktop.html` asset on the
+below. The web edition is the `SmartLifeTuyaDesktop-vX.Y.Z.html` asset on the
 same release. All editions share one version number and check for updates
 themselves (Settings → App updates). (Building from source is optional;
 instructions below.)
