@@ -301,6 +301,10 @@ struct Prefs {
     theme: String,
     accent: String,
     density: String,
+    /// Legacy fixed interval (v2.0.5 and earlier): still loaded so
+    /// old configs parse, and still drives the thermostat fetch
+    /// cadence — but the Tuya discovery timer no longer reads it.
+    /// That cadence is the dynamic disc_interval_secs (v2.0.6).
     interval: u64,
     proxy_preset: String,
     proxy_custom: String,
@@ -4385,6 +4389,40 @@ fn refresh_relogin_gate_open(now_ms: i64, last_auth_ms: i64, throttle_until_ms: 
         && now_ms - last_auth_ms >= REFRESH_RELOGIN_MIN_INTERVAL_MS
 }
 
+/// Dynamic normal-refresh interval (v2.0.6): the Tuya discovery
+/// timer no longer offers fixed options — it adapts. The floor is
+/// 30 s (the old 15 s option invited throttling) and the cap is
+/// 5 min, matching the discovery backoff cap. Throttling doubles
+/// the interval from its CURRENT value (never from a fixed base),
+/// so a throttle during partial recovery steps back up from where
+/// the interval actually is; success halves it back toward the
+/// floor. Pure so tests pin the steps without a timer.
+const DISC_INTERVAL_FLOOR_SECS: u64 = 30;
+const DISC_INTERVAL_CAP_SECS: u64 = 300;
+
+fn disc_interval_after_throttle(current: u64) -> u64 {
+    current.saturating_mul(2).max(60).min(DISC_INTERVAL_CAP_SECS)
+}
+
+fn disc_interval_after_success(current: u64) -> u64 {
+    if current <= DISC_INTERVAL_FLOOR_SECS {
+        DISC_INTERVAL_FLOOR_SECS
+    } else {
+        (current / 2).max(DISC_INTERVAL_FLOOR_SECS)
+    }
+}
+
+/// Read-only display text for the dynamic interval (v2.0.6):
+/// "Auto 30s", "Auto 2 min", "Auto 5 min" — information, not a
+/// choice. Whole minutes only when the value divides evenly.
+fn auto_interval_text(secs: u64) -> String {
+    if secs >= 60 && secs % 60 == 0 {
+        format!("Auto {} min", secs / 60)
+    } else {
+        format!("Auto {}s", secs)
+    }
+}
+
 /// True when an auth error means the auth endpoint throttled us
 /// (as opposed to wrong credentials or a network failure).
 /// Reuses the discovery rate-limit spellings and adds generic
@@ -4789,6 +4827,11 @@ struct App {
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
     disc_freq_streak: u32,
+    // Dynamic normal-refresh interval (v2.0.6): the timer's cadence,
+    // doubling on discovery throttling (floor 30 s, cap 5 min) and
+    // halving back toward the floor on success. Runtime-only —
+    // restarts begin at the floor and re-adapt within a few cycles.
+    disc_interval_secs: u64,
     // live camera previews (v1.2.0): frame pumps keyed "cam:{id}"
     // (tiles) and "player" (the big player window).
     pumps: HashMap<String, Pump>,
@@ -5038,6 +5081,7 @@ impl App {
             startup_check: StartupCheckState::default(),
             disc_backoff_until: None,
             disc_freq_streak: 0,
+            disc_interval_secs: DISC_INTERVAL_FLOOR_SECS,
             pumps: HashMap::new(),
             pump_force: HashSet::new(),
             cam_gen: HashMap::new(),
@@ -6885,21 +6929,42 @@ impl App {
 
     /// Tuya rate-limited a discovery call: never warn (v1.2.0) — the
     /// app keeps showing the last known states and stretches the
-    /// effective refresh interval instead. The backoff grows with
-    /// consecutive hits (interval ×2, ×4, ×8; at least 60 s, at most
-    /// 5 min) and resets on the next successful fetch.
+    /// effective refresh interval instead. Unified with the dynamic
+    /// interval (v2.0.6): the throttle doubles the CURRENT interval
+    /// (floor 60 s on the first hit, cap 5 min) and the streak
+    /// backoff is set to that same value, so the timer's two waits
+    /// can never disagree — the effective wait is max(interval,
+    /// backoff) and both derive from the one doubling. Success
+    /// halves the interval back toward the 30 s floor (see the
+    /// DiscOk handler); the streak counter itself only feeds the
+    /// diagnostics log line. Returns the new interval in seconds.
     fn note_rate_limited(&mut self) -> u64 {
         self.disc_freq_streak = self.disc_freq_streak.saturating_add(1);
-        let shift = self.disc_freq_streak.min(3);
-        let secs = self
-            .cfg
-            .prefs
-            .interval
-            .saturating_mul(1 << shift)
-            .max(60)
-            .min(300);
+        let old = self.disc_interval_secs;
+        let secs = disc_interval_after_throttle(old);
+        self.disc_interval_secs = secs;
         self.disc_backoff_until = Some(Instant::now() + Duration::from_secs(secs));
+        if secs != old {
+            crate::hap::tstat_log(&format!(
+                "refresh interval now {secs}s (discovery throttled)"
+            ));
+        }
         secs
+    }
+
+    /// Discovery succeeded: step the dynamic interval back toward
+    /// the 30 s floor (halving, never below it) and log the change.
+    /// Called on DiscOk and on login-time discovery success — a
+    /// successful fetch is a successful fetch either way.
+    fn note_discovery_success(&mut self) {
+        let old = self.disc_interval_secs;
+        let next = disc_interval_after_success(old);
+        if next != old {
+            self.disc_interval_secs = next;
+            crate::hap::tstat_log(&format!(
+                "refresh interval now {next}s (discovery healthy)"
+            ));
+        }
     }
 
     // ---------------- thermostat (HomeKit/HAP) spawns ----------------
@@ -7463,6 +7528,7 @@ impl App {
                         self.save();
                     } else {
                         crate::hap::tstat_log(&format!("login ok: {} devices", devices.len()));
+                        self.note_discovery_success();
                         self.set_devices(devices, true);
                     }
                 }
@@ -7483,6 +7549,7 @@ impl App {
                     self.session = Some(session.clone());
                     self.cfg.session = Some(session);
                     crate::hap::tstat_log(&format!("discovery ok: {} devices", devices.len()));
+                    self.note_discovery_success();
                     self.set_devices(devices, true);
                 }
                 NetResult::DiscFrequent { session } => {
@@ -7632,15 +7699,6 @@ const REGIONS: [(&str, &str); 3] = [
     ("86", "China (CN)"),
 ];
 const PLATFORMS: [(&str, &str); 2] = [("smart_life", "Smart Life"), ("tuya", "Tuya Smart")];
-const INTERVALS: [(u64, &str); 4] = [(15, "15s"), (30, "30s"), (60, "60s"), (120, "2 min")];
-
-fn interval_label(v: u64) -> &'static str {
-    INTERVALS
-        .iter()
-        .find(|(x, _)| *x == v)
-        .map(|(_, l)| *l)
-        .unwrap_or("30s")
-}
 
 fn label_of<'a>(table: &[(&'a str, &'a str)], value: &str) -> &'a str {
     table
@@ -7899,19 +7957,14 @@ impl App {
                             self.snap_to_monitor(ui.ctx(), &dev);
                         }
                         }
-                        let mut interval = self.cfg.prefs.interval;
-                        ComboBox::from_id_salt("hdr_interval")
-                            .selected_text(interval_label(interval))
-                            .width(74.0)
-                            .show_ui(ui, |ui| {
-                                for (v, l) in INTERVALS {
-                                    ui.selectable_value(&mut interval, v, l);
-                                }
-                            });
-                        if interval != self.cfg.prefs.interval {
-                            self.cfg.prefs.interval = interval;
-                            self.save();
-                        }
+                        // Dynamic interval (v2.0.6): read-only —
+                        // the timer adapts it, the user does not pick
+                        // it. Fixed options invited throttling.
+                        ui.label(
+                            RichText::new(auto_interval_text(self.disc_interval_secs))
+                                .size(12.0)
+                                .color(pal.dim),
+                        );
                         ui.add(
                             TextEdit::singleline(&mut self.query)
                                 .desired_width(180.0)
@@ -10174,19 +10227,14 @@ impl App {
                             self.proxy_fields(ui, &pal, "set");
                             ui.add_space(10.0);
                             Self::field_label(ui, &pal, "Autorefresh interval");
-                            let mut interval = self.cfg.prefs.interval;
-                            ComboBox::from_id_salt("set_interval")
-                                .selected_text(interval_label(interval))
-                                .width(ui.available_width())
-                                .show_ui(ui, |ui| {
-                                    for (v, l) in INTERVALS {
-                                        ui.selectable_value(&mut interval, v, l);
-                                    }
-                                });
-                            if interval != self.cfg.prefs.interval {
-                                self.cfg.prefs.interval = interval;
-                                self.save();
-                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} — adjusts automatically",
+                                    auto_interval_text(self.disc_interval_secs)
+                                ))
+                                .size(12.5)
+                                .color(pal.dim),
+                            );
                         });
                         // ---- Stream gateway & cameras ----
                         Self::settings_panel(ui, &pal, "Stream gateway & cameras", |ui| {
@@ -10493,7 +10541,7 @@ impl App {
                             ui.add_space(10.0);
                             ui.label(RichText::new("Diagnostics log").size(14.0).strong());
                             ui.label(
-                                RichText::new("Recent thermostat operations. Copy it into a message if something misbehaves.")
+                                RichText::new("Recent thermostat and sync activity. Copy it into a message if something misbehaves.")
                                     .size(12.5)
                                     .color(pal.dim),
                             );
@@ -10998,7 +11046,12 @@ impl App {
     /// Tuya refresh path and it is always on — no toggle, no
     /// manual button. Paused while editing, dragging, or typing.
     /// Extracted from `ui` so the timer path is unit-testable
-    /// without an eframe::Frame.
+    /// without an eframe::Frame. The cadence is the dynamic
+    /// interval (v2.0.6): it doubles on discovery throttling and
+    /// halves back toward the 30 s floor on success, so the timer
+    /// itself dodges the discovery-side throttle. The streak
+    /// backoff is set to the same value by note_rate_limited, so
+    /// the two waits agree and the effective wait is their max.
     fn maybe_autorefresh(&mut self, ctx: &egui::Context) {
         if self.view == View::Dashboard
             && self.session.is_some()
@@ -11008,7 +11061,7 @@ impl App {
         {
             let due = self
                 .last_fetch
-                .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.prefs.interval))
+                .map(|t| t.elapsed() >= Duration::from_secs(self.disc_interval_secs))
                 .unwrap_or(false);
             // Rate-limit backoff (v1.2.0): skip cycles silently until
             // it lapses — the cached devices stay on screen meanwhile.
@@ -11682,7 +11735,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.5");
+        assert_eq!(APP_VERSION, "2.0.6");
     }
 
     #[test]
@@ -13264,6 +13317,97 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_interval_steps() {
+        // v2.0.6: throttle doubles from the CURRENT interval (floor
+        // 60 s on the first hit, cap 5 min); success halves back
+        // toward the 30 s floor, never below it.
+        assert_eq!(disc_interval_after_throttle(30), 60);
+        assert_eq!(disc_interval_after_throttle(60), 120);
+        assert_eq!(disc_interval_after_throttle(120), 240);
+        assert_eq!(disc_interval_after_throttle(240), 300);
+        assert_eq!(disc_interval_after_throttle(300), 300);
+        assert_eq!(disc_interval_after_success(300), 150);
+        assert_eq!(disc_interval_after_success(150), 75);
+        assert_eq!(disc_interval_after_success(75), 37);
+        assert_eq!(disc_interval_after_success(37), 30);
+        assert_eq!(disc_interval_after_success(30), 30);
+        assert_eq!(auto_interval_text(30), "Auto 30s");
+        assert_eq!(auto_interval_text(60), "Auto 1 min");
+        assert_eq!(auto_interval_text(120), "Auto 2 min");
+        assert_eq!(auto_interval_text(300), "Auto 5 min");
+        assert_eq!(auto_interval_text(150), "Auto 150s");
+    }
+
+    #[test]
+    fn dynamic_interval_drives_timer_not_legacy_prefs() {
+        // v2.0.6: the timer reads disc_interval_secs, never the
+        // legacy prefs.interval — even an old stored 120 s value
+        // must not slow it. Stale last_fetch, interval 300 s: no
+        // spawn; interval 30 s: spawn.
+        let mut app = gate_app();
+        app.session = Some(test_session());
+        app.cfg.prefs.interval = 120;
+        app.last_fetch =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(100));
+        app.disc_backoff_until = None;
+        app.disc_busy = false;
+        app.editing = false;
+        app.dragging_slider = false;
+        app.disc_interval_secs = 300;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        app.maybe_autorefresh(&ctx);
+        assert!(!app.disc_busy, "300 s dynamic interval must not fire at 100 s");
+        app.disc_interval_secs = 30;
+        app.maybe_autorefresh(&ctx);
+        assert!(app.disc_busy, "30 s dynamic interval must fire at 100 s");
+    }
+
+    #[test]
+    fn disc_ok_steps_dynamic_interval_down() {
+        // v2.0.6: a successful discovery halves the interval toward
+        // the floor (and clears the streak/backoff as before).
+        let mut app = test_app(vec![]);
+        app.disc_interval_secs = 300;
+        app.disc_freq_streak = 2;
+        app.disc_backoff_until = Some(std::time::Instant::now());
+        app.disc_busy = true;
+        app.tx
+            .send(NetResult::DiscOk {
+                session: test_session(),
+                devices: vec![],
+            })
+            .unwrap();
+        app.poll_net();
+        assert_eq!(app.disc_interval_secs, 150);
+        assert_eq!(app.disc_freq_streak, 0);
+        assert!(app.disc_backoff_until.is_none());
+    }
+
+    #[test]
+    fn header_shows_auto_interval_not_options() {
+        // v2.0.6: the header carries a read-only "Auto 30s" display
+        // and no fixed interval options at all.
+        let mut app = gate_app();
+        app.editing = false;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let texts = render_header(&mut app, &ctx, egui::vec2(1330.0, 200.0), 3);
+        assert!(
+            texts.iter().any(|(t, _)| t.as_str() == "Auto 30s"),
+            "header must show the auto interval display"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t.as_str() == "15s"),
+            "header must not offer the 15 s option"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t.as_str() == "2 min"),
+            "header must not offer the 2 min option"
+        );
+    }
+
+    #[test]
     fn throttle_error_classifier() {
         // Throttle spellings: skill rate-limit codes plus generic
         // throttle/429 wording, since net_auth surfaces API
@@ -14267,6 +14411,7 @@ mod tests {
             last_seen_monitor: 0,
             disc_backoff_until: None,
             disc_freq_streak: 0,
+            disc_interval_secs: DISC_INTERVAL_FLOOR_SECS,
             pumps: HashMap::new(),
             pump_force: HashSet::new(),
             cam_gen: HashMap::new(),

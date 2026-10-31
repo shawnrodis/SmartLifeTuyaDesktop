@@ -132,6 +132,18 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.6
+
+- **The refresh rate now adjusts itself.** The fixed interval
+  options are gone — header and Settings both show a read-only
+  "Auto" rate instead. Normal refreshes start at 30 seconds, step
+  up when discovery gets throttled (up to five minutes), and walk
+  back down as discoveries succeed. The diagnostics log shows each
+  change. The every-180-seconds re-login cadence is untouched.
+- **Diagnostics log description updated** to "Recent thermostat
+  and sync activity," since the log covers Tuya sync lines too,
+  not just thermostat operations.
+
 ## What's new in 2.0.5
 
 - **The manual Refresh button is gone.** Autorefresh is now the only
