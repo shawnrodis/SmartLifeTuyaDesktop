@@ -8,7 +8,7 @@ fn main() {
     // Minimal .rc: exe icon + asInvoker manifest (no admin needed for this app).
     std::fs::write(
         out.join("sltd.rc"),
-        "101 ICON \"assets/SmartLifeTuyaDesktop.ico\"\n1 24 \"assets/SmartLifeTuyaDesktop.manifest\"\n",
+        "101 ICON \"assets/Homestead.ico\"\n1 24 \"assets/Homestead.manifest\"\n",
     )
     .unwrap();
 
@@ -26,6 +26,6 @@ fn main() {
 
     // Link the object directly (not via an archive, which the linker can discard).
     println!("cargo:rustc-link-arg={}", out.join("resource.o").display());
-    println!("cargo:rerun-if-changed=assets/SmartLifeTuyaDesktop.ico");
-    println!("cargo:rerun-if-changed=assets/SmartLifeTuyaDesktop.manifest");
+    println!("cargo:rerun-if-changed=assets/Homestead.ico");
+    println!("cargo:rerun-if-changed=assets/Homestead.manifest");
 }

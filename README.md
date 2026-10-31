@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/icon.png" alt="SmartLife & Tuya Desktop icon" width="120">
+  <img src="assets/icon.png" alt="Homestead icon" width="120">
 </p>
 
-# SmartLife & Tuya Desktop
+# Homestead
 
 A clean, modern dashboard for your **Smart Life / Tuya** devices — lights,
 plugs, switches and scenes — in editions that look and behave the same:
@@ -13,10 +13,10 @@ plugs, switches and scenes — in editions that look and behave the same:
   (Apple Silicon + Intel) `.dmg`, built by CI on each release. It's
   unsigned — see [Download](#download) for the one-time Gatekeeper
   bypass.
-- **Web app** (`web/SmartLife_Tuya_Desktop.html`): a single self-contained
+- **Web app** (`web/Homestead.html`): a single self-contained
   HTML file — open it in any modern browser, from disk or any static host.
   No build step, no dependencies. Also live at
-  [shawnrodis.github.io/SmartLifeTuyaDesktop](https://shawnrodis.github.io/SmartLifeTuyaDesktop).
+  [shawnrodis.github.io/Homestead](https://shawnrodis.github.io/Homestead).
 
 > **Android?** There is no Android port, by design — Smart Life, Tuya,
 > and Tapo already exist as Android apps and do the mobile job well. If
@@ -31,12 +31,12 @@ customisable interface they always deserved.
 ## Screenshots
 
 <p align="center">
-  <img src="docs/battlestation.jpg" alt="SmartLife & Tuya Desktop running on a second monitor at a real desk setup" width="880">
+  <img src="docs/battlestation.jpg" alt="Homestead running on a second monitor at a real desk setup" width="880">
   <br><em>On duty at a real desk — the dashboard lives on the second monitor. (Camera feed and a few details blurred for privacy.)</em>
 </p>
 
 <p align="center">
-  <img src="docs/screenshot-dashboard.jpg" alt="The SmartLife & Tuya Desktop dashboard: Cameras, Lighting with group controls, and device cards" width="640">
+  <img src="docs/screenshot-dashboard.jpg" alt="The Homestead dashboard: Cameras, Lighting with group controls, and device cards" width="640">
   <br><em>The dashboard itself — Cameras, the Lighting section with group-wide controls, and the device cards. (Camera feed blurred for privacy.)</em>
 </p>
 
@@ -47,12 +47,12 @@ customisable interface they always deserved.
 
 ## Download
 
-**Windows:** grab `SmartLifeTuyaDesktop-Setup-v<version>.exe` from
-[Releases](https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases) and
-run it — per-user install to `%LOCALAPPDATA%\SmartLifeTuyaDesktop`, with
+**Windows:** grab `Homestead-Setup-v<version>.exe` from
+[Releases](https://github.com/shawnrodis/Homestead/releases) and
+run it — per-user install to `%LOCALAPPDATA%\Homestead`, with
 Start Menu shortcuts and an uninstaller. No administrator rights required.
 
-**macOS:** grab `SmartLifeTuyaDesktop-v<version>.dmg` from the same
+**macOS:** grab `Homestead-v<version>.dmg` from the same
 release, open it, and drag the app into Applications. The build is
 **unsigned** (no Apple Developer certificate), so on first launch macOS
 refuses and offers to move it to Trash — don't. Instead open **System
@@ -60,13 +60,13 @@ Settings → Privacy & Security**, scroll to the Security section, and
 click **Open Anyway** next to the app, then authenticate (Touch ID or
 password) and confirm **Open**. After that it opens normally. (Terminal
 alternative, before first launch:
-`xattr -dr com.apple.quarantine /Applications/SmartLifeTuyaDesktop.app`;
+`xattr -dr com.apple.quarantine /Applications/Homestead.app`;
 on older macOS versions, right-click → Open does the same job.) One
 universal binary covers both Apple Silicon and Intel Macs.
 
 The installers are larger than they used to be (~100 MB) because they
 bundle ffmpeg for live camera video — see [Camera video](#camera-video)
-below. The web edition is the `SmartLifeTuyaDesktop-vX.Y.Z.html` asset on the
+below. The web edition is the `Homestead-vX.Y.Z.html` asset on the
 same release. All editions share one version number and check for updates
 themselves (Settings → App updates). (Building from source is optional;
 instructions below.)
@@ -131,6 +131,32 @@ instructions below.)
   over HTTPS. "Keep me logged in" stores them only on your device
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
+
+## What's new in 2.0.0
+
+- **Renamed to Homestead — and this one is a fresh install.** The app
+  has grown well past Tuya and Smart Life (thermostat control, monitor
+  handling, cameras), so it gets a name of its own. Installing 2.0.0
+  does NOT touch your existing install: the old app keeps working
+  side by side, with its own settings, while Homestead starts clean
+  in its own folders. That means signing in to Tuya again, re-pairing
+  the thermostat from scratch, and redoing pins, groups, and section
+  order in the new install. Nothing is carried over, on purpose.
+- **Thermostat fixes.** Temperature changes work now: setpoint writes
+  are rounded to the step the thermostat itself accepts, instead of
+  being rejected. Mode changes show immediately — a successful change
+  is confirmed at once rather than waiting on a slow re-read. The
+  status line shows the mode you set (what the wall unit shows), not
+  whether the unit happens to be running right now. Status refreshes
+  happen silently in the background with no "Working…" line. The
+  Thermostat section now has the same collapse arrow as Cameras and
+  Lighting. And Settings has a diagnostics log with Copy, so a
+  thermostat problem can be pasted for debugging instead of guessed at.
+- **Stricter maximized-launch monitor handling.** When the app is set
+  to start maximized, it re-checks after launch that it actually
+  landed on the monitor it was last on, and corrects itself if it
+  didn't — still by monitor identity only, never by saved window
+  position, so a disconnected display can never strand it off-screen.
 
 ## What's new in 1.6.3
 
@@ -484,38 +510,38 @@ sudo apt install mingw-w64 nsis
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 # installer:
-cp target/x86_64-pc-windows-gnu/release/SmartLifeTuyaDesktop.exe installer/
+cp target/x86_64-pc-windows-gnu/release/Homestead.exe installer/
 cd installer && makensis installer.nsi
 ```
 
 The build script generates a small `.rc` (exe icon +
-`assets/SmartLifeTuyaDesktop.manifest`), compiles it with windres and links
+`assets/Homestead.manifest`), compiles it with windres and links
 the result directly, embedding the icon and the asInvoker manifest. Settings are stored at
-`%APPDATA%\SmartLifeTuyaDesktop\config.json`.
+`%APPDATA%\Homestead\config.json`.
 
 ## The two editions stay in step
 
 Both editions share one design system — same layout, colours, cards and
 behaviour rules — documented in [DESIGN.md](DESIGN.md). The web edition is
-at `web/SmartLife_Tuya_Desktop.html`; it talks to the same Tuya API with the
+at `web/Homestead.html`; it talks to the same Tuya API with the
 same value scales and control payloads as the Windows app.
 
 ## Project layout
 
 ```
-SmartLifeTuyaDesktop/
+Homestead/
 ├── src/main.rs            # the whole Windows app (egui)
 ├── build.rs               # embeds icon + admin-free manifest via windres
 ├── assets/
-│   ├── SmartLifeTuyaDesktop.ico      # exe icon
-│   ├── SmartLifeTuyaDesktop.manifest # asInvoker manifest
+│   ├── Homestead.ico      # exe icon
+│   ├── Homestead.manifest # asInvoker manifest
 │   ├── icon.png                      # runtime / README icon
 │   ├── ffmpeg.exe                    # bundled FFmpeg 7.1.1 (GPL v3) for live camera video
 │   └── fonts/                        # embedded glyph fallbacks (egui)
 ├── licenses/
 │   └── FFmpeg-LICENSE.txt            # FFmpeg's GPL v3 license text
 ├── web/
-│   └── SmartLife_Tuya_Desktop.html   # the web edition (single file)
+│   └── Homestead.html   # the web edition (single file)
 ├── installer/
 │   └── installer.nsi                 # per-user NSIS installer
 ├── DESIGN.md              # shared design tokens for both editions

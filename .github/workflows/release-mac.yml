@@ -1,4 +1,4 @@
-# SmartLife & Tuya Desktop — macOS DMG builder.
+# Homestead — macOS DMG builder.
 #
 # Runner note (2026-10-29): runs-on is macos-15-intel, NOT
 # macos-latest/macos-15/macos-14. Those three all resolve to the
@@ -19,10 +19,10 @@
 # Trigger: every published GitHub release (plus manual dispatch
 # against an existing tag). It builds the app for both Apple
 # architectures on a real Mac runner, lipos them into ONE
-# universal binary, assembles SmartLifeTuyaDesktop.app with the
+# universal binary, assembles Homestead.app with the
 # pinned per-arch ffmpeg builds in Contents/Resources, ad-hoc
 # codesigns it (the build is deliberately unsigned), wraps it in
-# SmartLifeTuyaDesktop-v<version>.dmg and uploads the DMG to the
+# Homestead-v<version>.dmg and uploads the DMG to the
 # same release the Windows installer and web file live on.
 
 name: macOS DMG
@@ -80,11 +80,11 @@ jobs:
         run: |
           mkdir -p dist
           lipo -create \
-            target/aarch64-apple-darwin/release/SmartLifeTuyaDesktop \
-            target/x86_64-apple-darwin/release/SmartLifeTuyaDesktop \
-            -output dist/SmartLifeTuyaDesktop
+            target/aarch64-apple-darwin/release/Homestead \
+            target/x86_64-apple-darwin/release/Homestead \
+            -output dist/Homestead
           # Prove both slices are really in there.
-          lipo -info dist/SmartLifeTuyaDesktop
+          lipo -info dist/Homestead
 
       # Pinned static ffmpeg builds (see MAC_BUILD.md for the
       # source, the hashes and the version caveat). The app's
@@ -101,14 +101,14 @@ jobs:
           chmod +x dist/ffmpeg/ffmpeg-arm64 dist/ffmpeg/ffmpeg-x86_64
           file dist/ffmpeg/ffmpeg-arm64 dist/ffmpeg/ffmpeg-x86_64
 
-      - name: Assemble SmartLifeTuyaDesktop.app
+      - name: Assemble Homestead.app
         env:
           VERSION: ${{ steps.rel.outputs.version }}
         run: |
-          APP="dist/SmartLifeTuyaDesktop.app"
+          APP="dist/Homestead.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp dist/SmartLifeTuyaDesktop "$APP/Contents/MacOS/SmartLifeTuyaDesktop"
-          chmod +x "$APP/Contents/MacOS/SmartLifeTuyaDesktop"
+          cp dist/Homestead "$APP/Contents/MacOS/Homestead"
+          chmod +x "$APP/Contents/MacOS/Homestead"
           cp dist/ffmpeg/ffmpeg-arm64 dist/ffmpeg/ffmpeg-x86_64 "$APP/Contents/Resources/"
 
           # AppIcon.icns from the repo's assets/icon.png.
@@ -132,13 +132,13 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>CFBundleName</key>
-            <string>SmartLifeTuyaDesktop</string>
+            <string>Homestead</string>
             <key>CFBundleDisplayName</key>
-            <string>SmartLife &amp; Tuya Desktop</string>
+            <string>Homestead</string>
             <key>CFBundleIdentifier</key>
-            <string>com.shawnrodis.smartlifetuya</string>
+            <string>com.shawnrodis.homestead</string>
             <key>CFBundleExecutable</key>
-            <string>SmartLifeTuyaDesktop</string>
+            <string>Homestead</string>
             <key>CFBundleIconFile</key>
             <string>AppIcon</string>
             <key>CFBundlePackageType</key>
@@ -159,20 +159,20 @@ jobs:
 
       - name: Ad-hoc codesign (deliberately unsigned)
         run: |
-          codesign --force --deep --sign - dist/SmartLifeTuyaDesktop.app
-          codesign --verify --verbose=2 dist/SmartLifeTuyaDesktop.app
+          codesign --force --deep --sign - dist/Homestead.app
+          codesign --verify --verbose=2 dist/Homestead.app
 
       - name: Build the DMG
         id: dmg
         env:
           VERSION: ${{ steps.rel.outputs.version }}
         run: |
-          DMG="SmartLifeTuyaDesktop-v${VERSION}.dmg"
+          DMG="Homestead-v${VERSION}.dmg"
           rm -rf dmgroot
           mkdir dmgroot
-          cp -R dist/SmartLifeTuyaDesktop.app dmgroot/
+          cp -R dist/Homestead.app dmgroot/
           ln -s /Applications dmgroot/Applications
-          hdiutil create -volname "SmartLife & Tuya Desktop" \
+          hdiutil create -volname "Homestead" \
             -srcfolder dmgroot -ov -format UDZO "$DMG"
           ls -la "$DMG"
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
@@ -187,9 +187,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Versioned file only: the web edition's updater pattern-matches
-          # SmartLifeTuyaDesktop-v*.html (the classic name survives only as
-          # a fallback for older releases).
+          # Homestead-v*.html, with no fallback to any other name.
           TAG="${{ steps.rel.outputs.tag }}"
           VERSION="${TAG#v}"
-          cp web/SmartLife_Tuya_Desktop.html "SmartLifeTuyaDesktop-v${VERSION}.html"
-          gh release upload "$TAG" "SmartLifeTuyaDesktop-v${VERSION}.html" --clobber
+          cp web/Homestead.html "Homestead-v${VERSION}.html"
+          gh release upload "$TAG" "Homestead-v${VERSION}.html" --clobber

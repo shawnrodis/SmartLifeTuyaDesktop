@@ -38,12 +38,12 @@ jobs:
           # Clear any stale setup exe first: installer/ carries a
           # tracked v1.4.0 setup, and the artifact glob below would
           # otherwise sweep it up alongside the fresh build.
-          Remove-Item installer/SmartLifeTuyaDesktop-Setup-*.exe -ErrorAction SilentlyContinue
-          Copy-Item -Force target/x86_64-pc-windows-gnu/release/SmartLifeTuyaDesktop.exe installer/
+          Remove-Item installer/Homestead-Setup-*.exe -ErrorAction SilentlyContinue
+          Copy-Item -Force target/x86_64-pc-windows-gnu/release/Homestead.exe installer/
           cd installer
           makensis installer.nsi
       - uses: actions/upload-artifact@v4
         with:
-          name: smartlife-tuya-windows
+          name: homestead-windows
           path: |
-            installer/SmartLifeTuyaDesktop-Setup-*.exe
+            installer/Homestead-Setup-*.exe

@@ -463,6 +463,14 @@ pub fn handle_http(
             Err(m) => err_reply(400, m),
         },
         ("POST", "/thermostat/forget") => backend_reply(backend(BridgeRequest::Forget)),
+        // Diagnostics log (v1.6.4): read straight from hap's ring
+        // buffer — no UI-thread round trip, no backend job. The
+        // buffer holds outcomes/temperatures/modes/ids/statuses
+        // only, never codes, keys, or credentials (see hap).
+        ("GET", "/thermostat/log") => HttpReply {
+            status: 200,
+            body: json!({ "log": crate::hap::tstat_log_text() }).to_string(),
+        },
         _ => {
             let known = matches!(
                 path,
@@ -473,6 +481,7 @@ pub fn handle_http(
                     | "/thermostat/pair/cancel"
                     | "/thermostat/set"
                     | "/thermostat/forget"
+                    | "/thermostat/log"
             );
             if known {
                 err_reply(405, "method not allowed")
@@ -692,6 +701,32 @@ mod tests {
         );
         assert_eq!(r.status, 200);
         assert_eq!(r.body, "{\"paired\":false}");
+    }
+
+    #[test]
+    fn thermostat_log_route_serves_ring_buffer() {
+        // v1.6.4: the log endpoint needs no backend job — it reads
+        // hap's buffer directly, and a wrong method is 405 (the
+        // path is known), not 404.
+        crate::hap::tstat_log_clear();
+        crate::hap::tstat_log("Fetch ok: Cool indoor 77°F setpoint 77°F (0.8s)");
+        let r = handle_http(
+            "GET",
+            "/thermostat/log",
+            b"",
+            &stub(200, json!({})),
+            &PairSessions::new(),
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("Fetch ok: Cool"));
+        let r = handle_http(
+            "POST",
+            "/thermostat/log",
+            b"",
+            &stub(200, json!({})),
+            &PairSessions::new(),
+        );
+        assert_eq!(r.status, 405);
     }
 
     #[test]

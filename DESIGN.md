@@ -1,6 +1,6 @@
-# Shared design system — SmartLife & Tuya Desktop
+# Shared design system — Homestead
 
-The web edition (`web/SmartLife_Tuya_Desktop.html`, CSS variables) and the
+The web edition (`web/Homestead.html`, CSS variables) and the
 Windows edition (`src/main.rs`, `Palette`/`ACCENTS` constants) render the
 **same** design. When you change a token in one edition, change it in the
 other, and update this file. The look is intentionally flat: solid surfaces
@@ -303,7 +303,7 @@ column max width: 760px.
   end of this file has the mapping). "Start with Windows" is an ON/OFF toggle (default
   OFF = no autostart entry at all) writing the per-user Run key
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value
-  `SmartLifeTuyaDesktop` = the quoted current-exe path; on load the
+  `Homestead` = the quoted current-exe path; on load the
   toggle reflects the actual registry state (self-healing: an
   existing entry wins and is rewritten canonically). When ON, "Launch
   as" picks exactly one: **Normal window** (no flag), **Minimized
@@ -378,9 +378,9 @@ column max width: 760px.
   absent, the button is hidden.
 - **Single instance & tray event pumping (v1.2.2) — Windows.** The
   app is single-instance: the first process holds the named mutex
-  `SmartLifeTuyaDesktop.SingleInstance` for its lifetime. A later
+  `Homestead.SingleInstance` for its lifetime. A later
   launch creates neither window nor tray icon: it sets the named
-  auto-reset event `SmartLifeTuyaDesktop.ShowWindow`, which the
+  auto-reset event `Homestead.ShowWindow`, which the
   primary's waiter thread turns into an atomic flag + a repaint
   poke, and exits immediately. The primary consumes the flag through
   the same restore path as tray Open: `Visible(true)` +
@@ -426,7 +426,7 @@ column max width: 760px.
   the starvation this thread fixes is a Windows hidden-window
   quirk, and the pre-v1.2.3 polling pattern is sound there.)
 - **Auto-update.** Both editions share one version number and check
-  `api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest`
+  `api.github.com/repos/shawnrodis/Homestead/releases/latest`
   on launch, at most once per 24h (attempt-based, stored locally:
   web `slc_update`, Windows config `update`), silent on failure.
   Settings → App updates shows current vs latest with a manual check.
@@ -434,10 +434,10 @@ column max width: 760px.
   for the release's `.html` asset (a page can't overwrite its own file).
   Windows: "Download & install" downloads the release's Setup `.exe`
   with progress, verifies the file name matches
-  `SmartLifeTuyaDesktop-Setup-v{version}.exe`, launches it and exits so
+  `Homestead-Setup-v{version}.exe`, launches it and exits so
   the installer can replace the app; "Open releases page" is the
   fallback. **macOS (v1.4.0):** the same flow downloads the release's
-  `SmartLifeTuyaDesktop-v{version}.dmg` and *opens* it (the user
+  `Homestead-v{version}.dmg` and *opens* it (the user
   drags the app into Applications, then relaunches); the app does
   not exit. Asset selection is a pure function of version +
   platform — a release missing the platform's asset offers no
@@ -455,8 +455,8 @@ unsigned, so first launch needs right-click → Open or
 
 | Concern | Windows | macOS | Web |
 |---|---|---|---|
-| Config file | `%APPDATA%\SmartLifeTuyaDesktop\config.json` | `~/Library/Application Support/SmartLifeTuyaDesktop/config.json` | `localStorage` (`slc_*`) |
-| Start at login | per-user registry Run key | LaunchAgent plist in `~/Library/LaunchAgents` (`com.shawnrodis.smartlifetuya`), same command/flags, same self-healing reconcile | — |
+| Config file | `%APPDATA%\Homestead\config.json` | `~/Library/Application Support/Homestead/config.json` | `localStorage` (`slc_*`) |
+| Start at login | per-user registry Run key | LaunchAgent plist in `~/Library/LaunchAgents` (`com.shawnrodis.homestead`), same command/flags, same self-healing reconcile | — |
 | Tray | system tray; dedicated event thread (hidden-window frames can starve) | menu-bar tray; receivers polled in the frame loop | — |
 | First-hide "still running" hint | one-time tray balloon | toast only (no balloon API equivalent — deviation) | — |
 | Single instance | named mutex + kernel event; second launch signals Show | `flock` on `instance.lock` in the config dir + a `show-request` file the primary polls (~0.4 s) | browser tabs are independent |
@@ -477,4 +477,4 @@ macOS notes:
   truth in both stores: on macOS it is decomposed into the
   plist's `ProgramArguments` (XML-escaped) and reconstructed on
   read, a pure round-trip covered by tests.
-- The `.app` bundle id is `com.shawnrodis.smartlifetuya`.
+- The `.app` bundle id is `com.shawnrodis.homestead`.

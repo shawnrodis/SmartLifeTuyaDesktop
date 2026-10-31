@@ -1,12 +1,12 @@
 [package]
-name = "smartlife-tuya-desktop"
-version = "1.6.3"
+name = "homestead"
+version = "2.0.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "SmartLife & Tuya Desktop - a clean dashboard for Smart Life / Tuya devices (native desktop editions: Windows & macOS)"
+description = "Homestead - a clean dashboard for Smart Life / Tuya devices (native desktop editions: Windows & macOS)"
 
 [[bin]]
-name = "SmartLifeTuyaDesktop"
+name = "Homestead"
 path = "src/main.rs"
 
 [dependencies]

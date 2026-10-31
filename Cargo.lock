@@ -2059,6 +2059,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "homestead"
+version = "2.0.0"
+dependencies = [
+ "chacha20poly1305",
+ "chrono",
+ "ed25519-dalek",
+ "eframe",
+ "egui",
+ "fs2",
+ "hkdf",
+ "mdns-sd",
+ "num-bigint",
+ "rand 0.8.8",
+ "raw-window-handle",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tray-icon",
+ "windows-sys 0.59.0",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4212,30 +4236,6 @@ name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
-
-[[package]]
-name = "smartlife-tuya-desktop"
-version = "1.6.3"
-dependencies = [
- "chacha20poly1305",
- "chrono",
- "ed25519-dalek",
- "eframe",
- "egui",
- "fs2",
- "hkdf",
- "mdns-sd",
- "num-bigint",
- "rand 0.8.8",
- "raw-window-handle",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tray-icon",
- "windows-sys 0.59.0",
- "x25519-dalek",
-]
 
 [[package]]
 name = "smithay-client-toolkit"

@@ -72,6 +72,77 @@ fn err<T>(msg: impl Into<String>) -> HapResult<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics log (v1.6.4): an in-memory ring buffer of thermostat
+// operations, shown in Settings and served to the web tile. Timestamped,
+// capped at 200 entries (oldest evicted). Worker threads push directly;
+// the UI thread and the bridge thread only read. NEVER log setup
+// codes, pairing keys, tokens, Tuya credentials, or config contents:
+// the log call sites below pass outcomes, temperatures, modes,
+// characteristic ids, and status codes only, and the line builders
+// take no secret parameter at all (see the tests).
+// ---------------------------------------------------------------------------
+
+const TSTAT_LOG_CAP: usize = 200;
+
+fn tstat_log_buf() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static BUF: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::OnceLock::new();
+    BUF.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Push one timestamped line, evicting the oldest past the cap.
+pub fn tstat_log(line: &str) {
+    let stamp = chrono::Local::now().format("%H:%M:%S");
+    let mut buf = match tstat_log_buf().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    buf.push_back(format!("{stamp} {line}"));
+    while buf.len() > TSTAT_LOG_CAP {
+        buf.pop_front();
+    }
+}
+
+/// The whole buffer as display text (oldest first, one line each).
+pub fn tstat_log_text() -> String {
+    let join = |g: &std::collections::VecDeque<String>| g.iter().cloned().collect::<Vec<_>>().join("\n");
+    match tstat_log_buf().lock() {
+        Ok(g) => join(&g),
+        Err(p) => join(&p.into_inner()),
+    }
+}
+
+/// Drop every entry (Settings Clear button; tests).
+pub fn tstat_log_clear() {
+    if let Ok(mut g) = tstat_log_buf().lock() {
+        g.clear();
+    }
+}
+
+/// Pair log lines take a stage + outcome only: by construction they
+/// can never carry the setup code (it is not a parameter here, and
+/// the call sites pass outcomes/errors only).
+fn pair_begin_log_line(device_name: &str) -> String {
+    format!("Pair begin: {device_name} — session open, awaiting the code on the unit")
+}
+
+fn pair_finish_log_line(ok: bool, err: Option<&str>) -> String {
+    match (ok, err) {
+        (true, _) => "Pair finish: paired".to_string(),
+        (false, Some(e)) => format!("Pair finish failed: {e}"),
+        (false, None) => "Pair finish failed".to_string(),
+    }
+}
+
+/// Set log line: requested changes, PUT result (incl. per-char
+/// statuses), readback outcome, duration. Its parameters are
+/// temperatures, modes, ids, and statuses only — no secret material
+/// exists in this function's inputs at all.
+fn set_log_line(requested: &str, put: &str, readback: &str, secs: f64) -> String {
+    format!("Set: {requested} — {put}, {readback} ({secs:.1}s)")
+}
+
+// ---------------------------------------------------------------------------
 // TLV8 (HAP section 12): tag u8, length u8, value; values longer than 255
 // bytes are split into same-tag 255-byte chunks, concatenated on decode.
 // ---------------------------------------------------------------------------
@@ -936,8 +1007,18 @@ fn device_address(device: &DiscoveredDevice) -> HapResult<&str> {
 
 /// Begin pairing: open the connection, send M1 (no code needed), read
 /// M2 (salt + server public key B). The accessory shows its fresh
-/// setup code on screen once this session starts.
+/// setup code on screen once this session starts. Logs the outcome
+/// only (device name, never any code or key).
 pub fn begin_pair_setup(device: &DiscoveredDevice) -> HapResult<PendingPairSetup> {
+    let res = begin_pair_setup_inner(device);
+    match &res {
+        Ok(p) => tstat_log(&pair_begin_log_line(&p.name)),
+        Err(e) => tstat_log(&format!("Pair begin failed: {e}")),
+    }
+    res
+}
+
+fn begin_pair_setup_inner(device: &DiscoveredDevice) -> HapResult<PendingPairSetup> {
     let ip = device_address(device)?.to_string();
     let mut conn = Conn::connect(&ip, device.port)?;
     let m1 = tlv_encode(&[(TAG_STATE, &[STATE_M1]), (TAG_METHOD, &[0x00])]);
@@ -1071,6 +1152,17 @@ fn pair_setup_m5_m6(
 /// just-read code, send M3, verify M4, run M5/M6. Consumes the pending
 /// state; on any failure the connection is closed with it.
 pub fn finish_pair_setup(mut pending: PendingPairSetup, code: &str) -> HapResult<ThermostatPairing> {
+    // The setup code is passed straight to SRP and never logged:
+    // the log line below carries the outcome only.
+    let res = finish_pair_setup_inner(pending, code);
+    match &res {
+        Ok(_) => tstat_log(&pair_finish_log_line(true, None)),
+        Err(e) => tstat_log(&pair_finish_log_line(false, Some(&format!("{e}")))),
+    }
+    res
+}
+
+fn finish_pair_setup_inner(mut pending: PendingPairSetup, code: &str) -> HapResult<ThermostatPairing> {
     let pin = normalize_setup_code(code)?;
     let mut conn = pending
         .conn
@@ -1355,6 +1447,16 @@ pub struct CharInfo {
     #[allow(dead_code)]
     #[serde(default)]
     pub format: Option<String>,
+    /// HAP characteristic properties for write validation (v1.6.4):
+    /// the step the accessory accepts, plus its range. Absent on
+    /// accessories that don't report them (then set_state falls back
+    /// to 0.5 °C steps with no clamping).
+    #[serde(default, rename = "minStep")]
+    pub min_step: Option<f64>,
+    #[serde(default, rename = "minValue")]
+    pub min_value: Option<f64>,
+    #[serde(default, rename = "maxValue")]
+    pub max_value: Option<f64>,
 }
 
 /// Normalize a HAP service/characteristic type to its 8-digit prefix.
@@ -1413,6 +1515,18 @@ pub struct ThermostatState {
     pub w_heat_to: Option<(u32, u32)>,
     pub w_cool_to: Option<(u32, u32)>,
     pub w_fan_active: Option<(u32, u32)>,
+    // Write validation (v1.6.4): the step/range each temperature
+    // characteristic reports, recorded alongside its write target
+    // so set_state can quantize writes the accessory accepts.
+    pub step_target_temp: Option<f64>,
+    pub min_target_temp: Option<f64>,
+    pub max_target_temp: Option<f64>,
+    pub step_heat_to: Option<f64>,
+    pub min_heat_to: Option<f64>,
+    pub max_heat_to: Option<f64>,
+    pub step_cool_to: Option<f64>,
+    pub min_cool_to: Option<f64>,
+    pub max_cool_to: Option<f64>,
     // Read targets (aid, iid) for characteristics that are never
     // written but must be readable via /characteristics when
     // /accessories omits their values.
@@ -1467,15 +1581,24 @@ pub fn state_from_accessories(accs: &[AccessoryInfo]) -> ThermostatState {
                         }
                         CH_TARGET_TEMP => {
                             st.w_target_temp = Some((acc.aid, ch.iid));
+                            st.step_target_temp = ch.min_step;
+                            st.min_target_temp = ch.min_value;
+                            st.max_target_temp = ch.max_value;
                         }
                         CH_TEMP_UNITS => {
                             st.r_units = Some((acc.aid, ch.iid));
                         }
                         CH_HEAT_TO => {
                             st.w_heat_to = Some((acc.aid, ch.iid));
+                            st.step_heat_to = ch.min_step;
+                            st.min_heat_to = ch.min_value;
+                            st.max_heat_to = ch.max_value;
                         }
                         CH_COOL_TO => {
                             st.w_cool_to = Some((acc.aid, ch.iid));
+                            st.step_cool_to = ch.min_step;
+                            st.min_cool_to = ch.min_value;
+                            st.max_cool_to = ch.max_value;
                         }
                         CH_HUMIDITY => {
                             st.r_humidity = Some((acc.aid, ch.iid));
@@ -1671,65 +1794,187 @@ fn fetch_state_inner(pairing: &ThermostatPairing) -> HapResult<ThermostatState> 
 /// Fetch the thermostat state, with one automatic retry on IO failure
 /// (e.g. a stale connection) using a fresh session. Counters are never
 /// reused across sessions -- the retry opens a brand-new pair-verify.
+/// Logs the outcome + duration (modes and temperatures only).
 pub fn fetch_state(pairing: &ThermostatPairing) -> HapResult<ThermostatState> {
-    match fetch_state_inner(pairing) {
+    let started = std::time::Instant::now();
+    let res = match fetch_state_inner(pairing) {
         Ok(s) => Ok(s),
         Err(HapError::Io(_)) => fetch_state_inner(pairing),
         Err(e) => Err(e),
+    };
+    match &res {
+        Ok(st) => tstat_log(&format!(
+            "Fetch ok: {} indoor {:.0}°F setpoint {:.0}°F ({:.1}s)",
+            mode_name(st.target_mode),
+            c_to_f(st.current_temp_c),
+            c_to_f(st.target_temp_c),
+            started.elapsed().as_secs_f64()
+        )),
+        Err(e) => tstat_log(&format!(
+            "Fetch failed: {e} ({:.1}s)",
+            started.elapsed().as_secs_f64()
+        )),
+    }
+    res
+}
+
+/// Quantize a Celsius write to the characteristic's accepted step
+/// (round to nearest step; fall back to 0.5 °C when the accessory
+/// reports no step or a non-positive one), then clamp to its
+/// reported range. The T6 rejects unrounded values (e.g. 78 °F ->
+/// 25.555... °C) with HAP status -70410 (Invalid Value).
+pub fn quantize_temp(value: f64, step: Option<f64>, min: Option<f64>, max: Option<f64>) -> f64 {
+    let step = step.filter(|s| *s > 0.0).unwrap_or(0.5);
+    let mut v = (value / step).round() * step;
+    // Scrub binary float dust (25.500000000000004 -> 25.5) so the
+    // JSON value is exactly the stepped value.
+    v = (v * 1_000_000_000.0).round() / 1_000_000_000.0;
+    if let Some(lo) = min {
+        if v < lo {
+            v = lo;
+        }
+    }
+    if let Some(hi) = max {
+        if v > hi {
+            v = hi;
+        }
+    }
+    v
+}
+
+/// Outcome of a set: Confirmed means the post-PUT readback succeeded
+/// (the state carries real read values); Optimistic means the PUT
+/// succeeded but the readback failed, so the state is the pre-write
+/// state patched with exactly the values that were PUT (never
+/// invented values) — the caller must re-fetch promptly to confirm.
+pub enum SetOutcome {
+    Confirmed(ThermostatState),
+    Optimistic(ThermostatState),
+}
+
+/// Patch a state with the values from a writes list, matching each
+/// write's (aid, iid) against the state's write targets. Writes to
+/// unknown addresses are ignored; fields with no write keep their
+/// current value.
+fn apply_writes_to_state(st: &mut ThermostatState, writes: &[(u32, u32, serde_json::Value)]) {
+    for (a, i, v) in writes {
+        let addr = (*a, *i);
+        if Some(addr) == st.w_target_mode {
+            if let Some(m) = as_u8(v) {
+                st.target_mode = m;
+            }
+        } else if Some(addr) == st.w_target_temp {
+            if let Some(t) = as_f64(v) {
+                st.target_temp_c = t;
+            }
+        } else if Some(addr) == st.w_heat_to {
+            if let Some(t) = as_f64(v) {
+                st.heat_to_c = Some(t);
+            }
+        } else if Some(addr) == st.w_cool_to {
+            if let Some(t) = as_f64(v) {
+                st.cool_to_c = Some(t);
+            }
+        } else if Some(addr) == st.w_fan_active {
+            st.fan_on = as_u8(v).map(|u| u != 0);
+        }
     }
 }
 
-/// Apply changes, then read back exactly the written characteristics and
-/// report the actual values (the returned state reflects the readback).
+/// Apply changes, then read back exactly the written characteristics
+/// and report the actual values (the returned state reflects the
+/// readback). If the PUT succeeds but the readback fails, the set
+/// still counts as applied — the returned state is the intended one
+/// (Optimistic) instead of an error, because the device already
+/// applied the write; failing here is what left the tile stale
+/// until a much later autorefresh.
 pub fn set_state(
     pairing: &ThermostatPairing,
     changes: &ThermostatChanges,
-) -> HapResult<ThermostatState> {
+) -> HapResult<SetOutcome> {
+    let started = std::time::Instant::now();
     let mut sess = SecureConn::open(pairing)?;
     let mut st = fetch_via(&mut sess)?;
     let mut writes: Vec<(u32, u32, serde_json::Value)> = Vec::new();
+    let mut requested: Vec<String> = Vec::new();
     if let Some(m) = changes.target_mode {
         if let Some(t) = st.w_target_mode {
             writes.push((t.0, t.1, serde_json::json!(m)));
+            requested.push(format!("mode={}", mode_name(m)));
         }
     }
     if let Some(t) = changes.target_temp_c {
         if let Some(w) = st.w_target_temp {
-            writes.push((w.0, w.1, serde_json::json!(t)));
+            let q = quantize_temp(t, st.step_target_temp, st.min_target_temp, st.max_target_temp);
+            writes.push((w.0, w.1, serde_json::json!(q)));
+            requested.push(format!("target={q}°C (req {t}°C)"));
         }
     }
     if let Some(t) = changes.heat_to_c {
         if let Some(w) = st.w_heat_to {
-            writes.push((w.0, w.1, serde_json::json!(t)));
+            let q = quantize_temp(t, st.step_heat_to, st.min_heat_to, st.max_heat_to);
+            writes.push((w.0, w.1, serde_json::json!(q)));
+            requested.push(format!("heat-to={q}°C (req {t}°C)"));
         }
     }
     if let Some(t) = changes.cool_to_c {
         if let Some(w) = st.w_cool_to {
-            writes.push((w.0, w.1, serde_json::json!(t)));
+            let q = quantize_temp(t, st.step_cool_to, st.min_cool_to, st.max_cool_to);
+            writes.push((w.0, w.1, serde_json::json!(q)));
+            requested.push(format!("cool-to={q}°C (req {t}°C)"));
         }
     }
     if let Some(on) = changes.fan_on {
         if let Some(w) = st.w_fan_active {
             writes.push((w.0, w.1, serde_json::json!(if on { 1 } else { 0 })));
+            requested.push(format!("fan={}", if on { "on" } else { "auto" }));
         }
     }
     if writes.is_empty() {
-        return Ok(st);
+        return Ok(SetOutcome::Confirmed(st));
     }
+    let secs = || started.elapsed().as_secs_f64();
     let failures = sess.put_characteristics(&writes)?;
     if !failures.is_empty() {
         let desc: Vec<String> = failures
             .iter()
-            .map(|(a, i, s)| format!("{}.{} -> status {}", a, i, s))
+            .map(|(a, i, s)| format!("{a}.{i} -> status {s}"))
             .collect();
-        return err(format!("thermostat rejected write(s): {}", desc.join(", ")));
+        let msg = format!("thermostat rejected write(s): {}", desc.join(", "));
+        tstat_log(&set_log_line(
+            &requested.join(", "),
+            &format!("PUT rejected: {}", desc.join(", ")),
+            "no readback",
+            secs(),
+        ));
+        return err(msg);
     }
     // Read back the written characteristics and patch the state with
     // the same overlay mapping the fetch path uses.
     let ids: Vec<(u32, u32)> = writes.iter().map(|(a, i, _)| (*a, *i)).collect();
-    let back = sess.get_characteristics(&ids)?;
-    overlay_values(&mut st, &back);
-    Ok(st)
+    match sess.get_characteristics(&ids) {
+        Ok(back) => {
+            overlay_values(&mut st, &back);
+            tstat_log(&set_log_line(&requested.join(", "), "PUT ok", "readback ok", secs()));
+            Ok(SetOutcome::Confirmed(st))
+        }
+        Err(e) => {
+            // The PUT already applied on the device (a mode change
+            // shows instantly on the unit) — failing the whole set
+            // here is what left the tile stale until autorefresh.
+            // Return the intended state instead; the caller
+            // re-fetches promptly to confirm.
+            let mut intended = st;
+            apply_writes_to_state(&mut intended, &writes);
+            tstat_log(&set_log_line(
+                &requested.join(", "),
+                "PUT ok",
+                &format!("readback failed ({e}) — optimistic state"),
+                secs(),
+            ));
+            Ok(SetOutcome::Optimistic(intended))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1755,7 +2000,28 @@ pub struct DiscoveredDevice {
     pub protocol_version: String,
 }
 
+/// Discovery via mDNS, with a diagnostics-log entry for the outcome.
+/// Device names/models come from the mDNS TXT record (not secrets).
 pub fn discover(timeout: Duration) -> HapResult<Vec<DiscoveredDevice>> {
+    let res = discover_inner(timeout);
+    match &res {
+        Ok(devs) => {
+            if devs.is_empty() {
+                tstat_log("Discovery: no devices found");
+            } else {
+                let names: Vec<String> = devs
+                    .iter()
+                    .map(|d| format!("{} ({})", d.name, d.model))
+                    .collect();
+                tstat_log(&format!("Discovery: {} device(s): {}", devs.len(), names.join(", ")));
+            }
+        }
+        Err(e) => tstat_log(&format!("Discovery failed: {e}")),
+    }
+    res
+}
+
+fn discover_inner(timeout: Duration) -> HapResult<Vec<DiscoveredDevice>> {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
     use std::time::Instant;
 
@@ -1892,6 +2158,143 @@ mod tests {
         assert!(normalize_setup_code("123456789").is_err());
         assert!(normalize_setup_code("1234abcd").is_err());
         assert!(normalize_setup_code("").is_err());
+    }
+
+    #[test]
+    fn temp_write_quantization() {
+        // v1.6.4: the field case — 78 °F converts to 25.555... °C,
+        // which the T6 rejects (-70410); a 0.5 °C step turns it into
+        // 25.5, the value the unit accepts (and displays as 78 °F).
+        assert_eq!(quantize_temp(f_to_c(78.0), Some(0.5), None, None), 25.5);
+        assert_eq!(quantize_temp(25.555555555555557, Some(0.5), None, None), 25.5);
+        // No step reported: fall back to 0.5 °C steps.
+        assert_eq!(quantize_temp(25.555555555555557, None, None, None), 25.5);
+        // Non-positive steps are garbage: same fallback.
+        assert_eq!(quantize_temp(25.555555555555557, Some(0.0), None, None), 25.5);
+        assert_eq!(quantize_temp(25.555555555555557, Some(-1.0), None, None), 25.5);
+        // Other steps and on-step values.
+        assert_eq!(quantize_temp(25.555555555555557, Some(1.0), None, None), 26.0);
+        assert_eq!(quantize_temp(25.5, Some(0.5), None, None), 25.5);
+        assert_eq!(quantize_temp(22.0, Some(0.5), None, None), 22.0);
+        // Clamping to the reported range (after rounding).
+        assert_eq!(quantize_temp(5.0, Some(0.5), Some(10.0), Some(30.0)), 10.0);
+        assert_eq!(quantize_temp(35.0, Some(0.5), Some(10.0), Some(30.0)), 30.0);
+        assert_eq!(quantize_temp(25.555555555555557, Some(0.5), Some(10.0), Some(30.0)), 25.5);
+    }
+
+    #[test]
+    fn thermostat_step_range_recorded_from_accessories() {
+        // v1.6.4: step/range travel with the write target, and old
+        // fixtures without them still load (serde defaults -> None).
+        let json = serde_json::json!({
+            "aid": 1,
+            "services": [{
+                "iid": 10,
+                "type": "0000004A-0000-1000-8000-0026BB765291",
+                "characteristics": [
+                    { "iid": 14, "type": "00000035-0000-1000-8000-0026BB765291", "value": 22.0,
+                      "minStep": 0.5, "minValue": 10.0, "maxValue": 30.0 },
+                    { "iid": 16, "type": "00000012-0000-1000-8000-0026BB765291", "value": 21.0,
+                      "minStep": 1.0 },
+                    { "iid": 17, "type": "0000000D-0000-1000-8000-0026BB765291", "value": 24.0 }
+                ]
+            }]
+        });
+        let acc: AccessoryInfo = serde_json::from_value(json).unwrap();
+        let st = state_from_accessories(&[acc]);
+        assert_eq!(st.w_target_temp, Some((1, 14)));
+        assert_eq!(st.step_target_temp, Some(0.5));
+        assert_eq!(st.min_target_temp, Some(10.0));
+        assert_eq!(st.max_target_temp, Some(30.0));
+        assert_eq!(st.step_heat_to, Some(1.0));
+        assert_eq!(st.min_heat_to, None);
+        assert_eq!(st.step_cool_to, None);
+        assert_eq!(st.min_cool_to, None);
+        assert_eq!(st.max_cool_to, None);
+    }
+
+    #[test]
+    fn optimistic_state_patches_only_written_fields() {
+        // v1.6.4: the readback-failure fallback patches exactly the
+        // values that were PUT — nothing else, nothing invented.
+        let mut st = ThermostatState {
+            target_mode: 1,
+            target_temp_c: 21.0,
+            heat_to_c: Some(20.0),
+            cool_to_c: Some(24.0),
+            fan_on: Some(false),
+            w_target_mode: Some((1, 12)),
+            w_target_temp: Some((1, 14)),
+            w_heat_to: Some((1, 16)),
+            w_cool_to: Some((1, 17)),
+            w_fan_active: Some((1, 21)),
+            ..Default::default()
+        };
+        let writes = vec![
+            (1u32, 12u32, serde_json::json!(2)),
+            (1u32, 14u32, serde_json::json!(25.5)),
+            // An address this state has no target for: ignored.
+            (1u32, 99u32, serde_json::json!(0)),
+        ];
+        apply_writes_to_state(&mut st, &writes);
+        assert_eq!(st.target_mode, 2);
+        assert_eq!(st.target_temp_c, 25.5);
+        // No write for these: untouched.
+        assert_eq!(st.heat_to_c, Some(20.0));
+        assert_eq!(st.cool_to_c, Some(24.0));
+        assert_eq!(st.fan_on, Some(false));
+    }
+
+    #[test]
+    fn tstat_log_ring_cap_evicts_oldest() {
+        // Only this test pushes to the shared buffer (it clears
+        // first); the assertions are written to survive one foreign
+        // line from the unreachable-host test landing anywhere.
+        tstat_log_clear();
+        for i in 0..205 {
+            tstat_log(&format!("entry {i:03}"));
+        }
+        let text = tstat_log_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 200);
+        // The newest entry always survives; the five oldest of this
+        // test's own pushes are evicted by its own later pushes no
+        // matter where a foreign line interleaves.
+        assert!(text.contains("entry 204"));
+        for i in 0..5 {
+            assert!(!text.contains(&format!("entry {i:03}")));
+        }
+    }
+
+    #[test]
+    fn tstat_log_lines_carry_no_secret_material() {
+        // Regression guard for the v1.6.4 logger: the line builders
+        // take no code/key parameter at all (structural guarantee),
+        // and their output for representative inputs contains
+        // neither a setup code nor key material. The call sites pass
+        // outcomes, temperatures, modes, ids, and statuses only.
+        let pin = "123-45-678";
+        let key_hex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let begin = pair_begin_log_line("Tstat-79E7F2");
+        assert!(begin.contains("Tstat-79E7F2"));
+        assert!(!begin.contains(pin));
+        assert!(!begin.contains(key_hex));
+        let finish_ok = pair_finish_log_line(true, None);
+        let finish_err = pair_finish_log_line(false, Some("accessory proof mismatch -- wrong setup code?"));
+        for line in [&finish_ok, &finish_err] {
+            assert!(!line.contains(pin));
+            assert!(!line.contains(key_hex));
+        }
+        let set = set_log_line(
+            "mode=Cool, target=25.5°C (req 25.555555555555557°C)",
+            "PUT rejected: 1.278 -> status -70410",
+            "no readback",
+            1.2,
+        );
+        assert!(set.contains("25.5°C"));
+        assert!(set.contains("1.278 -> status -70410"));
+        assert!(!set.contains(pin));
+        assert!(!set.contains(key_hex));
     }
 
     #[test]

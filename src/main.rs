@@ -1,9 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! SmartLife & Tuya Desktop (native desktop editions: Windows &
+//! Homestead (native desktop editions: Windows &
 //! macOS) — a clean dashboard for
 //! Smart Life / Tuya devices, 1:1 with the single-file web edition in
-//! `web/SmartLife_Tuya_Desktop.html`. Both talk to Tuya's legacy consumer
+//! `web/Homestead.html`. Both talk to Tuya's legacy consumer
 //! cloud API ("homeassistant" API):
 //!   POST {base}auth.do   — login / token refresh
 //!   POST {base}skill     — Discovery (device list) / Control (commands)
@@ -141,7 +141,7 @@ fn hex_to_color32(hex: &str) -> Color32 {
 }
 
 // ---------------------------------------------------------------------------
-// Config (JSON, %APPDATA%\SmartLifeTuyaDesktop\config.json on Windows)
+// Config (JSON, %APPDATA%\Homestead\config.json on Windows)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -440,7 +440,7 @@ fn config_path() -> PathBuf {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     }
     .unwrap_or_else(|| PathBuf::from("."));
-    base.join("SmartLifeTuyaDesktop").join("config.json")
+    base.join("Homestead").join("config.json")
 }
 
 /// The directory holding config.json — sibling files (the macOS
@@ -1026,7 +1026,7 @@ fn app_paths_lookup(_name: &str) -> Option<PathBuf> {
 
 /// The per-user autostart (Run) key + this app's value name in it.
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_VALUE_NAME: &str = "SmartLifeTuyaDesktop";
+const RUN_VALUE_NAME: &str = "Homestead";
 
 /// How the app presents itself at launch. Carried as a flag in the
 /// autostart command ("--minimized" / "--maximized") and honoured
@@ -1446,6 +1446,20 @@ const SNAP_MAX_MOVES: u8 = 2;
 /// never wedged mid-transition.
 const SNAP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Launch-window self-check budget (v2.0.1): the window after
+/// the first frame during which a Maximized launch is
+/// re-verified against its remembered monitor. Covers an initial
+/// snap (≤ SNAP_TIMEOUT) plus a settle pause plus one re-armed
+/// snap (≤ SNAP_TIMEOUT) with room to spare; past it the check
+/// stops permanently for the session and the window stays
+/// wherever it verifiably is.
+const STARTUP_CHECK_WINDOW: Duration = Duration::from_secs(10);
+/// Settle pause after a snap job ends before the self-check may
+/// act on a wrong-monitor reading: a just-maximized window can
+/// transiently straddle monitors while the OS animation lands,
+/// and spending the one re-arm on that transient would waste it.
+const STARTUP_CHECK_SETTLE: Duration = Duration::from_millis(500);
+
 /// The pure snap decision: (next phase, this frame's action).
 /// Arrival beats expiry — a window that just landed is
 /// maximized, not failed. Kept free of Win32 so the whole
@@ -1480,6 +1494,90 @@ fn snap_next(phase: SnapPhase, f: SnapFacts, attempts: u8) -> (SnapPhase, SnapAc
     }
 }
 
+/// What the launch-window self-check should do this frame.
+/// Kept free of Win32 so the whole decision table is
+/// unit-testable headlessly, like snap_next.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum StartupCheckAction {
+    /// A snap is in flight, or the window is settling after one:
+    /// observe only, decide nothing.
+    Wait,
+    /// The window is on the intended monitor: the check is done.
+    Resolve,
+    /// The window was maximized, then left that state with no
+    /// snap in flight: the user took over — stop permanently,
+    /// with no unresolved latch (a deliberate move is never
+    /// recorded as a failed landing).
+    StopUserTakeover,
+    /// The launch window ran out with the window still off the
+    /// intended monitor: stop permanently; the caller latches
+    /// the monitor it expired on so the remember side does not
+    /// overwrite the intended monitor with the failed landing.
+    ExpireUnresolved,
+    /// Off the intended monitor, settled, re-arm still unused:
+    /// arm one more silent snap.
+    ArmSnap,
+}
+
+/// The facts the self-check decision needs, gathered fresh per
+/// frame by the Win32 wrapper.
+#[derive(Clone, Copy, Default)]
+struct StartupCheckFacts {
+    /// A snap job is in flight this frame.
+    snap_active: bool,
+    /// The launch window has run out.
+    expired: bool,
+    /// The window is maximized (IsZoomed) this frame.
+    maximized: bool,
+    /// MonitorFromWindow names the intended monitor.
+    on_target: bool,
+    /// The post-snap settle pause has passed.
+    settle_passed: bool,
+    /// The window's top-left moved since the previous check
+    /// frame (a move with no snap in flight means something
+    /// other than the check moved it).
+    moved: bool,
+}
+
+/// Pure launch self-check decision (v2.0.1): arrival beats
+/// everything (a window on target resolves even on the deadline
+/// frame); a user takeover beats expiry (a deliberate move must
+/// never be latched as a failed landing, and must never spend
+/// the re-arm); the one re-arm is spent only on a settled,
+/// off-target reading. A snap-failure restored state looks
+/// exactly like a user takeover, so it is exempted from the
+/// takeover rule via last_snap_failed — unless the window
+/// actually moved since (a drag after a failed snap is still a
+/// takeover, and must never be fought).
+fn startup_check_next(
+    f: StartupCheckFacts,
+    rearm_used: bool,
+    seen_maximized: bool,
+    last_snap_failed: bool,
+) -> (StartupCheckAction, bool) {
+    use StartupCheckAction::*;
+    let seen_maximized = seen_maximized || f.maximized;
+    if f.snap_active {
+        return (Wait, seen_maximized);
+    }
+    if f.on_target {
+        return (Resolve, seen_maximized);
+    }
+    if !f.settle_passed {
+        return (Wait, seen_maximized);
+    }
+    if seen_maximized && !f.maximized && (!last_snap_failed || f.moved) {
+        return (StopUserTakeover, seen_maximized);
+    }
+    if f.expired {
+        return (ExpireUnresolved, seen_maximized);
+    }
+    if !rearm_used {
+        return (ArmSnap, seen_maximized);
+    }
+    (Wait, seen_maximized)
+}
+
 /// An in-flight snap (v1.3.1): created by a Monitor-menu click,
 /// advanced per frame by App::advance_snap, dropped on success,
 /// failure or timeout. Never persisted.
@@ -1491,6 +1589,67 @@ struct SnapJob {
     phase: SnapPhase,
     attempts: u8,
     deadline: Instant,
+}
+
+/// Launch-window self-check state (v2.0.1, Windows): the
+/// maximized launch is re-verified against its remembered
+/// monitor for a bounded window after the first frame. Grouped
+/// so the App struct carries one field for the whole check.
+/// Identity only throughout — the remembered device string and
+/// the intended monitor's handle — never geometry.
+#[derive(Clone)]
+struct StartupCheckState {
+    /// The check is still running (cleared on resolve, user
+    /// takeover, or window expiry — never re-armed).
+    active: bool,
+    /// First frame + STARTUP_CHECK_WINDOW.
+    deadline: Instant,
+    /// Remembered device identity the check verifies against.
+    device: String,
+    /// HMONITOR of the intended monitor once resolved from the
+    /// device identity (0 = not resolved yet).
+    target: isize,
+    /// The check's one re-arm has been spent.
+    rearm_used: bool,
+    /// The window has been observed maximized during the check
+    /// (arms the user-takeover rule).
+    seen_maximized: bool,
+    /// A snap job was in flight on the previous check frame —
+    /// the transition to none starts the settle pause.
+    prev_snap: bool,
+    /// End of the post-snap settle pause (None = no pause).
+    settle_until: Option<Instant>,
+    /// The window's top-left on the previous check frame (the
+    /// user-move signal; None = not observed yet).
+    last_pos: Option<[i32; 2]>,
+    /// The check expired with the window still off target (see
+    /// the remember-side latch below).
+    unresolved: bool,
+    /// The monitor the window expired on (the failed landing).
+    unresolved_monitor: isize,
+    /// The last silent startup snap ended in failure (set by
+    /// advance_snap for silent jobs only): distinguishes a
+    /// snap-failure restored state from a user takeover.
+    last_snap_failed: bool,
+}
+
+impl Default for StartupCheckState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            deadline: Instant::now(),
+            device: String::new(),
+            target: 0,
+            rearm_used: false,
+            seen_maximized: false,
+            prev_snap: false,
+            settle_until: None,
+            last_pos: None,
+            unresolved: false,
+            unresolved_monitor: 0,
+            last_snap_failed: false,
+        }
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1513,6 +1672,20 @@ fn win32_needs_restore(hwnd: isize) -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn win32_needs_restore(_hwnd: isize) -> bool {
+    false
+}
+
+/// Maximized only (IsZoomed) — the self-check's user-takeover
+/// signal, distinct from win32_needs_restore (which also counts
+/// minimized).
+#[cfg(target_os = "windows")]
+fn win32_is_maximized(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed;
+    unsafe { IsZoomed(hwnd as _) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_is_maximized(_hwnd: isize) -> bool {
     false
 }
 
@@ -1592,6 +1765,26 @@ fn win32_window_size_px(_hwnd: isize) -> [i32; 2] {
     [1120, 780]
 }
 
+/// The window's top-left in PHYSICAL pixels (GetWindowRect) —
+/// the self-check's user-move signal: a top-left change with no
+/// snap in flight means something other than the check moved it.
+#[cfg(target_os = "windows")]
+fn win32_window_pos_px(hwnd: isize) -> [i32; 2] {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut rc: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd as _, &mut rc) } != 0 {
+        [rc.left, rc.top]
+    } else {
+        [0, 0]
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn win32_window_pos_px(_hwnd: isize) -> [i32; 2] {
+    [0, 0]
+}
+
 /// Parse a NAMED REG_SZ value out of `reg query` output (the App
 /// Paths parser reads the "(Default)" value; the Run key's values
 /// are named, so the name must head the line).
@@ -1641,8 +1834,8 @@ fn close_action(close_to_tray: bool, quitting: bool) -> CloseAction {
 // ---------------------------------------------------------------------------
 
 /// Kernel object names for the instance guard and the show signal.
-const SINGLE_INSTANCE_MUTEX: &str = "SmartLifeTuyaDesktop.SingleInstance";
-const SHOW_WINDOW_EVENT: &str = "SmartLifeTuyaDesktop.ShowWindow";
+const SINGLE_INSTANCE_MUTEX: &str = "Homestead.SingleInstance";
+const SHOW_WINDOW_EVENT: &str = "Homestead.ShowWindow";
 
 /// Set by the primary's waiter thread when a secondary launch asks
 /// it to show its window; consumed by handle_window_chrome.
@@ -2046,7 +2239,7 @@ fn reg_command() -> Command {
 
 /// This app's LaunchAgent label (= plist file stem).
 #[cfg(any(target_os = "macos", test))]
-const LAUNCH_AGENT_LABEL: &str = "com.shawnrodis.smartlifetuya";
+const LAUNCH_AGENT_LABEL: &str = "com.shawnrodis.homestead";
 
 /// Where the LaunchAgent plist lives (macOS).
 #[cfg(target_os = "macos")]
@@ -2280,7 +2473,7 @@ enum TrayAction {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn build_tray() -> Option<TrayState> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
-    let open_item = MenuItem::new("Open SmartLife & Tuya Desktop", true, None);
+    let open_item = MenuItem::new("Open Homestead", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -2296,7 +2489,7 @@ fn build_tray() -> Option<TrayState> {
     .ok()?;
     let tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("SmartLife & Tuya Desktop")
+        .with_tooltip("Homestead")
         .with_icon(icon)
         .build()
         .ok()?;
@@ -2378,19 +2571,19 @@ fn show_tray_balloon(hwnd: isize) {
             hicon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
         }
         nid.hIcon = hicon;
-        let tip = "SmartLife & Tuya Desktop";
+        let tip = "Homestead";
         for (i, ch) in tip.encode_utf16().enumerate() {
             if i + 1 < nid.szTip.len() {
                 nid.szTip[i] = ch;
             }
         }
-        let title = "SmartLife & Tuya Desktop";
+        let title = "Homestead";
         for (i, ch) in title.encode_utf16().enumerate() {
             if i + 1 < nid.szInfoTitle.len() {
                 nid.szInfoTitle[i] = ch;
             }
         }
-        let msg = "SmartLife & Tuya Desktop is still running in the system tray — right-click its icon to quit.";
+        let msg = "Homestead is still running in the system tray — right-click its icon to quit.";
         for (i, ch) in msg.encode_utf16().enumerate() {
             if i + 1 < nid.szInfo.len() {
                 nid.szInfo[i] = ch;
@@ -3662,6 +3855,17 @@ enum TstatResult {
     },
     Paired(crate::hap::ThermostatPairing),
     State(crate::hap::ThermostatState),
+    /// A fetch success (autorefresh, manual Refresh, post-pairing,
+    /// bridge Status, optimistic re-fetch). Clears fetch-busy only —
+    /// never the action flag, so a fetch result can never end an
+    /// action's "Working…" early.
+    Fetched(crate::hap::ThermostatState),
+    /// A fetch failure. Clears fetch-busy only.
+    FetchFailed(String),
+    /// An optimistic set: the PUT succeeded but the readback failed,
+    /// so the state is the intended one (see hap::SetOutcome). Handled
+    /// like State, plus a prompt re-fetch to confirm.
+    StateConfirm(crate::hap::ThermostatState),
     Failed(String),
 }
 
@@ -3695,9 +3899,9 @@ struct BridgePending {
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_API: &str =
-    "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
+    "https://api.github.com/repos/shawnrodis/Homestead/releases/latest";
 const RELEASES_PAGE: &str =
-    "https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
+    "https://github.com/shawnrodis/Homestead/releases/latest";
 const UPDATE_PERIOD_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The release asset THIS platform installs from: the Windows
@@ -3707,9 +3911,9 @@ const UPDATE_PERIOD_MS: i64 = 24 * 60 * 60 * 1000;
 /// app must never be offered the .exe (or vice versa).
 fn expected_update_asset_name_for(version: &str, os: &str) -> String {
     if os == "macos" {
-        format!("SmartLifeTuyaDesktop-v{}.dmg", version)
+        format!("Homestead-v{}.dmg", version)
     } else {
-        format!("SmartLifeTuyaDesktop-Setup-v{}.exe", version)
+        format!("Homestead-Setup-v{}.exe", version)
     }
 }
 
@@ -4359,6 +4563,10 @@ struct App {
     /// monitor feature. Compared every frame; a change persists
     /// the new display's device identity.
     last_seen_monitor: isize,
+    /// Launch-window self-check state (v2.0.1, Windows): the
+    /// bounded re-verification of a Maximized launch against
+    /// its remembered monitor (see StartupCheckState).
+    startup_check: StartupCheckState,
     // rate-limit backoff (v1.2.0): while set, autorefresh skips
     // discovery cycles instead of warning the user.
     disc_backoff_until: Option<Instant>,
@@ -4394,7 +4602,17 @@ struct App {
     // long-term keys in cfg.thermostat are saved, same trust model
     // as the "keep me logged in" Tuya credentials.
     tstat_setup_code: String,
+    /// Action-busy (v1.6.4 split): a user-initiated thermostat
+    /// operation is running — set, discovery, pairing. Only this
+    /// flag shows "Working…" on the card and in Settings.
     tstat_busy: bool,
+    /// Fetch-busy (v1.6.4 split): a status fetch is running
+    /// (autorefresh, manual Refresh, post-pairing, bridge Status,
+    /// optimistic re-fetch). Fetches are silent: no "Working…"
+    /// text anywhere, though the Refresh button stays disabled
+    /// while one runs. Both flags together keep operations
+    /// serialized exactly as the single flag did before.
+    tstat_fetch_busy: bool,
     tstat_state: Option<crate::hap::ThermostatState>,
     tstat_error: Option<String>,
     tstat_discovered: Vec<crate::hap::DiscoveredDevice>,
@@ -4573,6 +4791,7 @@ impl App {
             snap_job: None,
             startup_monitor_checked: false,
             last_seen_monitor: 0,
+            startup_check: StartupCheckState::default(),
             disc_backoff_until: None,
             disc_freq_streak: 0,
             pumps: HashMap::new(),
@@ -4588,6 +4807,7 @@ impl App {
             cfg: Config::default(),
             tstat_setup_code: String::new(),
             tstat_busy: false,
+            tstat_fetch_busy: false,
             tstat_state: None,
             tstat_error: None,
             tstat_discovered: Vec::new(),
@@ -4845,7 +5065,7 @@ impl App {
                     .get(RELEASES_API)
                     .header(
                         "User-Agent",
-                        concat!("SmartLifeTuyaDesktop/", env!("CARGO_PKG_VERSION")),
+                        concat!("Homestead/", env!("CARGO_PKG_VERSION")),
                     )
                     .header("Accept", "application/vnd.github+json")
                     .send()
@@ -4883,7 +5103,7 @@ impl App {
                     .get(&url)
                     .header(
                         "User-Agent",
-                        concat!("SmartLifeTuyaDesktop/", env!("CARGO_PKG_VERSION")),
+                        concat!("Homestead/", env!("CARGO_PKG_VERSION")),
                     )
                     .send()
                     .map_err(|e| e.to_string())?;
@@ -5533,11 +5753,27 @@ impl App {
             return;
         }
         self.startup_monitor_checked = true;
-        if self.launch_mode != LaunchMode::Maximized || self.snap_job.is_some() {
+        if self.launch_mode != LaunchMode::Maximized {
             return;
         }
         let saved = self.cfg.prefs.last_monitor_device.clone();
         if saved.is_empty() {
+            return;
+        }
+        // v2.0.1: arm the launch-window self-check alongside the
+        // one-shot restore. The check stays live even when this
+        // first frame arms no snap — the window may not be
+        // ready yet (no HWND), the display may enumerate late,
+        // or the window may open on target and drift during
+        // startup settling — and the per-frame check covers all
+        // three holes the one-shot check left open.
+        self.startup_check = StartupCheckState {
+            active: true,
+            deadline: Instant::now() + STARTUP_CHECK_WINDOW,
+            device: saved.clone(),
+            ..StartupCheckState::default()
+        };
+        if self.snap_job.is_some() {
             return;
         }
         let Some(hwnd) = main_hwnd(frame) else {
@@ -5560,6 +5796,107 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Launch-window self-check (v2.0.1, Windows): called every
+    /// frame from handle_window_chrome after advance_snap, so it
+    /// sees post-snap state. Re-verifies a Maximized launch
+    /// against its remembered monitor: resolves on arrival,
+    /// stops permanently on a user takeover or when the window
+    /// runs out, and otherwise re-arms ONE silent snap on a
+    /// settled off-target reading. Silent throughout — no
+    /// toasts, no user-visible messages — and never past the
+    /// launch window.
+    #[cfg(target_os = "windows")]
+    fn startup_monitor_self_check(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !self.startup_check.active {
+            return;
+        }
+        // A snap ending this frame starts the settle pause;
+        // the transition is observed here, every frame.
+        let snap_active = self.snap_job.is_some();
+        if self.startup_check.prev_snap && !snap_active {
+            self.startup_check.settle_until = Some(Instant::now() + STARTUP_CHECK_SETTLE);
+        }
+        self.startup_check.prev_snap = snap_active;
+        let Some(hwnd) = main_hwnd(frame) else {
+            // Window not ready yet; the window still bounds
+            // the wait, so just keep waiting.
+            return;
+        };
+        // Resolve the intended monitor's handle once; a fresh
+        // enumeration also covers a display that appears late.
+        if self.startup_check.target == 0 {
+            let monitors = enumerate_monitors();
+            if let Some(m) = monitors.iter().find(|m| m.device == self.startup_check.device) {
+                self.startup_check.target = m.handle;
+            }
+        }
+        // The user-move signal: a top-left change with no snap
+        // in flight means something other than the check moved
+        // the window. The baseline updates every frame, so a
+        // snap's own moves never read as user moves.
+        let pos = win32_window_pos_px(hwnd);
+        let moved = self.startup_check.last_pos.map(|p| p != pos).unwrap_or(false);
+        self.startup_check.last_pos = Some(pos);
+        let cur = win32_window_monitor(hwnd);
+        let facts = StartupCheckFacts {
+            snap_active,
+            expired: Instant::now() >= self.startup_check.deadline,
+            maximized: win32_is_maximized(hwnd),
+            on_target: self.startup_check.target != 0 && cur == self.startup_check.target,
+            settle_passed: self
+                .startup_check
+                .settle_until
+                .map(|t| Instant::now() >= t)
+                .unwrap_or(true),
+            moved,
+        };
+        let (action, seen) = startup_check_next(
+            facts,
+            self.startup_check.rearm_used,
+            self.startup_check.seen_maximized,
+            self.startup_check.last_snap_failed,
+        );
+        self.startup_check.seen_maximized = seen;
+        match action {
+            StartupCheckAction::Wait => {}
+            StartupCheckAction::Resolve | StartupCheckAction::StopUserTakeover => {
+                self.startup_check.active = false;
+                self.startup_check.last_snap_failed = false;
+            }
+            StartupCheckAction::ExpireUnresolved => {
+                self.startup_check.active = false;
+                self.startup_check.unresolved = true;
+                self.startup_check.unresolved_monitor = cur;
+                self.startup_check.last_snap_failed = false;
+            }
+            StartupCheckAction::ArmSnap => {
+                // Fresh enumeration: the target must still
+                // exist, and its handle may have changed since
+                // the check resolved it.
+                let monitors = enumerate_monitors();
+                let Some(target) = monitors
+                    .iter()
+                    .find(|m| m.device == self.startup_check.device)
+                    .cloned()
+                else {
+                    // Display gone; wait for the window to run
+                    // out (a missing display is a no-op).
+                    return;
+                };
+                self.startup_check.rearm_used = true;
+                self.startup_check.last_snap_failed = false;
+                self.snap_job = Some(SnapJob {
+                    silent: true,
+                    target,
+                    phase: SnapPhase::LeaveStates,
+                    attempts: 0,
+                    deadline: Instant::now() + SNAP_TIMEOUT,
+                });
+                ctx.request_repaint();
+            }
+        }
+    }
+
     /// Remember which monitor the window is on (v1.5.0,
     /// Windows): called every frame from handle_window_chrome
     /// while no snap is in flight. A changed HMONITOR resolves
@@ -5572,12 +5909,31 @@ impl App {
         if self.snap_job.is_some() {
             return;
         }
+        // v2.0.1: while the launch self-check is active, the
+        // window may sit on a wrong monitor transiently around
+        // a snap — recording that monitor would overwrite the
+        // intended one the check is still trying to reach.
+        if self.startup_check.active {
+            return;
+        }
         let Some(hwnd) = main_hwnd(frame) else {
             return;
         };
         let cur = win32_window_monitor(hwnd);
         if cur == 0 || cur == self.last_seen_monitor {
             return;
+        }
+        // v2.0.1: the check expired with the window still off
+        // target. The failed landing must not overwrite the
+        // intended monitor — but any later monitor change
+        // means a deliberate move or a display change, so it
+        // clears the latch and recording resumes from then on.
+        if self.startup_check.unresolved {
+            if cur == self.startup_check.unresolved_monitor {
+                return;
+            }
+            self.startup_check.unresolved = false;
+            self.startup_check.unresolved_monitor = 0;
         }
         self.last_seen_monitor = cur;
         let monitors = enumerate_monitors();
@@ -5660,6 +6016,12 @@ impl App {
             SnapAction::MaximizeAndFinish => {
                 win32_maximize_window(hwnd);
                 self.snap_job = None;
+                if silent {
+                    // A silent startup snap that landed clears
+                    // the failure flag (see the self-check's
+                    // takeover rule).
+                    self.startup_check.last_snap_failed = false;
+                }
                 if !silent {
                     self.toast(format!("Snapped to {}", target.name), false);
                 }
@@ -5667,6 +6029,14 @@ impl App {
             }
             SnapAction::Fail => {
                 self.snap_job = None;
+                if silent {
+                    // A silent startup snap that failed leaves
+                    // a restored window that looks exactly like
+                    // a user takeover — the self-check must
+                    // know it was the snap, so it re-arms
+                    // instead of stopping.
+                    self.startup_check.last_snap_failed = true;
+                }
                 if !silent {
                     self.toast(
                         format!("Couldn't move to {} — window left as-is", target.name),
@@ -5755,6 +6125,12 @@ impl App {
         #[cfg(target_os = "windows")]
         self.remember_window_monitor(frame);
         self.advance_snap(ctx, frame);
+        // Launch-window self-check (v2.0.1, Windows): re-verify
+        // the maximized launch against its remembered monitor
+        // and re-arm one silent snap on a settled miss — never
+        // past the launch window, never against a user move.
+        #[cfg(target_os = "windows")]
+        self.startup_monitor_self_check(ctx, frame);
         // Focus regained (clicking back into the window) is a
         // backoff reset trigger for camera feeds (v1.2.2).
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
@@ -6077,7 +6453,7 @@ impl App {
     // two pair-verify sessions never interleave on one pairing.
 
     fn spawn_tstat_discover(&mut self) {
-        if self.tstat_busy {
+        if self.tstat_busy || self.tstat_fetch_busy {
             return;
         }
         self.tstat_busy = true;
@@ -6099,7 +6475,7 @@ impl App {
     /// pending session is delivered back as TstatResult::PairBegun
     /// and held in App.tstat_pending until Finish or Cancel.
     fn spawn_tstat_begin(&mut self, device: crate::hap::DiscoveredDevice) {
-        if self.tstat_busy {
+        if self.tstat_busy || self.tstat_fetch_busy {
             return;
         }
         self.tstat_busy = true;
@@ -6119,7 +6495,7 @@ impl App {
     /// now. Takes (and thereby clears) the pending session, so a
     /// failed finish always returns the panel to Start pairing.
     fn spawn_tstat_finish(&mut self) {
-        if self.tstat_busy {
+        if self.tstat_busy || self.tstat_fetch_busy {
             return;
         }
         let Some(pending) = self.tstat_pending.take() else {
@@ -6138,14 +6514,19 @@ impl App {
         });
     }
 
-    fn spawn_tstat_fetch(&mut self) {
-        if self.tstat_busy {
-            return;
+    /// Status fetch (v1.6.4 busy split): sets fetch-busy only, so the
+    /// card and Settings stay silent — no "Working…" text. Returns
+    /// false when an operation is already running (the caller that
+    /// needs a guaranteed re-fetch, the optimistic-confirm handler,
+    /// runs after the current operation clears instead).
+    fn spawn_tstat_fetch(&mut self) -> bool {
+        if self.tstat_busy || self.tstat_fetch_busy {
+            return false;
         }
         let Some(pairing) = self.cfg.thermostat.clone() else {
-            return;
+            return false;
         };
-        self.tstat_busy = true;
+        self.tstat_fetch_busy = true;
         // Attempt time, not just success time: a failed fetch must not
         // make the autorefresh below retry every frame.
         self.tstat_last_fetch = Some(Instant::now());
@@ -6153,14 +6534,15 @@ impl App {
         thread::spawn(move || {
             let res = crate::hap::fetch_state(&pairing);
             let _ = tx.send(match res {
-                Ok(st) => TstatResult::State(st),
-                Err(e) => TstatResult::Failed(format!("Thermostat refresh failed: {}", e)),
+                Ok(st) => TstatResult::Fetched(st),
+                Err(e) => TstatResult::FetchFailed(format!("Thermostat refresh failed: {}", e)),
             });
         });
+        true
     }
 
     fn spawn_tstat_set(&mut self, changes: crate::hap::ThermostatChanges) {
-        if self.tstat_busy {
+        if self.tstat_busy || self.tstat_fetch_busy {
             return;
         }
         let Some(pairing) = self.cfg.thermostat.clone() else {
@@ -6171,7 +6553,8 @@ impl App {
         thread::spawn(move || {
             let res = crate::hap::set_state(&pairing, &changes);
             let _ = tx.send(match res {
-                Ok(st) => TstatResult::State(st),
+                Ok(crate::hap::SetOutcome::Confirmed(st)) => TstatResult::State(st),
+                Ok(crate::hap::SetOutcome::Optimistic(st)) => TstatResult::StateConfirm(st),
                 Err(e) => TstatResult::Failed(format!("Thermostat control failed: {}", e)),
             });
         });
@@ -6349,6 +6732,66 @@ impl App {
                         }
                         other => self.bridge_pending = other,
                     }
+                }
+                TstatResult::Fetched(st) => {
+                    // Fetch-busy only: a fetch result never clears
+                    // the action flag (see Fetched's docs).
+                    self.tstat_fetch_busy = false;
+                    self.tstat_error = None;
+                    self.tstat_last_fetch = Some(Instant::now());
+                    let state_json = bridge::state_to_json(&st);
+                    self.tstat_state = Some(st);
+                    match self.bridge_pending.take() {
+                        Some(bp) if bp.kind == BridgePendingKind::Status => {
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 200,
+                                body: json!({ "paired": true, "state": state_json }),
+                            });
+                        }
+                        other => self.bridge_pending = other,
+                    }
+                }
+                TstatResult::FetchFailed(e) => {
+                    self.tstat_fetch_busy = false;
+                    self.tstat_error = Some(e.clone());
+                    match self.bridge_pending.take() {
+                        Some(bp) if bp.kind == BridgePendingKind::Status => {
+                            // A failed Status fetch still proves the
+                            // app is paired (dispatch only fetches when
+                            // paired), so the web page can show
+                            // "paired, no reading" instead of "unpaired".
+                            let mut body = json!({ "error": e });
+                            body["paired"] = json!(true);
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 502,
+                                body,
+                            });
+                        }
+                        other => self.bridge_pending = other,
+                    }
+                }
+                TstatResult::StateConfirm(st) => {
+                    // Optimistic set: the PUT applied, the readback
+                    // didn't. Show the intended state now, then
+                    // re-fetch promptly to confirm against the unit.
+                    // The re-fetch always spawns here: the set just
+                    // cleared action-busy and no fetch can be running
+                    // (operations are serialized across both flags).
+                    self.tstat_busy = false;
+                    self.tstat_error = None;
+                    self.tstat_last_fetch = Some(Instant::now());
+                    let state_json = bridge::state_to_json(&st);
+                    self.tstat_state = Some(st);
+                    match self.bridge_pending.take() {
+                        Some(bp) if bp.kind == BridgePendingKind::Set => {
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 200,
+                                body: json!({ "ok": true, "state": state_json }),
+                            });
+                        }
+                        other => self.bridge_pending = other,
+                    }
+                    let _ = self.spawn_tstat_fetch();
                 }
                 TstatResult::Failed(e) => {
                     self.tstat_busy = false;
@@ -6617,7 +7060,7 @@ impl App {
                     ui.set_width(344.0);
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("🏠").size(40.0));
-                        ui.label(RichText::new("SmartLife & Tuya Desktop").size(23.0).strong());
+                        ui.label(RichText::new("Homestead").size(23.0).strong());
                         ui.label(
                             RichText::new("Your Smart Life / Tuya devices, in one clean dashboard")
                                 .size(13.5)
@@ -6752,7 +7195,7 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("🏠").size(22.0));
-                    ui.label(RichText::new("SmartLife & Tuya Desktop").size(18.0).strong());
+                    ui.label(RichText::new("Homestead").size(18.0).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.add(Button::new("Log out")).clicked() {
                             self.do_logout();
@@ -6897,14 +7340,33 @@ impl App {
 
     /// Thermostat (HomeKit) section on the dashboard: its own
     /// reorderable category section, like Cameras and Lighting. The
-    /// header carries the title, the ↻ Refresh button, and (in
+    /// header carries the ▾/▸ collapse chevron (v1.6.4, same
+    /// collapsed machinery as every other section, keyed by
+    /// "thermostat"), the title, the ↻ Refresh button, and (in
     /// editing mode) the ↓/↑ move buttons; the card below holds the
-    /// existing thermostat controls unchanged. It is not collapsible
-    /// and has no count badge, Delete, or "Reset to name order".
+    /// existing thermostat controls unchanged. Collapsed, only the
+    /// header renders. It has no count badge, Delete, or "Reset to
+    /// name order".
     fn thermostat_section_view(&mut self, ui: &mut Ui, sec_idx: usize, sec_total: usize) {
         let paired = self.cfg.thermostat.is_some();
         let busy = self.tstat_busy;
+        let fetch_busy = self.tstat_fetch_busy;
+        let collapsed = self
+            .cfg
+            .layout
+            .collapsed
+            .get("thermostat")
+            .copied()
+            .unwrap_or(false);
         ui.horizontal(|ui| {
+            let chev = if collapsed { "▸" } else { "▾" };
+            if ui.add(Button::new(chev).frame(false)).clicked() {
+                self.cfg
+                    .layout
+                    .collapsed
+                    .insert("thermostat".to_string(), !collapsed);
+                self.save();
+            }
             ui.label(RichText::new("Thermostat").size(16.5).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.editing {
@@ -6927,7 +7389,7 @@ impl App {
                     }
                 }
                 if ui
-                    .add_enabled(paired && !busy, Button::new("↻ Refresh"))
+                    .add_enabled(paired && !busy && !fetch_busy, Button::new("↻ Refresh"))
                     .clicked()
                 {
                     self.spawn_tstat_fetch();
@@ -6935,8 +7397,30 @@ impl App {
             });
         });
         ui.add_space(8.0);
+        if collapsed {
+            // Header only, like every other collapsed section.
+            ui.add_space(10.0);
+            return;
+        }
         self.thermostat_card(ui);
         ui.add_space(14.0);
+    }
+
+    /// The thermostat card's status line (v1.6.4): shows the TARGET /
+    /// set mode (what the wall unit shows), not the live idle /
+    /// heating / cooling state — a unit set to Cool but idle must
+    /// read "Cool", not "Off". The mode buttons already highlight
+    /// the target mode; the line now agrees with them.
+    fn thermostat_status_line(st: &crate::hap::ThermostatState) -> String {
+        format!(
+            "{} — indoor {:.0}°F, setpoint {:.0}°F{}",
+            crate::hap::mode_name(st.target_mode),
+            crate::hap::c_to_f(st.current_temp_c),
+            crate::hap::c_to_f(st.target_temp_c),
+            st.humidity
+                .map(|h| format!(", humidity {:.0}%", h))
+                .unwrap_or_default()
+        )
     }
 
     /// The thermostat card itself (paired state, mode buttons,
@@ -6983,20 +7467,8 @@ impl App {
                     );
                     return;
                 };
-                let cur_f = crate::hap::c_to_f(st.current_temp_c);
                 let set_f = crate::hap::c_to_f(st.target_temp_c);
-                ui.label(
-                    RichText::new(format!(
-                        "{} — indoor {:.0}°F, setpoint {:.0}°F{}",
-                        crate::hap::mode_name(st.current_mode),
-                        cur_f,
-                        set_f,
-                        st.humidity
-                            .map(|h| format!(", humidity {:.0}%", h))
-                            .unwrap_or_default()
-                    ))
-                    .size(14.0),
-                );
+                ui.label(RichText::new(Self::thermostat_status_line(&st)).size(14.0));
                 // Mode buttons (Off / Heat / Cool / Auto).
                 ui.horizontal(|ui| {
                     for (label, mode) in
@@ -9352,6 +9824,36 @@ impl App {
                                 ui.add_space(6.0);
                                 ui.label(RichText::new(e.clone()).size(12.5).color(DANGER));
                             }
+                            // ---- Diagnostics log (v1.6.4) ----
+                            // Timestamped ring buffer of thermostat
+                            // operations (discovery, pairing, fetch,
+                            // set) for debugging. It never carries
+                            // setup codes, keys, or credentials —
+                            // see hap::tstat_log.
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Diagnostics log").size(14.0).strong());
+                            ui.label(
+                                RichText::new("Recent thermostat operations. Copy it into a message if something misbehaves.")
+                                    .size(12.5)
+                                    .color(pal.dim),
+                            );
+                            let mut log_text = crate::hap::tstat_log_text();
+                            ui.horizontal(|ui| {
+                                if ui.add(Button::new("Copy log").small()).clicked() {
+                                    ui.ctx().copy_text(log_text.clone());
+                                }
+                                if ui.add(Button::new("Clear").small()).clicked() {
+                                    crate::hap::tstat_log_clear();
+                                }
+                            });
+                            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut log_text)
+                                        .desired_rows(8)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            });
                         });
                         // ---- Hidden devices ----
                         Self::settings_panel(ui, &pal, "Hidden devices", |ui| {
@@ -9390,7 +9892,7 @@ impl App {
                         Self::settings_panel(ui, &pal, "Help", |ui| {
                             let paras = [
                                 "How login works. This app signs in to Tuya's cloud with the same account you use in the Smart Life (or Tuya Smart) app, then asks Tuya for your device list and sends control commands — the same approach as the classic Smart Life web dashboards. Pick the region where your account was registered; the wrong region is the most common cause of “login failed”.",
-                                "Your credentials. Your username and password go directly to Tuya's servers (px1.tuya*.com) over HTTPS. If you tick “Keep me logged in”, they are kept in this app's config file (in your user profile, under SmartLifeTuyaDesktop\\config.json) so the app can silently sign back in when the session token expires — use it only on your own devices, and use “Forget saved login” above to erase them.",
+                                "Your credentials. Your username and password go directly to Tuya's servers (px1.tuya*.com) over HTTPS. If you tick “Keep me logged in”, they are kept in this app's config file (in your user profile, under Homestead\\config.json) so the app can silently sign back in when the session token expires — use it only on your own devices, and use “Forget saved login” above to erase them.",
                                 "The proxy. Some networks block direct calls to Tuya's endpoints. In “Auto” mode, China-region traffic is routed through a community CORS proxy (cors.smartathome.co.uk); US and EU traffic goes direct. Note a proxy can see the requests it forwards (they contain a session token, never your password after sign-in — the sign-in request itself does contain your password, so only use proxies you trust for CN logins).",
                                 "Customising. Sections appear as Cameras, Pinned, Lighting, your groups, Ungrouped, Scenes by default — and in ✎ Edit mode every section header has ↑/↓ buttons to move the section itself; your order sticks. Inside a section, cards sort A–Z by name by default: drag cards into your own order — drag a card by its body and drop it where it belongs, or use the ↑/↓ buttons (that order then sticks, and each section has a “Reset to name order” button) — create groups (rooms), rename devices with an alias, or hide devices you never use. Dragging a card onto another section moves it there. Use the 📌 button on any card to pin a shortcut copy of it in the Pinned section — the device also stays in its group below. Scenes always live in their own Scenes section.",
                                 "Lighting & group controls. Lights organise themselves: any bulb or strip that isn't assigned to one of your groups lives in the built-in Lighting section, and cameras get their own built-in Cameras section the same way — assigning a device to a group always wins over the automatic sections. The Lighting header (and the header of any group containing a light) has group controls: a master switch (on if any member is on; clicking turns the whole group on or off), brightness and colour-temperature sliders showing the members' average, and colour swatches. Group controls broadcast — they send the command to each member in turn, and changing a single light afterwards simply overrides it for that light. Nothing about the group itself is stored.",
@@ -9933,7 +10435,7 @@ impl eframe::App for App {
         }
         // Thermostat autorefresh — independent of the Tuya session:
         // piggybacks the same interval while on the dashboard.
-        if self.view == View::Dashboard && self.cfg.thermostat.is_some() && !self.tstat_busy {
+        if self.view == View::Dashboard && self.cfg.thermostat.is_some() && !self.tstat_busy && !self.tstat_fetch_busy {
             let due = self
                 .tstat_last_fetch
                 .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.prefs.interval))
@@ -10015,7 +10517,7 @@ fn main() -> eframe::Result<()> {
     // header button is the supported way to place the window:
     // it acts at click time only and lets the OS own the result.)
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("SmartLife & Tuya Desktop")
+        .with_title("Homestead")
         .with_inner_size([1120.0, 780.0])
         .with_min_inner_size([720.0, 520.0]);
     match launch {
@@ -10036,7 +10538,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "SmartLife & Tuya Desktop",
+        "Homestead",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
@@ -10496,7 +10998,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.6.3");
+        assert_eq!(APP_VERSION, "2.0.0");
     }
 
     #[test]
@@ -10886,9 +11388,9 @@ mod tests {
             "tag_name": "v1.2.0",
             "html_url": "https://github.com/x/releases/v1.2.0",
             "assets": [
-                { "name": "SmartLife_Tuya_Desktop.html", "browser_download_url": "https://dl/html", "size": 100 },
-                { "name": "SmartLifeTuyaDesktop-Setup-v1.2.0.exe", "browser_download_url": "https://dl/exe", "size": 200 },
-                { "name": "SmartLifeTuyaDesktop-v1.2.0.dmg", "browser_download_url": "https://dl/dmg", "size": 300 }
+                { "name": "Homestead.html", "browser_download_url": "https://dl/html", "size": 100 },
+                { "name": "Homestead-Setup-v1.2.0.exe", "browser_download_url": "https://dl/exe", "size": 200 },
+                { "name": "Homestead-v1.2.0.dmg", "browser_download_url": "https://dl/dmg", "size": 300 }
             ]
         });
         let info = parse_release(&v).expect("release parses");
@@ -10898,15 +11400,15 @@ mod tests {
         let win = select_update_asset(assets, "1.2.0", "windows").expect("windows asset");
         assert_eq!(
             win.get("name").and_then(|n| n.as_str()),
-            Some("SmartLifeTuyaDesktop-Setup-v1.2.0.exe")
+            Some("Homestead-Setup-v1.2.0.exe")
         );
         let mac = select_update_asset(assets, "1.2.0", "macos").expect("macos asset");
         assert_eq!(
             mac.get("name").and_then(|n| n.as_str()),
-            Some("SmartLifeTuyaDesktop-v1.2.0.dmg")
+            Some("Homestead-v1.2.0.dmg")
         );
         assert_ne!(
-            "SmartLifeTuyaDesktop-Setup-v9.9.9.exe",
+            "Homestead-Setup-v9.9.9.exe",
             expected_update_asset_name(&info.version)
         );
         assert!(parse_release(&json!({ "tag_name": "v1.2.0", "html_url": "x", "assets": [] })).is_none());
@@ -10919,20 +11421,20 @@ mod tests {
         // app must never be offered the Windows .exe, nor the
         // Windows app the .dmg (v1.4.0).
         let assets = json!([
-            { "name": "SmartLife_Tuya_Desktop.html", "browser_download_url": "https://dl/html", "size": 100 },
-            { "name": "SmartLifeTuyaDesktop-Setup-v1.4.0.exe", "browser_download_url": "https://dl/exe", "size": 200 },
-            { "name": "SmartLifeTuyaDesktop-v1.4.0.dmg", "browser_download_url": "https://dl/dmg", "size": 300 }
+            { "name": "Homestead.html", "browser_download_url": "https://dl/html", "size": 100 },
+            { "name": "Homestead-Setup-v1.4.0.exe", "browser_download_url": "https://dl/exe", "size": 200 },
+            { "name": "Homestead-v1.4.0.dmg", "browser_download_url": "https://dl/dmg", "size": 300 }
         ]);
         let assets = assets.as_array().unwrap();
         let win = select_update_asset(assets, "1.4.0", "windows").expect("windows asset");
         assert_eq!(
             win.get("name").and_then(|n| n.as_str()),
-            Some("SmartLifeTuyaDesktop-Setup-v1.4.0.exe")
+            Some("Homestead-Setup-v1.4.0.exe")
         );
         let mac = select_update_asset(assets, "1.4.0", "macos").expect("macos asset");
         assert_eq!(
             mac.get("name").and_then(|n| n.as_str()),
-            Some("SmartLifeTuyaDesktop-v1.4.0.dmg")
+            Some("Homestead-v1.4.0.dmg")
         );
         assert_eq!(mac.get("size").and_then(|s| s.as_u64()), Some(300));
         // A release missing the platform's asset selects nothing
@@ -10940,11 +11442,11 @@ mod tests {
         assert!(select_update_asset(&assets[..2], "1.4.0", "macos").is_none());
         assert_eq!(
             expected_update_asset_name_for("1.4.0", "macos"),
-            "SmartLifeTuyaDesktop-v1.4.0.dmg"
+            "Homestead-v1.4.0.dmg"
         );
         assert_eq!(
             expected_update_asset_name_for("1.4.0", "windows"),
-            "SmartLifeTuyaDesktop-Setup-v1.4.0.exe"
+            "Homestead-Setup-v1.4.0.exe"
         );
         // And the install step matches the asset: run + exit for
         // the installer, open for the disk image.
@@ -11086,6 +11588,121 @@ mod tests {
             keys(&secs2),
             vec!["thermostat", "cameras", "pinned", "lighting", "ungrouped", "g1", "scenes"]
         );
+    }
+
+    #[test]
+    fn thermostat_status_line_shows_target_mode() {
+        // v1.6.4: the line must read the SET mode (what the wall
+        // unit shows), not the live idle/heating/cooling state — a
+        // unit set to Cool but idle reads "Cool", not "Off".
+        let st = crate::hap::ThermostatState {
+            current_mode: 0,
+            target_mode: 2,
+            current_temp_c: 25.0,
+            target_temp_c: 25.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            App::thermostat_status_line(&st),
+            "Cool — indoor 77°F, setpoint 77°F"
+        );
+    }
+
+    #[test]
+    fn thermostat_move_down_from_first_with_legacy_stored_seq() {
+        // v1.6.4: a config saved before v1.6.3 has no "thermostat"
+        // in section_seq at all — the ↓ move must still work,
+        // because moved_section_seq starts from the EFFECTIVE
+        // sequence (which slots the thermostat first), not the raw
+        // stored one.
+        let mut layout = grouped_layout();
+        layout.section_seq = vec![
+            "cameras".into(),
+            "pinned".into(),
+            "lighting".into(),
+            "group:g1".into(),
+            "ungrouped".into(),
+            "scenes".into(),
+        ];
+        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        assert_eq!(secs[0].key, "thermostat");
+        // First position: ↑ disabled, ↓ enabled (the header's
+        // add_enabled conditions: sec_idx > 0 / sec_idx + 1 < total).
+        let (sec_idx, sec_total) = (0usize, secs.len());
+        assert!(!(sec_idx > 0));
+        assert!(sec_idx + 1 < sec_total);
+        let down = moved_section_seq(&layout.section_seq, &secs, "thermostat", 1);
+        assert_eq!(down[1], "thermostat");
+        // The new stored order renders thermostat second, and
+        // moving back up restores it to first.
+        let mut layout2 = grouped_layout();
+        layout2.section_seq = down.clone();
+        let secs2 = build_sections(&full_entry_set(), &layout2, false, "");
+        assert_eq!(secs2[1].key, "thermostat");
+        let back = moved_section_seq(&down, &secs2, "thermostat", -1);
+        assert_eq!(back[0], "thermostat");
+    }
+
+    #[test]
+    fn thermostat_collapsed_renders_header_only() {
+        // v1.6.4: collapsing the Thermostat section hides the card
+        // (here: the unpaired notice) but keeps the header, and the
+        // collapsed flag round-trips through the saved layout.
+        let mut app = gate_app();
+        app.cfg.layout.collapsed.insert("thermostat".to_string(), true);
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let texts = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1200.0), 3);
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(drawn.iter().any(|t| *t == "Thermostat"));
+        assert!(
+            !drawn.iter().any(|t| t.contains("Not paired")),
+            "collapsed thermostat must hide the card: {:?}",
+            drawn
+        );
+        let text = serde_json::to_string(&app.cfg.layout).unwrap();
+        let back: LayoutCfg = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.collapsed.get("thermostat"), Some(&true));
+        // Expanded, the card is back.
+        let mut app2 = gate_app();
+        let ctx2 = egui::Context::default();
+        install_fonts(&ctx2);
+        let texts2 = render_dashboard(&mut app2, &ctx2, egui::vec2(1330.0, 1200.0), 3);
+        assert!(texts2.iter().any(|(t, _)| t.contains("Not paired")));
+    }
+
+    #[test]
+    fn thermostat_fetch_busy_shows_no_working_indicator() {
+        // v1.6.4 busy split: a status fetch must not show
+        // "Working…" on the card; a user action must.
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_state = Some(crate::hap::ThermostatState {
+            current_mode: 0,
+            target_mode: 2,
+            current_temp_c: 25.0,
+            target_temp_c: 25.0,
+            ..Default::default()
+        });
+        app.tstat_last_fetch = Some(std::time::Instant::now());
+        // Fetch-busy only: silent.
+        app.tstat_busy = false;
+        app.tstat_fetch_busy = true;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let texts = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1200.0), 3);
+        assert!(
+            !texts.iter().any(|(t, _)| t == "Working…"),
+            "fetch-busy must not show Working…: {:?}",
+            texts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>()
+        );
+        // Action-busy: the indicator shows.
+        app.tstat_busy = true;
+        app.tstat_fetch_busy = false;
+        let ctx2 = egui::Context::default();
+        install_fonts(&ctx2);
+        let texts2 = render_dashboard(&mut app, &ctx2, egui::vec2(1330.0, 1200.0), 3);
+        assert!(texts2.iter().any(|(t, _)| t == "Working…"));
     }
 
     #[test]
@@ -11284,18 +11901,18 @@ mod tests {
 
     #[test]
     fn autostart_command_all_modes_and_off() {
-        let exe = Path::new("C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe");
+        let exe = Path::new("C:\\Users\\Shawn\\AppData\\Local\\Homestead\\Homestead.exe");
         assert_eq!(
             autostart_command(exe, LaunchMode::Normal),
-            "\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\""
+            "\"C:\\Users\\Shawn\\AppData\\Local\\Homestead\\Homestead.exe\""
         );
         assert_eq!(
             autostart_command(exe, LaunchMode::Minimized),
-            "\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\" --minimized"
+            "\"C:\\Users\\Shawn\\AppData\\Local\\Homestead\\Homestead.exe\" --minimized"
         );
         assert_eq!(
             autostart_command(exe, LaunchMode::Maximized),
-            "\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\" --maximized"
+            "\"C:\\Users\\Shawn\\AppData\\Local\\Homestead\\Homestead.exe\" --maximized"
         );
         // OFF = no entry at all (None), whatever the mode says.
         let mut prefs = Prefs::default();
@@ -11304,7 +11921,7 @@ mod tests {
         prefs.launch_mode = "minimized".into();
         assert_eq!(
             desired_autostart(&prefs, exe).as_deref(),
-            Some("\"C:\\Users\\Shawn\\AppData\\Local\\SmartLifeTuyaDesktop\\SmartLifeTuyaDesktop.exe\" --minimized")
+            Some("\"C:\\Users\\Shawn\\AppData\\Local\\Homestead\\Homestead.exe\" --minimized")
         );
         prefs.launch_mode = "maximized".into();
         assert!(desired_autostart(&prefs, exe).unwrap().ends_with("--maximized"));
@@ -11613,6 +12230,131 @@ mod tests {
     }
 
     #[test]
+    fn startup_check_decision_table() {
+        use StartupCheckAction::*;
+        // Settled, maximized, off target, re-arm unused: arm.
+        let calm = StartupCheckFacts {
+            snap_active: false,
+            expired: false,
+            maximized: true,
+            on_target: false,
+            settle_passed: true,
+            moved: false,
+        };
+        assert_eq!(startup_check_next(calm, false, true, false), (ArmSnap, true));
+        // A snap in flight: observe only, even on the deadline.
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { snap_active: true, expired: true, ..calm },
+                false,
+                true,
+                false
+            ),
+            (Wait, true)
+        );
+        // Arrival beats everything: resolves even on the
+        // deadline frame, even restored (straddling target).
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { on_target: true, expired: true, ..calm },
+                true,
+                true,
+                false
+            ),
+            (Resolve, true)
+        );
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { on_target: true, maximized: false, ..calm },
+                true,
+                true,
+                false
+            ),
+            (Resolve, true)
+        );
+        // Still settling after a snap: wait, don't spend the arm.
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { settle_passed: false, ..calm },
+                false,
+                true,
+                false
+            ),
+            (Wait, true)
+        );
+        // User takeover beats expiry: maximized, then restored
+        // with no snap in flight — stop, never latch, never arm.
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { maximized: false, expired: true, ..calm },
+                false,
+                true,
+                false
+            ),
+            (StopUserTakeover, true)
+        );
+        // A snap-failure restored state is NOT a takeover: the
+        // arm is still spent on it.
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { maximized: false, ..calm },
+                false,
+                true,
+                true
+            ),
+            (ArmSnap, true)
+        );
+        // ...unless the window actually moved since the failure:
+        // a drag after a failed snap is still a takeover.
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { maximized: false, moved: true, ..calm },
+                false,
+                true,
+                true
+            ),
+            (StopUserTakeover, true)
+        );
+        // Never observed maximized (window still starting):
+        // a restored state is not a takeover.
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { maximized: false, ..calm },
+                false,
+                false,
+                false
+            ),
+            (ArmSnap, false)
+        );
+        // Window expired, settled, re-arm already spent: latch
+        // as unresolved (the caller records the failed landing).
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { expired: true, ..calm },
+                true,
+                true,
+                false
+            ),
+            (ExpireUnresolved, true)
+        );
+        // Expiry beats the arm: an unused re-arm is never spent
+        // past the deadline.
+        assert_eq!(
+            startup_check_next(
+                StartupCheckFacts { expired: true, ..calm },
+                false,
+                true,
+                false
+            ),
+            (ExpireUnresolved, true)
+        );
+        // Re-arm spent and still off target: wait out the window.
+        assert_eq!(startup_check_next(calm, true, true, false), (Wait, true));
+        // A maximized observation is remembered for later frames.
+        assert_eq!(startup_check_next(calm, false, false, false), (ArmSnap, true));
+    }
+
+    #[test]
     fn snap_current_monitor_detection() {
         let mons = vec![
             mon(0, 0, 1920, 1080, 1.0, true),
@@ -11666,9 +12408,9 @@ mod tests {
 
     #[test]
     fn reg_named_value_parsing() {
-        let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    SmartLifeTuyaDesktop    REG_SZ    \"C:\\Users\\Shawn\\app.exe\" --minimized\r\n    OtherApp    REG_SZ    C:\\other.exe\r\n\r\n";
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    Homestead    REG_SZ    \"C:\\Users\\Shawn\\app.exe\" --minimized\r\n    OtherApp    REG_SZ    C:\\other.exe\r\n\r\n";
         assert_eq!(
-            parse_reg_named_value(out, "SmartLifeTuyaDesktop").as_deref(),
+            parse_reg_named_value(out, "Homestead").as_deref(),
             Some("\"C:\\Users\\Shawn\\app.exe\" --minimized")
         );
         assert_eq!(
@@ -11676,8 +12418,8 @@ mod tests {
             Some("C:\\other.exe")
         );
         assert_eq!(parse_reg_named_value(out, "Missing"), None);
-        assert_eq!(parse_reg_named_value("ERROR: not found", "SmartLifeTuyaDesktop"), None);
-        assert_eq!(parse_reg_named_value("", "SmartLifeTuyaDesktop"), None);
+        assert_eq!(parse_reg_named_value("ERROR: not found", "Homestead"), None);
+        assert_eq!(parse_reg_named_value("", "Homestead"), None);
     }
 
     // ---------------- v1.4.0: macOS port ----------------
@@ -11695,15 +12437,15 @@ mod tests {
         ] {
             let cmd = autostart_command(
                 Path::new(
-                    "/Applications/SmartLife & Tuya Desktop.app/Contents/MacOS/SmartLifeTuyaDesktop",
+                    "/Applications/Homestead.app/Contents/MacOS/Homestead",
                 ),
                 mode,
             );
             let plist = launch_agent_plist(&cmd).expect("plist builds");
             assert!(plist.contains(LAUNCH_AGENT_LABEL));
             assert!(plist.contains("<key>RunAtLoad</key>"));
-            // The "&" in the path is XML-escaped in the plist…
-            assert!(plist.contains("SmartLife &amp; Tuya"));
+            // The plist carries the app command (exe path + flags).
+            assert!(plist.contains("/Applications/Homestead.app/Contents/MacOS/Homestead"));
             // …and unescaped on read-back: an exact round-trip.
             assert_eq!(launch_agent_command(&plist).as_deref(), Some(cmd.as_str()));
         }
@@ -11715,9 +12457,9 @@ mod tests {
         // An unquoted stored command (no spaces in the path)
         // parses too.
         assert_eq!(
-            parse_autostart_command("/opt/app/SmartLifeTuyaDesktop --maximized"),
+            parse_autostart_command("/opt/app/Homestead --maximized"),
             Some((
-                "/opt/app/SmartLifeTuyaDesktop".to_string(),
+                "/opt/app/Homestead".to_string(),
                 LaunchMode::Maximized
             ))
         );
@@ -11859,6 +12601,7 @@ mod tests {
             last_updated: String::new(),
             open_color_for: None,
             color_pick: HashMap::new(),
+            startup_check: StartupCheckState::default(),
             slider_live: HashMap::new(),
             dragging_slider: false,
             alias_buf: HashMap::new(),
@@ -11900,6 +12643,7 @@ mod tests {
             ffmpeg_cache: None,
             tstat_setup_code: String::new(),
             tstat_busy: false,
+            tstat_fetch_busy: false,
             tstat_state: None,
             tstat_error: None,
             tstat_discovered: Vec::new(),
