@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::Duration;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -594,6 +594,12 @@ impl Conn {
         }
     }
 
+    /// Shut the socket down promptly (used when a pending pairing is
+    /// abandoned: the accessory must see the session end at once).
+    pub fn shutdown(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
     /// Fill `buf`: raw socket bytes in the plain phase, one decrypted
     /// frame in the secure phase.
     fn fill(&mut self) -> HapResult<()> {
@@ -741,14 +747,78 @@ fn check_state(items: &[(u8, Vec<u8>)], expected: u8, step: &str) -> HapResult<(
 }
 
 // ---------------------------------------------------------------------------
-// Pair-setup (M1..M6) on one plain connection. `pin_dashed` is the
-// "123-45-678" form; the code itself is never stored anywhere.
+// Two-step pair-setup (M1..M6) for accessories whose setup code rotates
+// per attempt (field-verified on the Resideo T6: the unit shows a fresh
+// code on its screen each time a pairing session starts, so a code
+// typed before the session begins is always stale). begin opens the
+// connection and runs M1..M2; finish runs M3..M6 on that SAME held-open
+// connection once the user has read the fresh code off the screen.
+// The code is NEVER part of the pending state: it arrives only at
+// finish, is used for one SRP computation, and is never stored.
 // ---------------------------------------------------------------------------
 
-pub fn pair_setup(ip: &str, port: u16, pin_dashed: &str) -> HapResult<ThermostatPairing> {
-    let mut conn = Conn::connect(ip, port)?;
+/// Pair-setup session between M2 and M3: the live connection, the
+/// SRP client state (whose public value A does not depend on the
+/// code), and the M2 values. No setup code is held here, by
+/// construction: there is no pin field, and the Debug impl below
+/// prints only the device identity, never key material.
+pub struct PendingPairSetup {
+    conn: Option<Conn>,
+    srp: SrpClient,
+    salt: Vec<u8>,
+    b_raw: Vec<u8>,
+    ip: String,
+    port: u16,
+    name: String,
+    model: String,
+    device_id: String,
+}
 
-    // M1 -> M2: method + state, expect salt + server public key.
+impl fmt::Debug for PendingPairSetup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingPairSetup")
+            .field("device_id", &self.device_id)
+            .field("name", &self.name)
+            .field("address", &format!("{}:{}", self.ip, self.port))
+            .finish()
+    }
+}
+
+impl Drop for PendingPairSetup {
+    /// Abandoning a pending pairing closes the socket at once, so the
+    /// accessory sees the session end (cancel, or a dropped begin).
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            conn.shutdown();
+        }
+    }
+}
+
+impl PendingPairSetup {
+    /// mDNS id of the device this session belongs to.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+}
+
+/// Resolve a discovered device to its IPv4-first address, as the
+/// single-shot flow did.
+fn device_address(device: &DiscoveredDevice) -> HapResult<&str> {
+    device
+        .addresses
+        .iter()
+        .find(|a| a.contains('.'))
+        .or_else(|| device.addresses.first())
+        .map(|s| s.as_str())
+        .ok_or_else(|| HapError::Msg("discovered device has no address".into()))
+}
+
+/// Begin pairing: open the connection, send M1 (no code needed), read
+/// M2 (salt + server public key B). The accessory shows its fresh
+/// setup code on screen once this session starts.
+pub fn begin_pair_setup(device: &DiscoveredDevice) -> HapResult<PendingPairSetup> {
+    let ip = device_address(device)?.to_string();
+    let mut conn = Conn::connect(&ip, device.port)?;
     let m1 = tlv_encode(&[(TAG_STATE, &[STATE_M1]), (TAG_METHOD, &[0x00])]);
     let m2 = conn.post_tlv("/pair-setup", &m1)?;
     check_state(&m2, STATE_M2, "pair-setup M2")?;
@@ -758,38 +828,54 @@ pub fn pair_setup(ip: &str, port: u16, pin_dashed: &str) -> HapResult<Thermostat
     let b_raw = tlv_get(&m2, TAG_PUBLIC_KEY)
         .ok_or_else(|| HapError::Msg("pair-setup M2 missing server public key".into()))?
         .to_vec();
-
-    // SRP client math, then M3 (public key + proof).
     let srp = SrpClient::new()?;
-    let k = srp.session(&salt, &b_raw, pin_dashed)?;
-    let m_proof = srp.client_proof(&salt, &b_raw, &k);
-    let m3 = tlv_encode(&[
-        (TAG_STATE, &[STATE_M3]),
-        (TAG_PUBLIC_KEY, srp.public_bytes()),
-        (TAG_PROOF, &m_proof),
-    ]);
-    let m4 = conn.post_tlv("/pair-setup", &m3)?;
-    check_state(&m4, STATE_M4, "pair-setup M4")?;
-    let server_proof = tlv_get(&m4, TAG_PROOF)
-        .ok_or_else(|| HapError::Msg("pair-setup M4 missing server proof".into()))?;
-    if !srp.verify_server_proof(&m_proof, &k, server_proof) {
-        return err("accessory proof mismatch -- wrong setup code?");
-    }
+    Ok(PendingPairSetup {
+        conn: Some(conn),
+        srp,
+        salt,
+        b_raw,
+        ip,
+        port: device.port,
+        name: device.name.clone(),
+        model: device.model.clone(),
+        device_id: device.id.clone(),
+    })
+}
 
-    // M5: fresh controller identity + signature, encrypted.
+/// True when a pair-setup failure means the accessory-side session is
+/// gone (idle timeout or a closed connection): the only recovery is
+/// to start over with a fresh session and a fresh screen code.
+fn is_session_expired(e: &HapError) -> bool {
+    match e {
+        HapError::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
+        HapError::Msg(m) => m.contains("accessory closed the connection"),
+    }
+}
+
+/// M5..M6 on an already-running pair-setup session: fresh controller
+/// identity + signature, encrypted, then the accessory's identity
+/// verified. Called only by finish_pair_setup.
+fn pair_setup_m5_m6(
+    conn: &mut Conn,
+    k: &[u8; 64],
+    ip: &str,
+    port: u16,
+    name: &str,
+    model: &str,
+) -> HapResult<ThermostatPairing> {
     let mut seed = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut seed);
     let signing = SigningKey::from_bytes(&seed);
     let ltpk = signing.verifying_key().to_bytes();
     let pairing_id = fresh_pairing_id();
     let ios_x = hkdf_sha512(
-        &k,
+        k,
         b"Pair-Setup-Controller-Sign-Salt",
         b"Pair-Setup-Controller-Sign-Info",
         32,
     )?;
     let enc_key = hkdf_sha512(
-        &k,
+        k,
         b"Pair-Setup-Encrypt-Salt",
         b"Pair-Setup-Encrypt-Info",
         32,
@@ -828,7 +914,7 @@ pub fn pair_setup(ip: &str, port: u16, pin_dashed: &str) -> HapResult<Thermostat
         return err("pair-setup M6 accessory public key is not 32 bytes");
     }
     let acc_x = hkdf_sha512(
-        &k,
+        k,
         b"Pair-Setup-Accessory-Sign-Salt",
         b"Pair-Setup-Accessory-Sign-Info",
         32,
@@ -854,7 +940,59 @@ pub fn pair_setup(ip: &str, port: u16, pin_dashed: &str) -> HapResult<Thermostat
         accessory_ltpk_hex: hex_encode(&acc_ltpk),
         accessory_ip: ip.to_string(),
         accessory_port: port,
+        accessory_name: name.to_string(),
+        accessory_model: model.to_string(),
         ..Default::default()
+    })
+}
+
+/// Finish pairing on a begun session: compute the SRP proof from the
+/// just-read code, send M3, verify M4, run M5/M6. Consumes the pending
+/// state; on any failure the connection is closed with it.
+pub fn finish_pair_setup(mut pending: PendingPairSetup, code: &str) -> HapResult<ThermostatPairing> {
+    let pin = normalize_setup_code(code)?;
+    let mut conn = pending
+        .conn
+        .take()
+        .ok_or_else(|| HapError::Msg("pairing session already finished".into()))?;
+    let mut run = || -> HapResult<ThermostatPairing> {
+        let k = pending.srp.session(&pending.salt, &pending.b_raw, &pin)?;
+        let m_proof = pending
+            .srp
+            .client_proof(&pending.salt, &pending.b_raw, &k);
+        let m3 = tlv_encode(&[
+            (TAG_STATE, &[STATE_M3]),
+            (TAG_PUBLIC_KEY, pending.srp.public_bytes()),
+            (TAG_PROOF, &m_proof),
+        ]);
+        let m4 = conn.post_tlv("/pair-setup", &m3)?;
+        check_state(&m4, STATE_M4, "pair-setup M4")?;
+        let server_proof = tlv_get(&m4, TAG_PROOF)
+            .ok_or_else(|| HapError::Msg("pair-setup M4 missing server proof".into()))?;
+        if !pending
+            .srp
+            .verify_server_proof(&m_proof, &k, server_proof)
+        {
+            return err("accessory proof mismatch -- wrong setup code?");
+        }
+        pair_setup_m5_m6(
+            &mut conn,
+            &k,
+            &pending.ip,
+            pending.port,
+            &pending.name,
+            &pending.model,
+        )
+    };
+    run().map_err(|e| {
+        if is_session_expired(&e) {
+            HapError::Msg(
+                "pairing session timed out -- press Start pairing and try again with the fresh code"
+                    .into(),
+            )
+        } else {
+            e
+        }
     })
 }
 
@@ -1420,22 +1558,6 @@ pub fn discover(timeout: Duration) -> HapResult<Vec<DiscoveredDevice>> {
     Ok(out)
 }
 
-/// Pair with a discovered device. The setup code is normalised, used for
-/// this handshake only, and never stored.
-pub fn pair_device(device: &DiscoveredDevice, code: &str) -> HapResult<ThermostatPairing> {
-    let pin = normalize_setup_code(code)?;
-    let ip = device
-        .addresses
-        .iter()
-        .find(|a| a.contains('.'))
-        .or_else(|| device.addresses.first())
-        .ok_or_else(|| HapError::Msg("discovered device has no address".into()))?;
-    let mut pairing = pair_setup(ip, device.port, &pin)?;
-    pairing.accessory_name = device.name.clone();
-    pairing.accessory_model = device.model.clone();
-    Ok(pairing)
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests (no hardware needed). The SRP consistency test implements a
 // minimal server side from the same formulas and asserts client and
@@ -1798,5 +1920,286 @@ mod tests {
         assert_eq!(st.w_target_mode, Some((1, 12)));
         assert_eq!(st.w_target_temp, Some((1, 14)));
         assert_eq!(st.w_fan_active, Some((1, 21)));
+    }
+
+    // -- Two-step pair-setup tests --------------------------------------
+    // A minimal pair-setup accessory on loopback: answers M1..M6 with
+    // server-side SRP computed from `correct_pin`. Handles exactly one
+    // connection, then exits (EOF on cancel also exits it cleanly).
+
+    fn read_http_request(s: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                let mut content_len = 0usize;
+                for line in head.lines().skip(1) {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let total = pos + 4 + content_len;
+                while buf.len() < total {
+                    match s.read(&mut chunk) {
+                        Ok(0) => return None,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => return None,
+                    }
+                }
+                return Some(buf[pos + 4..total].to_vec());
+            }
+            match s.read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn write_http_response(s: &mut TcpStream, body: &[u8]) {
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        s.write_all(head.as_bytes()).unwrap();
+        s.write_all(body).unwrap();
+    }
+
+    fn spawn_fake_pair_server(
+        correct_pin: &str,
+        acc_id: &str,
+        seed: [u8; 32],
+    ) -> (u16, thread::JoinHandle<()>) {
+        let correct_pin = correct_pin.to_string();
+        let acc_id = acc_id.to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            // Server SRP state, filled at M1, consumed at M3.
+            let mut srv: Option<(BigUint, Vec<u8>, BigUint, Vec<u8>)> = None;
+            let mut k_session: Option<[u8; 64]> = None;
+            loop {
+                let body = match read_http_request(&mut s) {
+                    Some(b) => b,
+                    None => return,
+                };
+                let items = match tlv_decode(&body) {
+                    Ok(i) => i,
+                    Err(_) => return,
+                };
+                let state = tlv_get(&items, TAG_STATE)
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(0);
+                match state {
+                    STATE_M1 => {
+                        let mut salt = [0u8; 16];
+                        rand::thread_rng().fill_bytes(&mut salt);
+                        let x = SrpClient::compute_x(&salt, &correct_pin);
+                        let n = srp_n();
+                        let k = srp_k();
+                        let g = srp_g();
+                        let v = g.modpow(&x, &n);
+                        let mut bb = [0u8; 32];
+                        rand::thread_rng().fill_bytes(&mut bb);
+                        let b = BigUint::from_bytes_be(&bb);
+                        let big_b = (&k * &v + g.modpow(&b, &n)) % &n;
+                        let b_raw = pad384(&big_b.to_bytes_be()).unwrap();
+                        srv = Some((b, b_raw.to_vec(), v, salt.to_vec()));
+                        let refs = [
+                            (TAG_STATE, &[STATE_M2][..]),
+                            (TAG_SALT, &salt[..]),
+                            (TAG_PUBLIC_KEY, &b_raw[..]),
+                        ];
+                        write_http_response(&mut s, &tlv_encode(&refs));
+                    }
+                    STATE_M3 => {
+                        let (b, b_raw, v, salt) = match srv.take() {
+                            Some(t) => t,
+                            None => return,
+                        };
+                        let a_raw = tlv_get(&items, TAG_PUBLIC_KEY).unwrap().to_vec();
+                        let m = tlv_get(&items, TAG_PROOF).unwrap().to_vec();
+                        let n = srp_n();
+                        let mut u_msg = Vec::new();
+                        u_msg.extend_from_slice(&a_raw);
+                        u_msg.extend_from_slice(&b_raw);
+                        let u = BigUint::from_bytes_be(&sha512(&u_msg));
+                        let a_int = BigUint::from_bytes_be(&a_raw);
+                        let s_val = (a_int * v.modpow(&u, &n)).modpow(&b, &n);
+                        let k = sha512(&pad384(&s_val.to_bytes_be()).unwrap());
+                        let h_n = sha512(&n.to_bytes_be());
+                        let h_g = sha512(&[0x05u8]);
+                        let mut xor = [0u8; 64];
+                        for i in 0..64 {
+                            xor[i] = h_n[i] ^ h_g[i];
+                        }
+                        let mut m_msg = Vec::new();
+                        m_msg.extend_from_slice(&xor);
+                        m_msg.extend_from_slice(&sha512(b"Pair-Setup"));
+                        m_msg.extend_from_slice(&pad16(&salt));
+                        m_msg.extend_from_slice(&a_raw);
+                        m_msg.extend_from_slice(&b_raw);
+                        m_msg.extend_from_slice(&k);
+                        if sha512(&m_msg).as_slice() != m.as_slice() {
+                            let refs = [
+                                (TAG_STATE, &[STATE_M4][..]),
+                                (TAG_ERROR, &[2u8][..]),
+                            ];
+                            write_http_response(&mut s, &tlv_encode(&refs));
+                            return;
+                        }
+                        k_session = Some(k);
+                        let mut sp_msg = Vec::new();
+                        sp_msg.extend_from_slice(&a_raw);
+                        sp_msg.extend_from_slice(&m);
+                        sp_msg.extend_from_slice(&k);
+                        let server_proof = sha512(&sp_msg);
+                        let refs = [
+                            (TAG_STATE, &[STATE_M4][..]),
+                            (TAG_PROOF, &server_proof[..]),
+                        ];
+                        write_http_response(&mut s, &tlv_encode(&refs));
+                    }
+                    STATE_M5 => {
+                        let k = match k_session {
+                            Some(k) => k,
+                            None => return,
+                        };
+                        let enc = tlv_get(&items, TAG_ENCRYPTED_DATA).unwrap();
+                        let enc_key = hkdf_sha512(
+                            &k,
+                            b"Pair-Setup-Encrypt-Salt",
+                            b"Pair-Setup-Encrypt-Info",
+                            32,
+                        )
+                        .unwrap();
+                        let enc_arr: [u8; 32] = enc_key.try_into().unwrap();
+                        let inner =
+                            chacha_decrypt(&enc_arr, &pairing_nonce(b"PS-Msg05"), b"", enc)
+                                .unwrap();
+                        let sub = tlv_decode(&inner).unwrap();
+                        let cid = tlv_get(&sub, TAG_IDENTIFIER).unwrap();
+                        let cltpk = tlv_get(&sub, TAG_PUBLIC_KEY).unwrap();
+                        let csig = tlv_get(&sub, TAG_SIGNATURE).unwrap();
+                        let ios_x = hkdf_sha512(
+                            &k,
+                            b"Pair-Setup-Controller-Sign-Salt",
+                            b"Pair-Setup-Controller-Sign-Info",
+                            32,
+                        )
+                        .unwrap();
+                        let mut info = Vec::new();
+                        info.extend_from_slice(&ios_x);
+                        info.extend_from_slice(cid);
+                        info.extend_from_slice(cltpk);
+                        let vk = VerifyingKey::from_bytes(
+                            <&[u8; 32]>::try_from(cltpk).unwrap(),
+                        )
+                        .unwrap();
+                        let sig = Signature::try_from(csig).unwrap();
+                        vk.verify(&info, &sig).unwrap();
+                        let acc_sk = SigningKey::from_bytes(&seed);
+                        let acc_ltpk = acc_sk.verifying_key().to_bytes();
+                        let acc_x = hkdf_sha512(
+                            &k,
+                            b"Pair-Setup-Accessory-Sign-Salt",
+                            b"Pair-Setup-Accessory-Sign-Info",
+                            32,
+                        )
+                        .unwrap();
+                        let mut acc_info = Vec::new();
+                        acc_info.extend_from_slice(&acc_x);
+                        acc_info.extend_from_slice(acc_id.as_bytes());
+                        acc_info.extend_from_slice(&acc_ltpk);
+                        let acc_sig = acc_sk.sign(&acc_info).to_bytes();
+                        let sub6 = tlv_encode(&[
+                            (TAG_IDENTIFIER, acc_id.as_bytes()),
+                            (TAG_PUBLIC_KEY, &acc_ltpk[..]),
+                            (TAG_SIGNATURE, &acc_sig[..]),
+                        ]);
+                        let enc6 =
+                            chacha_encrypt(&enc_arr, &pairing_nonce(b"PS-Msg06"), b"", &sub6)
+                                .unwrap();
+                        let refs = [
+                            (TAG_STATE, &[STATE_M6][..]),
+                            (TAG_ENCRYPTED_DATA, &enc6[..]),
+                        ];
+                        write_http_response(&mut s, &tlv_encode(&refs));
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    fn test_device(port: u16) -> DiscoveredDevice {
+        DiscoveredDevice {
+            id: "test-id".to_string(),
+            name: "Test T6".to_string(),
+            model: "T6".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            port,
+            unpaired: true,
+            category: 0,
+            feature_flags: 0,
+            config_num: 0,
+            state_num: 0,
+            protocol_version: "2".to_string(),
+        }
+    }
+
+    #[test]
+    fn two_step_pair_setup_success() {
+        let pin = "123-45-678";
+        let acc_id = "test-accessory-1";
+        let seed = [0x5Au8; 32];
+        let (port, server) = spawn_fake_pair_server(pin, acc_id, seed);
+        let pending = begin_pair_setup(&test_device(port)).unwrap();
+        // The pending state holds no pin, by construction and in
+        // Debug output (the Debug impl prints identity only).
+        let dbg = format!("{:?}", pending);
+        assert!(!dbg.contains("123-45-678"), "debug leaks pin: {dbg}");
+        assert!(!dbg.contains("12345678"), "debug leaks pin: {dbg}");
+        assert!(dbg.contains("Test T6"), "debug: {dbg}");
+        let pairing = finish_pair_setup(pending, pin).unwrap();
+        assert_eq!(pairing.accessory_pairing_id, acc_id);
+        let expect_ltpk =
+            hex_encode(&SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+        assert_eq!(pairing.accessory_ltpk_hex, expect_ltpk);
+        assert_eq!(pairing.accessory_ip, "127.0.0.1");
+        assert_eq!(pairing.accessory_port, port);
+        assert_eq!(pairing.accessory_name, "Test T6");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn two_step_pair_setup_wrong_code_fails_with_auth_error() {
+        let (port, server) = spawn_fake_pair_server("123-45-678", "acc-1", [0x5Au8; 32]);
+        let pending = begin_pair_setup(&test_device(port)).unwrap();
+        let err = finish_pair_setup(pending, "123-45-679").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("authentication"), "wrong-code error: {msg}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pending_drop_then_rebegin_succeeds() {
+        // Cancel = drop: the server must see EOF and exit cleanly
+        // (no panic on either side), and a fresh begin afterwards
+        // must still pair.
+        let pin = "123-45-678";
+        let (port1, server1) = spawn_fake_pair_server(pin, "acc-1", [0x11u8; 32]);
+        let pending = begin_pair_setup(&test_device(port1)).unwrap();
+        drop(pending);
+        server1.join().unwrap();
+        let (port2, server2) = spawn_fake_pair_server(pin, "acc-2", [0x22u8; 32]);
+        let pending2 = begin_pair_setup(&test_device(port2)).unwrap();
+        let pairing = finish_pair_setup(pending2, pin).unwrap();
+        assert_eq!(pairing.accessory_pairing_id, "acc-2");
+        server2.join().unwrap();
     }
 }

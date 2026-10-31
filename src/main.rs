@@ -3637,6 +3637,13 @@ enum NetResult {
 /// over a dedicated channel so Tuya traffic is untouched.
 enum TstatResult {
     Discovered(Vec<crate::hap::DiscoveredDevice>),
+    /// A pair-setup session is open (M1 sent, M2 received): the UI
+    /// now prompts for the code the thermostat is showing. The
+    /// device itself still lives in tstat_discovered; the session
+    /// carries its id for matching the panel row.
+    PairBegun {
+        pending: crate::hap::PendingPairSetup,
+    },
     Paired(crate::hap::ThermostatPairing),
     State(crate::hap::ThermostatState),
     Failed(String),
@@ -3650,7 +3657,6 @@ enum TstatResult {
 enum BridgePendingKind {
     Status,
     Discover,
-    Pair,
     Set,
 }
 
@@ -4376,6 +4382,13 @@ struct App {
     tstat_state: Option<crate::hap::ThermostatState>,
     tstat_error: Option<String>,
     tstat_discovered: Vec<crate::hap::DiscoveredDevice>,
+    /// Open pair-setup session for a rotating-code thermostat (see
+    /// hap::begin_pair_setup): holds the live connection, the salt
+    /// and server key from M2, and the client's ephemeral pair. The
+    /// setup code is NEVER stored here — it arrives only at finish,
+    /// typed from the code the thermostat shows during the attempt.
+    /// Dropping this value closes the socket (Cancel = drop).
+    tstat_pending: Option<crate::hap::PendingPairSetup>,
     tstat_tx: Sender<TstatResult>,
     tstat_rx: Receiver<TstatResult>,
     tstat_last_fetch: Option<Instant>,
@@ -4562,6 +4575,7 @@ impl App {
             tstat_state: None,
             tstat_error: None,
             tstat_discovered: Vec::new(),
+            tstat_pending: None,
             tstat_tx,
             tstat_rx,
             tstat_last_fetch: None,
@@ -6062,16 +6076,45 @@ impl App {
         });
     }
 
-    fn spawn_tstat_pair(&mut self, device: crate::hap::DiscoveredDevice) {
+    /// Step 1 of two-step pairing (rotating-code thermostats): open
+    /// the pair-setup session (M1 sent, M2 received). No code is
+    /// needed here — the thermostat shows its fresh code during the
+    /// attempt, and the user types it at Finish (step 2). The
+    /// pending session is delivered back as TstatResult::PairBegun
+    /// and held in App.tstat_pending until Finish or Cancel.
+    fn spawn_tstat_begin(&mut self, device: crate::hap::DiscoveredDevice) {
         if self.tstat_busy {
             return;
         }
+        self.tstat_busy = true;
+        self.tstat_error = None;
+        let tx = self.tstat_tx.clone();
+        thread::spawn(move || {
+            let res = crate::hap::begin_pair_setup(&device);
+            let _ = tx.send(match res {
+                Ok(p) => TstatResult::PairBegun { pending: p },
+                Err(e) => TstatResult::Failed(format!("Pairing start failed: {}", e)),
+            });
+        });
+    }
+
+    /// Step 2 of two-step pairing: finish the session opened by
+    /// spawn_tstat_begin with the code the thermostat is showing
+    /// now. Takes (and thereby clears) the pending session, so a
+    /// failed finish always returns the panel to Start pairing.
+    fn spawn_tstat_finish(&mut self) {
+        if self.tstat_busy {
+            return;
+        }
+        let Some(pending) = self.tstat_pending.take() else {
+            return;
+        };
         let code = self.tstat_setup_code.clone();
         self.tstat_busy = true;
         self.tstat_error = None;
         let tx = self.tstat_tx.clone();
         thread::spawn(move || {
-            let res = crate::hap::pair_device(&device, &code);
+            let res = crate::hap::finish_pair_setup(pending, &code);
             let _ = tx.send(match res {
                 Ok(p) => TstatResult::Paired(p),
                 Err(e) => TstatResult::Failed(format!("Pairing failed: {}", e)),
@@ -6169,38 +6212,24 @@ impl App {
                     self.spawn_tstat_discover();
                 }
             }
-            bridge::BridgeRequest::Pair { device_id, pin } => {
-                if self.tstat_busy || self.bridge_pending.is_some() {
-                    Self::bridge_busy_reply(reply);
-                } else {
-                    match self
-                        .tstat_discovered
-                        .iter()
-                        .find(|d| d.id == device_id)
-                        .cloned()
-                    {
-                        None => {
-                            let _ = reply.send(bridge::BridgeResponse {
-                                status: 400,
-                                body: json!({
-                                    "error": "device not found — press Discover again, then pair"
-                                }),
-                            });
-                        }
-                        Some(dev) => {
-                            // Same rule as the desktop panel: the
-                            // code lives in memory only for this
-                            // pairing and is cleared when the
-                            // attempt ends, success or failure.
-                            self.tstat_setup_code = pin;
-                            self.bridge_pending = Some(BridgePending {
-                                reply,
-                                kind: BridgePendingKind::Pair,
-                            });
-                            self.spawn_tstat_pair(dev);
-                        }
-                    }
-                }
+            bridge::BridgeRequest::PairSave { pairing } => {
+                // The bridge ran the two-step pairing on its own
+                // threads (pair/begin + pair/finish); this just
+                // persists the result exactly like a desktop
+                // pairing success. Any desktop pairing session
+                // open at the same time is dropped (its socket
+                // closes) — the bridge pairing supersedes it.
+                self.tstat_pending = None;
+                let name = pairing.accessory_name.clone();
+                let model = pairing.accessory_model.clone();
+                self.cfg.thermostat = Some(pairing);
+                self.save();
+                self.toast("Thermostat paired over HomeKit", false);
+                self.spawn_tstat_fetch();
+                let _ = reply.send(bridge::BridgeResponse {
+                    status: 200,
+                    body: json!({ "ok": true, "name": name, "model": model }),
+                });
             }
             bridge::BridgeRequest::Set(req) => {
                 if self.cfg.thermostat.is_none() {
@@ -6265,22 +6294,19 @@ impl App {
                         }
                     }
                 }
+                TstatResult::PairBegun { pending } => {
+                    self.tstat_busy = false;
+                    self.tstat_setup_code.clear();
+                    self.tstat_error = None;
+                    // The session is open and the thermostat is
+                    // showing its fresh code: the panel now prompts
+                    // for it (Finish pairing / Cancel).
+                    self.tstat_pending = Some(pending);
+                }
                 TstatResult::Paired(p) => {
                     self.tstat_busy = false;
                     self.tstat_setup_code.clear();
                     self.tstat_error = None;
-                    let name = p.accessory_name.clone();
-                    let model = p.accessory_model.clone();
-                    if let Some(bp) = self.bridge_pending.take() {
-                        if bp.kind == BridgePendingKind::Pair {
-                            let _ = bp.reply.send(bridge::BridgeResponse {
-                                status: 200,
-                                body: json!({ "ok": true, "name": name, "model": model }),
-                            });
-                        } else {
-                            self.bridge_pending = Some(bp);
-                        }
-                    }
                     self.cfg.thermostat = Some(p);
                     self.save();
                     self.toast("Thermostat paired over HomeKit", false);
@@ -6311,25 +6337,30 @@ impl App {
                 TstatResult::Failed(e) => {
                     self.tstat_busy = false;
                     self.tstat_error = Some(e.clone());
-                    if let Some(bp) = self.bridge_pending.take() {
-                        // The bridge Pair job's setup code lives
-                        // only for that request: clear it on
-                        // failure too (success clears it above).
-                        if bp.kind == BridgePendingKind::Pair {
+                    match self.bridge_pending.take() {
+                        Some(bp) => {
+                            // A failed Status fetch still proves the
+                            // app is paired (dispatch only fetches when
+                            // paired), so the web page can show
+                            // "paired, no reading" instead of "unpaired".
+                            let mut body = json!({ "error": e });
+                            if bp.kind == BridgePendingKind::Status {
+                                body["paired"] = json!(true);
+                            }
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 502,
+                                body,
+                            });
+                        }
+                        None => {
+                            // Desktop-originated failure. A failed
+                            // finish leaves a stale (possibly already
+                            // rotated) code in the field, so clear it
+                            // and return the panel to Start pairing;
+                            // in every other state the field is
+                            // already empty, so this is a no-op.
                             self.tstat_setup_code.clear();
                         }
-                        // A failed Status fetch still proves the
-                        // app is paired (dispatch only fetches when
-                        // paired), so the web page can show
-                        // "paired, no reading" instead of "unpaired".
-                        let mut body = json!({ "error": e });
-                        if bp.kind == BridgePendingKind::Status {
-                            body["paired"] = json!(true);
-                        }
-                        let _ = bp.reply.send(bridge::BridgeResponse {
-                            status: 502,
-                            body,
-                        });
                     }
                 }
             }
@@ -9124,25 +9155,24 @@ impl App {
                                 None => {
                                     ui.label(RichText::new("Not paired.").size(12.5));
                                     ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new("Setup code (shown on the thermostat screen during pairing, or on the sticker in the box):")
-                                            .size(12.5)
-                                            .color(pal.dim),
-                                    );
-                                    ui.add(
-                                        TextEdit::singleline(&mut self.tstat_setup_code)
-                                            .hint_text("123-45-678"),
-                                    );
-                                    ui.label(
-                                        RichText::new("The code is used for this pairing only and is never stored — only the derived keys are saved, like the saved Tuya login above.")
-                                            .size(12.5)
-                                            .color(pal.dim),
-                                    );
-                                    ui.add_space(6.0);
+                                    // Two-step pairing for rotating-code
+                                    // thermostats: Start pairing opens
+                                    // the session (M1/M2) with no code
+                                    // needed; the thermostat shows its
+                                    // fresh code during the attempt,
+                                    // and Finish sends it (M3..M6).
+                                    // A code typed before Start would
+                                    // already be stale, so the field
+                                    // only appears once a session is
+                                    // open. Only one session at a
+                                    // time: other devices' Start
+                                    // buttons disable while one is
+                                    // pending.
                                     ui.horizontal(|ui| {
                                         if ui
                                             .add_enabled(
-                                                !self.tstat_busy,
+                                                !self.tstat_busy
+                                                    && self.tstat_pending.is_none(),
                                                 Button::new("Discover devices"),
                                             )
                                             .clicked()
@@ -9157,6 +9187,10 @@ impl App {
                                             );
                                         }
                                     });
+                                    let pending_id = self
+                                        .tstat_pending
+                                        .as_ref()
+                                        .map(|p| p.device_id().to_string());
                                     for dev in self.tstat_discovered.clone() {
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(format!(
@@ -9172,22 +9206,77 @@ impl App {
                                             ui.with_layout(
                                                 Layout::right_to_left(Align::Center),
                                                 |ui| {
-                                                    if ui
-                                                        .add_enabled(
-                                                            !self.tstat_busy
-                                                                && !self
-                                                                    .tstat_setup_code
-                                                                    .trim()
-                                                                    .is_empty(),
-                                                            Button::new("Pair"),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        self.spawn_tstat_pair(dev.clone());
+                                                    match &pending_id {
+                                                        None => {
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !self.tstat_busy,
+                                                                    Button::new("Start pairing"),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                self.spawn_tstat_begin(dev.clone());
+                                                            }
+                                                        }
+                                                        Some(pid) if *pid == dev.id => {
+                                                            ui.label(
+                                                                RichText::new("Pairing…")
+                                                                    .size(12.5)
+                                                                    .color(pal.dim),
+                                                            );
+                                                        }
+                                                        Some(_) => {
+                                                            ui.add_enabled(
+                                                                false,
+                                                                Button::new("Start pairing"),
+                                                            );
+                                                        }
                                                     }
                                                 },
                                             );
                                         });
+                                        if pending_id.as_deref() == Some(dev.id.as_str()) {
+                                            ui.label(
+                                                RichText::new("Code shown on your thermostat — type it here:")
+                                                    .size(12.5),
+                                            );
+                                            ui.add(
+                                                TextEdit::singleline(&mut self.tstat_setup_code)
+                                                    .hint_text("e.g. 123-45-678"),
+                                            );
+                                            ui.label(
+                                                RichText::new("Type it promptly: the thermostat may time out the pairing session. If it expires, press Start pairing and try again with the fresh code.")
+                                                    .size(12.5)
+                                                    .color(pal.dim),
+                                            );
+                                            ui.label(
+                                                RichText::new("The code is used for this pairing only and is never stored — only the derived keys are saved, like the saved Tuya login above.")
+                                                    .size(12.5)
+                                                    .color(pal.dim),
+                                            );
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        !self.tstat_busy
+                                                            && !self
+                                                                .tstat_setup_code
+                                                                .trim()
+                                                                .is_empty(),
+                                                        Button::new("Finish pairing"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.spawn_tstat_finish();
+                                                }
+                                                if ui.add(Button::new("Cancel")).clicked() {
+                                                    // Dropping the pending
+                                                    // session closes its
+                                                    // socket at once.
+                                                    self.tstat_pending = None;
+                                                    self.tstat_error = None;
+                                                }
+                                            });
+                                        }
                                         ui.separator();
                                     }
                                 }
@@ -10338,7 +10427,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.6.0");
+        assert_eq!(APP_VERSION, "1.6.1");
     }
 
     #[test]
@@ -11678,6 +11767,7 @@ mod tests {
             tstat_state: None,
             tstat_error: None,
             tstat_discovered: Vec::new(),
+            tstat_pending: None,
             tstat_tx,
             tstat_rx,
             tstat_last_fetch: None,

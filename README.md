@@ -132,6 +132,18 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.6.1
+
+- **Fixed: pairing with thermostats that show a fresh setup code on
+  every attempt.** Some thermostats (including the Resideo T6 Pro)
+  generate a new code each time pairing starts, so typing a code
+  before tapping Pair could never succeed. Pairing is now two steps:
+  Start pairing makes the thermostat show its fresh code, then you
+  type that code and tap Finish pairing. The web edition follows the
+  same two-step flow through the desktop app's bridge.
+- **Small fix:** the setup-code field's hint now reads
+  "e.g. 123-45-678" so it can't be mistaken for a filled-in code.
+
 ## What's new in 1.6.0
 
 - **New: HomeKit thermostat control.** The desktop editions (Windows

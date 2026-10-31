@@ -11,19 +11,30 @@
 //     not loopback, so nothing off this computer can reach it.
 //   * It exposes thermostat endpoints ONLY. It never serves Tuya
 //     credentials, config contents, or any other app state — it does
-//     not even know they exist: every request is forwarded to the UI
-//     thread over a channel, and the UI thread answers through the
-//     SAME spawn/report machinery the desktop tile uses (one pairing
-//     store in cfg.thermostat, one busy flag, one result channel).
+//     not even know they exist. Status/discover/set/forget requests
+//     are forwarded to the UI thread over a channel and answered
+//     through the SAME spawn/report machinery the desktop tile uses
+//     (one pairing store in cfg.thermostat, one busy flag, one
+//     result channel); only pairing itself runs on the bridge's own
+//     threads (see the two-step note below), with the finished
+//     pairing handed to the UI thread to persist.
 //   * It runs on its own thread and never blocks the UI thread; the
 //     UI thread only drains the request channel once per frame.
 //   * It runs always, paired or not: discovery and pairing from the
 //     web page need it before any pairing exists.
-//   * The setup code (pin) is carried in memory for one pairing
-//     request only. It is never written to config, never logged,
-//     and the UI thread clears it when the pairing attempt ends,
-//     success or failure. BridgeRequest deliberately has NO Debug
-//     impl, so a stray log can never print a pin.
+//   * Two-step pairing (rotating-code thermostats): POST
+//     /thermostat/pair/begin opens a session (M1/M2, no code needed)
+//     and returns a pending_id; POST /thermostat/pair/finish sends
+//     the code the thermostat is showing (M3..M6) and, on success,
+//     hands the finished pairing to the UI thread to persist;
+//     POST /thermostat/pair/cancel drops the session. The sessions
+//     live only in the bridge's PairSessions map — never in config,
+//     never on the UI thread. The setup code (pin) is carried in
+//     memory for one finish request only. It is never written to
+//     config, never logged, never echoed in a response, and never
+//     part of a pending session (the code arrives only at finish).
+//     BridgeRequest deliberately has NO Debug impl, so a stray log
+//     can never print a pin.
 //
 // CORS: every response carries Access-Control-Allow-Origin: * plus
 // the Private-Network header, and OPTIONS is answered 204, so the
@@ -34,11 +45,13 @@
 // test must confirm; see the report notes.
 // ---------------------------------------------------------------------------
 
-use crate::hap::{DiscoveredDevice, ThermostatState};
+use crate::hap::{DiscoveredDevice, PendingPairSetup, ThermostatState};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -80,14 +93,69 @@ pub struct SetRequest {
 }
 
 /// One thermostat operation for the UI thread. NOTE: no Debug impl
-/// on purpose — Pair carries the setup code, and it must never be
-/// printable by a debug log.
+/// on purpose — PairFinish carries the setup code, and it must never
+/// be printable by a debug log. PairSave carries only the derived
+/// pairing (no code ever reaches it: the bridge hands the UI thread
+/// the finished pairing, never the pin).
 pub enum BridgeRequest {
     Status,
     Discover,
-    Pair { device_id: String, pin: String },
+    /// A pairing finished on the bridge's own threads, for the UI
+    /// thread to persist in config like a desktop pairing success.
+    PairSave {
+        pairing: crate::hap::ThermostatPairing,
+    },
     Set(SetRequest),
     Forget,
+}
+
+/// Open pair-setup sessions for the web edition, keyed by fresh
+/// random ids. Lives only in memory on the bridge threads: a session
+/// holds a live socket to the thermostat, so it can never cross to
+/// the UI thread or survive a restart. Finish and cancel remove the
+/// entry; at most one session exists at a time (a second begin gets
+/// 409), so two pages cannot interleave pair-setup on one unit.
+pub struct PairSessions {
+    inner: Mutex<HashMap<String, PendingPairSetup>>,
+}
+
+impl PairSessions {
+    pub fn new() -> Self {
+        PairSessions {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().map(|m| m.is_empty()).unwrap_or(false)
+    }
+
+    /// Store a session if none is open; None means one already is
+    /// (the caller answers 409). The check and the insert share one
+    /// lock, so two simultaneous begins cannot both succeed.
+    pub fn insert_if_empty(&self, pending: PendingPairSetup) -> Option<String> {
+        let mut map = self.inner.lock().ok()?;
+        if !map.is_empty() {
+            return None;
+        }
+        let mut id = fresh_pending_id();
+        while map.contains_key(&id) {
+            id = fresh_pending_id();
+        }
+        map.insert(id.clone(), pending);
+        Some(id)
+    }
+
+    /// Remove and return a session, if it exists. Dropping the
+    /// returned value closes its socket (cancel = take + drop).
+    pub fn take(&self, pending_id: &str) -> Option<PendingPairSetup> {
+        self.inner.lock().ok()?.remove(pending_id)
+    }
+}
+
+fn fresh_pending_id() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// A request plus the channel its answer goes back on.
@@ -195,22 +263,61 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn parse_pair_body(body: &[u8]) -> Result<BridgeRequest, &'static str> {
+fn parse_begin_body(body: &[u8]) -> Result<String, &'static str> {
     let v: Value = serde_json::from_slice(body).map_err(|_| "malformed JSON body")?;
-    let device_id = v
-        .get("device_id")
+    v.get("device_id")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .ok_or("pair needs a device_id string")?;
+        .map(|s| s.to_string())
+        .ok_or("pair/begin needs a device_id string")
+}
+
+fn parse_finish_body(body: &[u8]) -> Result<(String, String), &'static str> {
+    let v: Value = serde_json::from_slice(body).map_err(|_| "malformed JSON body")?;
+    let pending_id = v
+        .get("pending_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("pair/finish needs a pending_id string")?;
     let pin = v
         .get("pin")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .ok_or("pair needs a pin string")?;
-    Ok(BridgeRequest::Pair {
-        device_id: device_id.to_string(),
-        pin: pin.to_string(),
-    })
+        .ok_or("pair/finish needs a pin string")?;
+    Ok((pending_id.to_string(), pin.to_string()))
+}
+
+fn parse_cancel_body(body: &[u8]) -> Result<String, &'static str> {
+    let v: Value = serde_json::from_slice(body).map_err(|_| "malformed JSON body")?;
+    v.get("pending_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .ok_or("pair/cancel needs a pending_id string")
+}
+
+/// Resolve a device id to a live address (fresh discovery: the
+/// page's device list carries no addresses, and the accessory must
+/// be advertising right now for pairing to work at all), open the
+/// pair-setup session, and store it. Returns the pending id.
+fn begin_session(sessions: &PairSessions, device_id: &str) -> Result<String, (u16, String)> {
+    let devs = crate::hap::discover(Duration::from_secs(8))
+        .map_err(|e| (502, format!("discovery failed: {e}")))?;
+    let dev = devs
+        .iter()
+        .find(|d| d.id == device_id)
+        .ok_or_else(|| {
+            (
+                404,
+                "device not found — press Discover again, then pair".to_string(),
+            )
+        })?;
+    let pending = crate::hap::begin_pair_setup(dev)
+        .map_err(|e| (502, format!("could not start pairing: {e}")))?;
+    sessions.insert_if_empty(pending).ok_or((
+        409,
+        "a pairing is already in progress — finish or cancel it first".to_string(),
+    ))
 }
 
 fn opt_temp(obj: &Map<String, Value>, key: &str) -> Result<Option<f64>, &'static str> {
@@ -267,12 +374,15 @@ fn parse_set_body(body: &[u8]) -> Result<BridgeRequest, &'static str> {
 
 /// Route one request. Never panics on hostile input: every parse
 /// failure becomes a 400, every unknown path a 404. Bodies are never
-/// echoed back (a pair body contains the setup code).
+/// echoed back (a finish body contains the setup code). Pairing runs
+/// on the bridge's own threads through `sessions`; only the finished
+/// pairing crosses to the UI thread (PairSave), via `backend`.
 pub fn handle_http(
     method: &str,
     raw_path: &str,
     body: &[u8],
     backend: &dyn Fn(BridgeRequest) -> BridgeResponse,
+    sessions: &PairSessions,
 ) -> HttpReply {
     // Browsers preflight cross-origin POSTs (and private-network
     // fetches) with OPTIONS; answer it before any routing.
@@ -286,9 +396,67 @@ pub fn handle_http(
     match (method, path) {
         ("GET", "/thermostat/status") => backend_reply(backend(BridgeRequest::Status)),
         ("GET", "/thermostat/discover") => backend_reply(backend(BridgeRequest::Discover)),
-        ("POST", "/thermostat/pair") => match parse_pair_body(body) {
-            Ok(req) => backend_reply(backend(req)),
+        ("POST", "/thermostat/pair/begin") => match parse_begin_body(body) {
             Err(m) => err_reply(400, m),
+            Ok(device_id) => {
+                if !sessions.is_empty() {
+                    err_reply(
+                        409,
+                        "a pairing is already in progress — finish or cancel it first",
+                    )
+                } else {
+                    match begin_session(sessions, &device_id) {
+                        Ok(pending_id) => HttpReply {
+                            status: 200,
+                            body: json!({ "pending_id": pending_id }).to_string(),
+                        },
+                        Err((status, msg)) => err_reply(status, &msg),
+                    }
+                }
+            }
+        },
+        ("POST", "/thermostat/pair/finish") => match parse_finish_body(body) {
+            Err(m) => err_reply(400, m),
+            Ok((pending_id, pin)) => {
+                // A malformed code must not consume the session:
+                // the user can retype without starting over.
+                if crate::hap::normalize_setup_code(&pin).is_err() {
+                    err_reply(400, "pin must be 8 digits (e.g. 123-45-678)")
+                } else {
+                    match sessions.take(&pending_id) {
+                        None => err_reply(
+                            404,
+                            "no such pairing session — press Start pairing first",
+                        ),
+                        Some(pending) => {
+                            match crate::hap::finish_pair_setup(pending, &pin) {
+                                Ok(pairing) => {
+                                    backend_reply(backend(BridgeRequest::PairSave { pairing }))
+                                }
+                                Err(e) => {
+                                    // The session is spent either
+                                    // way (the SRP state is gone
+                                    // after a failed M3), so the
+                                    // error tells the page to start
+                                    // over with a fresh code.
+                                    err_reply(502, &format!("pairing failed: {e}"))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        ("POST", "/thermostat/pair/cancel") => match parse_cancel_body(body) {
+            Err(m) => err_reply(400, m),
+            Ok(pending_id) => match sessions.take(&pending_id) {
+                // Dropping the taken session closes its socket.
+                Some(_) => HttpReply {
+                    status: 200,
+                    body: json!({ "ok": true }).to_string(),
+                },
+                None => err_reply(404, "no such pairing session"),
+            },
         },
         ("POST", "/thermostat/set") => match parse_set_body(body) {
             Ok(req) => backend_reply(backend(req)),
@@ -300,7 +468,9 @@ pub fn handle_http(
                 path,
                 "/thermostat/status"
                     | "/thermostat/discover"
-                    | "/thermostat/pair"
+                    | "/thermostat/pair/begin"
+                    | "/thermostat/pair/finish"
+                    | "/thermostat/pair/cancel"
                     | "/thermostat/set"
                     | "/thermostat/forget"
             );
@@ -327,16 +497,19 @@ pub fn is_loopback_peer(addr: &SocketAddr) -> bool {
 /// Start the bridge thread. Never blocks the caller; a bind failure
 /// (port already in use) only disables web-edition control — the
 /// desktop tile keeps working — and is reported on stderr.
+/// Pairing sessions live in the map created here, shared by every
+/// connection thread (see PairSessions).
 pub fn start_bridge(tx: Sender<BridgeJob>) {
+    let sessions = Arc::new(PairSessions::new());
     let spawn = thread::Builder::new()
         .name("tstat-bridge".to_string())
-        .spawn(move || serve(tx));
+        .spawn(move || serve(tx, sessions));
     if let Err(e) = spawn {
         eprintln!("thermostat bridge: could not start thread: {e}");
     }
 }
 
-fn serve(tx: Sender<BridgeJob>) {
+fn serve(tx: Sender<BridgeJob>, sessions: Arc<PairSessions>) {
     let listener = match TcpListener::bind((BRIDGE_BIND_ADDR, BRIDGE_PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -351,21 +524,26 @@ fn serve(tx: Sender<BridgeJob>) {
         match stream {
             Ok(s) => {
                 let tx = tx.clone();
-                thread::spawn(move || handle_connection(s, tx));
+                let sessions = sessions.clone();
+                thread::spawn(move || handle_connection(s, tx, sessions));
             }
             Err(_) => continue,
         }
     }
 }
 
-fn handle_connection(stream: TcpStream, tx: Sender<BridgeJob>) {
+fn handle_connection(stream: TcpStream, tx: Sender<BridgeJob>, sessions: Arc<PairSessions>) {
     let mut stream = stream;
-    let reply = process_connection(&mut stream, &tx);
+    let reply = process_connection(&mut stream, &tx, &sessions);
     let _ = write_response(&mut stream, &reply);
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-fn process_connection(stream: &mut TcpStream, tx: &Sender<BridgeJob>) -> HttpReply {
+fn process_connection(
+    stream: &mut TcpStream,
+    tx: &Sender<BridgeJob>,
+    sessions: &PairSessions,
+) -> HttpReply {
     match stream.peer_addr() {
         Ok(a) if is_loopback_peer(&a) => {}
         _ => {
@@ -401,7 +579,7 @@ fn process_connection(stream: &mut TcpStream, tx: &Sender<BridgeJob>) -> HttpRep
             },
         }
     };
-    handle_http(&method, &path, &body, &backend)
+    handle_http(&method, &path, &body, &backend, sessions)
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), &'static str> {
@@ -510,6 +688,7 @@ mod tests {
             "/thermostat/status",
             b"",
             &stub(200, json!({ "paired": false })),
+            &PairSessions::new(),
         );
         assert_eq!(r.status, 200);
         assert_eq!(r.body, "{\"paired\":false}");
@@ -517,7 +696,13 @@ mod tests {
 
     #[test]
     fn options_answers_204_and_cors_covers_private_network() {
-        let r = handle_http("OPTIONS", "/thermostat/status", b"", &stub(200, json!({})));
+        let r = handle_http(
+            "OPTIONS",
+            "/thermostat/status",
+            b"",
+            &stub(200, json!({})),
+            &PairSessions::new(),
+        );
         assert_eq!(r.status, 204);
         assert_eq!(r.body, "");
         let cors = cors_header_block();
@@ -528,12 +713,52 @@ mod tests {
 
     #[test]
     fn malformed_json_is_400_never_panic() {
-        // Pair: garbage, missing pin, missing device_id.
-        for body in [&b"{not json"[..], b"[]", b"{\"device_id\":\"x\"}", b"{\"pin\":\"123-45-678\"}"] {
-            let r = handle_http("POST", "/thermostat/pair", body, &stub(200, json!({})));
+        let sessions = PairSessions::new();
+        // Begin: garbage, non-object, missing device_id, empty id.
+        for body in [
+            &b"{not json"[..],
+            b"[]",
+            b"{}",
+            b"{\"device_id\":\"\"}",
+        ] {
+            let r = handle_http(
+                "POST",
+                "/thermostat/pair/begin",
+                body,
+                &stub(200, json!({})),
+                &sessions,
+            );
             assert_eq!(r.status, 400, "body {:?}", String::from_utf8_lossy(body));
-            // The body is never echoed back (a pair body holds the code).
+        }
+        // Finish: garbage, missing pin, missing pending_id, empty id.
+        // One body carries a real-looking code: it must never be
+        // echoed back.
+        for body in [
+            &b"{not json"[..],
+            b"{\"pending_id\":\"x\"}",
+            b"{\"pin\":\"123-45-678\"}",
+            b"{\"pending_id\":\"\",\"pin\":\"123-45-678\"}",
+        ] {
+            let r = handle_http(
+                "POST",
+                "/thermostat/pair/finish",
+                body,
+                &stub(200, json!({})),
+                &sessions,
+            );
+            assert_eq!(r.status, 400, "body {:?}", String::from_utf8_lossy(body));
             assert!(!r.body.contains("123-45-678"));
+        }
+        // Cancel: garbage, missing pending_id.
+        for body in [&b"{not json"[..], b"{}"] {
+            let r = handle_http(
+                "POST",
+                "/thermostat/pair/cancel",
+                body,
+                &stub(200, json!({})),
+                &sessions,
+            );
+            assert_eq!(r.status, 400, "body {:?}", String::from_utf8_lossy(body));
         }
         // Set: garbage, non-object, unknown mode, unknown fan,
         // non-numeric temp, and an empty set.
@@ -545,25 +770,56 @@ mod tests {
             b"{\"target_f\":\"warm\"}",
             b"{}",
         ] {
-            let r = handle_http("POST", "/thermostat/set", body, &stub(200, json!({})));
+            let r = handle_http(
+                "POST",
+                "/thermostat/set",
+                body,
+                &stub(200, json!({})),
+                &sessions,
+            );
             assert_eq!(r.status, 400, "body {:?}", String::from_utf8_lossy(body));
         }
     }
 
     #[test]
     fn unknown_path_404_wrong_method_405() {
-        let r = handle_http("GET", "/nope", b"", &stub(200, json!({})));
+        let sessions = PairSessions::new();
+        let r = handle_http("GET", "/nope", b"", &stub(200, json!({})), &sessions);
         assert_eq!(r.status, 404);
-        let r = handle_http("POST", "/thermostat/status", b"", &stub(200, json!({})));
+        let r = handle_http(
+            "POST",
+            "/thermostat/status",
+            b"",
+            &stub(200, json!({})),
+            &sessions,
+        );
         assert_eq!(r.status, 405);
-        let r = handle_http("GET", "/thermostat/pair", b"", &stub(200, json!({})));
+        let r = handle_http(
+            "GET",
+            "/thermostat/pair/begin",
+            b"",
+            &stub(200, json!({})),
+            &sessions,
+        );
         assert_eq!(r.status, 405);
+        // The old single-shot pair route is gone, not kept as an
+        // alias: a stale client gets a plain 404.
+        let r = handle_http(
+            "POST",
+            "/thermostat/pair",
+            b"{\"device_id\":\"x\",\"pin\":\"123-45-678\"}",
+            &stub(200, json!({})),
+            &sessions,
+        );
+        assert_eq!(r.status, 404);
+        assert!(!r.body.contains("123-45-678"));
         // Query strings do not break routing.
         let r = handle_http(
             "GET",
             "/thermostat/status?x=1",
             b"",
             &stub(200, json!({ "paired": false })),
+            &sessions,
         );
         assert_eq!(r.status, 200);
     }
@@ -625,10 +881,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = channel::<BridgeJob>();
         drop(rx);
+        let sessions = Arc::new(PairSessions::new());
         let server = thread::spawn(move || {
             for stream in listener.incoming().take(2) {
                 if let Ok(s) = stream {
-                    handle_connection(s, tx.clone());
+                    handle_connection(s, tx.clone(), sessions.clone());
                 }
             }
         });
@@ -648,9 +905,144 @@ mod tests {
             "preflight: {preflight}"
         );
         let bad = roundtrip(
-            "POST /thermostat/pair HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n{bad",
+            "POST /thermostat/pair/begin HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n{bad",
         );
-        assert!(bad.contains("400"), "bad pair: {bad}");
+        assert!(bad.contains("400"), "bad begin: {bad}");
         server.join().unwrap();
+    }
+
+    // -- Two-step pairing session tests ------------------------------
+    // A minimal M1/M2-only accessory: answers one pair-setup M1 with
+    // a fixed M2 (salt + public key), then waits for the client to
+    // close. Begin only stores M2's values — no SRP math runs until
+    // finish, which these tests never reach — so the values need not
+    // be a real server key.
+
+    fn spawn_m1m2_server() -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    Some(p) => break p + 4,
+                    None => match s.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => return,
+                    },
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let mut content_len = 0usize;
+            for line in head.lines().skip(1) {
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            while buf.len() < head_end + content_len {
+                match s.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => return,
+                }
+            }
+            // Tag 6 = State (M2), 2 = Salt, 3 = PublicKey.
+            let body = crate::hap::tlv_encode(&[
+                (6, &[2u8][..]),
+                (2, &[0xabu8; 16][..]),
+                (3, &[0xcdu8; 384][..]),
+            ]);
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = s.write_all(resp.as_bytes());
+            let _ = s.write_all(&body);
+            // Wait for the client to close (cancel drops the pending)
+            // or time out; either way exit without panicking.
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    fn m1m2_device(port: u16) -> DiscoveredDevice {
+        DiscoveredDevice {
+            id: "test-id".to_string(),
+            name: "Test T6".to_string(),
+            model: "T6".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            port,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pair_sessions_second_begin_409_and_finish_after_cancel_404() {
+        let sessions = PairSessions::new();
+        let (port1, server1) = spawn_m1m2_server();
+        let pending = crate::hap::begin_pair_setup(&m1m2_device(port1)).unwrap();
+        let id = sessions.insert_if_empty(pending).expect("first insert");
+        // A second session cannot open while one is pending: the
+        // map-level insert refuses, and the HTTP layer answers 409
+        // before any discovery runs.
+        let (port2, server2) = spawn_m1m2_server();
+        let pending2 = crate::hap::begin_pair_setup(&m1m2_device(port2)).unwrap();
+        assert!(sessions.insert_if_empty(pending2).is_none());
+        let r = handle_http(
+            "POST",
+            "/thermostat/pair/begin",
+            b"{\"device_id\":\"x\"}",
+            &stub(200, json!({})),
+            &sessions,
+        );
+        assert_eq!(r.status, 409);
+        // Unknown finish/cancel: 404, no panic, pin never echoed.
+        let r = handle_http(
+            "POST",
+            "/thermostat/pair/finish",
+            b"{\"pending_id\":\"nope\",\"pin\":\"123-45-678\"}",
+            &stub(200, json!({})),
+            &sessions,
+        );
+        assert_eq!(r.status, 404);
+        assert!(!r.body.contains("123-45-678"));
+        let r = handle_http(
+            "POST",
+            "/thermostat/pair/cancel",
+            b"{\"pending_id\":\"nope\"}",
+            &stub(200, json!({})),
+            &sessions,
+        );
+        assert_eq!(r.status, 404);
+        // Cancel the real session, then finishing it fails cleanly
+        // (404, no panic): the session is gone, not half-alive.
+        let r = handle_http(
+            "POST",
+            "/thermostat/pair/cancel",
+            format!("{{\"pending_id\":\"{id}\"}}").as_bytes(),
+            &stub(200, json!({})),
+            &sessions,
+        );
+        assert_eq!(r.status, 200);
+        let r = handle_http(
+            "POST",
+            "/thermostat/pair/finish",
+            format!("{{\"pending_id\":\"{id}\",\"pin\":\"123-45-678\"}}").as_bytes(),
+            &stub(200, json!({})),
+            &sessions,
+        );
+        assert_eq!(r.status, 404);
+        assert!(!r.body.contains("123-45-678"));
+        server1.join().unwrap();
+        server2.join().unwrap();
     }
 }
