@@ -1881,6 +1881,33 @@ fn apply_writes_to_state(st: &mut ThermostatState, writes: &[(u32, u32, serde_js
     }
 }
 
+/// Patch a state with a semantic change set (the tile's instant
+/// optimistic update, v2.0.1): only the fields the change set
+/// names move; every other field keeps its current value. This is
+/// the same patch apply_writes_to_state performs for wire writes,
+/// but at the ThermostatChanges level, so the tile can show the
+/// tapped mode/setpoint/fan at once without waiting for the set
+/// round-trip. The authoritative result (Confirmed/Optimistic)
+/// replaces this state when it arrives; a real failure reverts it
+/// via a prompt re-fetch.
+pub fn apply_changes_to_state(st: &mut ThermostatState, changes: &ThermostatChanges) {
+    if let Some(m) = changes.target_mode {
+        st.target_mode = m;
+    }
+    if let Some(t) = changes.target_temp_c {
+        st.target_temp_c = t;
+    }
+    if let Some(t) = changes.heat_to_c {
+        st.heat_to_c = Some(t);
+    }
+    if let Some(t) = changes.cool_to_c {
+        st.cool_to_c = Some(t);
+    }
+    if let Some(on) = changes.fan_on {
+        st.fan_on = Some(on);
+    }
+}
+
 /// Apply changes, then read back exactly the written characteristics
 /// and report the actual values (the returned state reflects the
 /// readback). If the PUT succeeds but the readback fails, the set
@@ -2243,6 +2270,44 @@ mod tests {
         assert_eq!(st.heat_to_c, Some(20.0));
         assert_eq!(st.cool_to_c, Some(24.0));
         assert_eq!(st.fan_on, Some(false));
+    }
+
+    #[test]
+    fn optimistic_tile_patch_changes_only_requested_fields() {
+        // v2.0.1 instant tile: patching a change set moves only the
+        // named fields; everything else (current readings, humidity,
+        // the other setpoint) keeps its value.
+        let mut st = ThermostatState {
+            current_mode: 0,
+            target_mode: 2,
+            current_temp_c: 25.0,
+            target_temp_c: 25.0,
+            heat_to_c: Some(20.0),
+            cool_to_c: Some(24.0),
+            humidity: Some(40.0),
+            fan_on: Some(false),
+            ..Default::default()
+        };
+        apply_changes_to_state(
+            &mut st,
+            &ThermostatChanges {
+                target_temp_c: Some(25.555555555555557),
+                fan_on: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(st.target_temp_c, 25.555555555555557);
+        assert_eq!(st.fan_on, Some(true));
+        assert_eq!(st.target_mode, 2);
+        assert_eq!(st.current_mode, 0);
+        assert_eq!(st.current_temp_c, 25.0);
+        assert_eq!(st.heat_to_c, Some(20.0));
+        assert_eq!(st.cool_to_c, Some(24.0));
+        assert_eq!(st.humidity, Some(40.0));
+        // An empty change set is a no-op.
+        apply_changes_to_state(&mut st, &ThermostatChanges::default());
+        assert_eq!(st.target_temp_c, 25.555555555555557);
+        assert_eq!(st.fan_on, Some(true));
     }
 
     #[test]

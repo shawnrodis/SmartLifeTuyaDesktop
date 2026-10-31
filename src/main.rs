@@ -3866,6 +3866,10 @@ enum TstatResult {
     /// so the state is the intended one (see hap::SetOutcome). Handled
     /// like State, plus a prompt re-fetch to confirm.
     StateConfirm(crate::hap::ThermostatState),
+    /// A set failure (PUT rejected or network error). Handled like
+    /// Failed, plus a prompt re-fetch so the tile reverts from any
+    /// optimistic patch to the unit's true state quickly.
+    SetFailed(String),
     Failed(String),
 }
 
@@ -4603,14 +4607,29 @@ struct App {
     // as the "keep me logged in" Tuya credentials.
     tstat_setup_code: String,
     /// Action-busy (v1.6.4 split): a user-initiated thermostat
-    /// operation is running — set, discovery, pairing. Only this
-    /// flag shows "Working…" on the card and in Settings.
+    /// operation is running — discovery or pairing. Only this
+    /// flag shows "Working…" on the card and in Settings. (Sets
+    /// used to set it too; since v2.0.1 they use tstat_set_busy
+    /// below, so tile taps never show the indicator.)
     tstat_busy: bool,
+    /// Set-busy (v2.0.1 split): a tile or bridge set is running.
+    /// Serialization only — it never shows "Working…" anywhere.
+    /// The card's buttons stay disabled while it is set, so
+    /// overlapping sets stay blocked exactly as before; the tile
+    /// itself updates instantly from the optimistic patch instead
+    /// of waiting for the round-trip.
+    tstat_set_busy: bool,
+    /// Set-failure revert guard (v2.0.1): true from a SetFailed
+    /// result until the prompt re-fetch it triggers resolves. While
+    /// set, a Fetched/FetchFailed result reverts the tile's state
+    /// but leaves the set error line alone, so the failure stays
+    /// visible instead of being cleared by the revert itself.
+    tstat_revert_pending: bool,
     /// Fetch-busy (v1.6.4 split): a status fetch is running
     /// (autorefresh, manual Refresh, post-pairing, bridge Status,
     /// optimistic re-fetch). Fetches are silent: no "Working…"
     /// text anywhere, though the Refresh button stays disabled
-    /// while one runs. Both flags together keep operations
+    /// while one runs. All three flags together keep operations
     /// serialized exactly as the single flag did before.
     tstat_fetch_busy: bool,
     tstat_state: Option<crate::hap::ThermostatState>,
@@ -4807,6 +4826,8 @@ impl App {
             cfg: Config::default(),
             tstat_setup_code: String::new(),
             tstat_busy: false,
+            tstat_set_busy: false,
+            tstat_revert_pending: false,
             tstat_fetch_busy: false,
             tstat_state: None,
             tstat_error: None,
@@ -6453,7 +6474,7 @@ impl App {
     // two pair-verify sessions never interleave on one pairing.
 
     fn spawn_tstat_discover(&mut self) {
-        if self.tstat_busy || self.tstat_fetch_busy {
+        if self.tstat_busy || self.tstat_fetch_busy || self.tstat_set_busy {
             return;
         }
         self.tstat_busy = true;
@@ -6475,7 +6496,7 @@ impl App {
     /// pending session is delivered back as TstatResult::PairBegun
     /// and held in App.tstat_pending until Finish or Cancel.
     fn spawn_tstat_begin(&mut self, device: crate::hap::DiscoveredDevice) {
-        if self.tstat_busy || self.tstat_fetch_busy {
+        if self.tstat_busy || self.tstat_fetch_busy || self.tstat_set_busy {
             return;
         }
         self.tstat_busy = true;
@@ -6495,7 +6516,7 @@ impl App {
     /// now. Takes (and thereby clears) the pending session, so a
     /// failed finish always returns the panel to Start pairing.
     fn spawn_tstat_finish(&mut self) {
-        if self.tstat_busy || self.tstat_fetch_busy {
+        if self.tstat_busy || self.tstat_fetch_busy || self.tstat_set_busy {
             return;
         }
         let Some(pending) = self.tstat_pending.take() else {
@@ -6520,7 +6541,7 @@ impl App {
     /// needs a guaranteed re-fetch, the optimistic-confirm handler,
     /// runs after the current operation clears instead).
     fn spawn_tstat_fetch(&mut self) -> bool {
-        if self.tstat_busy || self.tstat_fetch_busy {
+        if self.tstat_busy || self.tstat_fetch_busy || self.tstat_set_busy {
             return false;
         }
         let Some(pairing) = self.cfg.thermostat.clone() else {
@@ -6541,23 +6562,46 @@ impl App {
         true
     }
 
-    fn spawn_tstat_set(&mut self, changes: crate::hap::ThermostatChanges) {
-        if self.tstat_busy || self.tstat_fetch_busy {
-            return;
+    /// Tile tap helper (v2.0.1): spawn a thermostat set and, when it
+    /// spawns, patch local state at once so the tile shows the tapped
+    /// mode/setpoint/fan immediately instead of waiting for the
+    /// round-trip. The authoritative result replaces the patch when
+    /// it arrives, and a real failure reverts it via re-fetch. A
+    /// blocked tap (another operation running) patches nothing, so
+    /// the tile never paints a change that was never sent.
+    fn tstat_tap(&mut self, changes: crate::hap::ThermostatChanges) {
+        if self.spawn_tstat_set(changes.clone()) {
+            if let Some(st) = self.tstat_state.as_mut() {
+                crate::hap::apply_changes_to_state(st, &changes);
+            }
+            self.tstat_error = None;
+        }
+    }
+
+    /// Tile/bridge set (v2.0.1 busy split): sets set-busy only, so
+    /// the card never shows "Working…" for a set — the tile updates
+    /// instantly from the caller's optimistic patch instead. Returns
+    /// true when the set actually spawned; the tile handler patches
+    /// local state only on true, so a blocked tap never paints a
+    /// change that was never sent.
+    fn spawn_tstat_set(&mut self, changes: crate::hap::ThermostatChanges) -> bool {
+        if self.tstat_busy || self.tstat_fetch_busy || self.tstat_set_busy {
+            return false;
         }
         let Some(pairing) = self.cfg.thermostat.clone() else {
-            return;
+            return false;
         };
-        self.tstat_busy = true;
+        self.tstat_set_busy = true;
         let tx = self.tstat_tx.clone();
         thread::spawn(move || {
             let res = crate::hap::set_state(&pairing, &changes);
             let _ = tx.send(match res {
                 Ok(crate::hap::SetOutcome::Confirmed(st)) => TstatResult::State(st),
                 Ok(crate::hap::SetOutcome::Optimistic(st)) => TstatResult::StateConfirm(st),
-                Err(e) => TstatResult::Failed(format!("Thermostat control failed: {}", e)),
+                Err(e) => TstatResult::SetFailed(format!("Thermostat control failed: {}", e)),
             });
         });
+        true
     }
 
     // ---------------- thermostat bridge (web edition) ----------------
@@ -6590,7 +6634,7 @@ impl App {
                         status: 200,
                         body: json!({ "paired": false }),
                     });
-                } else if self.tstat_busy || self.bridge_pending.is_some() {
+                } else if self.tstat_busy || self.tstat_set_busy || self.bridge_pending.is_some() {
                     Self::bridge_busy_reply(reply);
                 } else {
                     self.bridge_pending = Some(BridgePending {
@@ -6601,7 +6645,7 @@ impl App {
                 }
             }
             bridge::BridgeRequest::Discover => {
-                if self.tstat_busy || self.bridge_pending.is_some() {
+                if self.tstat_busy || self.tstat_set_busy || self.bridge_pending.is_some() {
                     Self::bridge_busy_reply(reply);
                 } else {
                     self.bridge_pending = Some(BridgePending {
@@ -6636,7 +6680,7 @@ impl App {
                         status: 400,
                         body: json!({ "error": "thermostat is not paired" }),
                     });
-                } else if self.tstat_busy || self.bridge_pending.is_some() {
+                } else if self.tstat_busy || self.tstat_set_busy || self.bridge_pending.is_some() {
                     Self::bridge_busy_reply(reply);
                 } else {
                     let changes = crate::hap::ThermostatChanges {
@@ -6650,7 +6694,7 @@ impl App {
                         reply,
                         kind: BridgePendingKind::Set,
                     });
-                    self.spawn_tstat_set(changes);
+                    let _ = self.spawn_tstat_set(changes);
                 }
             }
             bridge::BridgeRequest::Forget => {
@@ -6712,7 +6756,8 @@ impl App {
                     self.spawn_tstat_fetch();
                 }
                 TstatResult::State(st) => {
-                    self.tstat_busy = false;
+                    self.tstat_set_busy = false;
+                    self.tstat_revert_pending = false;
                     self.tstat_error = None;
                     self.tstat_last_fetch = Some(Instant::now());
                     let state_json = bridge::state_to_json(&st);
@@ -6737,7 +6782,15 @@ impl App {
                     // Fetch-busy only: a fetch result never clears
                     // the action flag (see Fetched's docs).
                     self.tstat_fetch_busy = false;
-                    self.tstat_error = None;
+                    if self.tstat_revert_pending {
+                        // Revert fetch after a set failure: the state
+                        // reverts to the unit's truth, but the set
+                        // error line stays — otherwise the revert
+                        // itself would erase the failure it explains.
+                        self.tstat_revert_pending = false;
+                    } else {
+                        self.tstat_error = None;
+                    }
                     self.tstat_last_fetch = Some(Instant::now());
                     let state_json = bridge::state_to_json(&st);
                     self.tstat_state = Some(st);
@@ -6753,7 +6806,16 @@ impl App {
                 }
                 TstatResult::FetchFailed(e) => {
                     self.tstat_fetch_busy = false;
-                    self.tstat_error = Some(e.clone());
+                    if self.tstat_revert_pending {
+                        // Revert fetch failed too: keep the original
+                        // set error on the desktop line (it is the
+                        // more relevant failure); the bridge reply
+                        // below still carries this fetch's error for
+                        // its own requester.
+                        self.tstat_revert_pending = false;
+                    } else {
+                        self.tstat_error = Some(e.clone());
+                    }
                     match self.bridge_pending.take() {
                         Some(bp) if bp.kind == BridgePendingKind::Status => {
                             // A failed Status fetch still proves the
@@ -6775,9 +6837,10 @@ impl App {
                     // didn't. Show the intended state now, then
                     // re-fetch promptly to confirm against the unit.
                     // The re-fetch always spawns here: the set just
-                    // cleared action-busy and no fetch can be running
-                    // (operations are serialized across both flags).
-                    self.tstat_busy = false;
+                    // cleared set-busy and no fetch can be running
+                    // (operations are serialized across all flags).
+                    self.tstat_set_busy = false;
+                    self.tstat_revert_pending = false;
                     self.tstat_error = None;
                     self.tstat_last_fetch = Some(Instant::now());
                     let state_json = bridge::state_to_json(&st);
@@ -6790,6 +6853,32 @@ impl App {
                             });
                         }
                         other => self.bridge_pending = other,
+                    }
+                    let _ = self.spawn_tstat_fetch();
+                }
+                TstatResult::SetFailed(e) => {
+                    // A real set failure: the tile keeps the error
+                    // line, and a prompt re-fetch reverts any
+                    // optimistic patch to the unit's true state
+                    // instead of waiting for the next autorefresh.
+                    // The re-fetch always spawns here: the set just
+                    // cleared set-busy and no fetch can be running
+                    // (operations are serialized across all flags).
+                    self.tstat_set_busy = false;
+                    self.tstat_error = Some(e.clone());
+                    self.tstat_revert_pending = true;
+                    match self.bridge_pending.take() {
+                        Some(bp) => {
+                            let mut body = json!({ "error": e });
+                            if bp.kind == BridgePendingKind::Status {
+                                body["paired"] = json!(true);
+                            }
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 502,
+                                body,
+                            });
+                        }
+                        None => {}
                     }
                     let _ = self.spawn_tstat_fetch();
                 }
@@ -7350,6 +7439,7 @@ impl App {
     fn thermostat_section_view(&mut self, ui: &mut Ui, sec_idx: usize, sec_total: usize) {
         let paired = self.cfg.thermostat.is_some();
         let busy = self.tstat_busy;
+        let set_busy = self.tstat_set_busy;
         let fetch_busy = self.tstat_fetch_busy;
         let collapsed = self
             .cfg
@@ -7389,7 +7479,7 @@ impl App {
                     }
                 }
                 if ui
-                    .add_enabled(paired && !busy && !fetch_busy, Button::new("↻ Refresh"))
+                    .add_enabled(paired && !busy && !set_busy && !fetch_busy, Button::new("↻ Refresh"))
                     .clicked()
                 {
                     self.spawn_tstat_fetch();
@@ -7429,9 +7519,13 @@ impl App {
     fn thermostat_card(&mut self, ui: &mut Ui) {
         let pal = self.pal();
         // Snapshot what the UI needs so button clicks below can spawn
-        // threads without borrow fights.
+        // threads without borrow fights. `busy` gates the buttons
+        // (a set or a pairing/discovery blocks new taps); only the
+        // action flag shows "Working…" — sets are silent since
+        // v2.0.1 (the tile patches instantly instead).
         let paired = self.cfg.thermostat.is_some();
-        let busy = self.tstat_busy;
+        let busy = self.tstat_busy || self.tstat_set_busy;
+        let action_busy = self.tstat_busy;
         let state = self.tstat_state.clone();
         let error = self.tstat_error.clone();
         Frame::new()
@@ -7453,7 +7547,7 @@ impl App {
                     );
                     return;
                 }
-                if busy {
+                if action_busy {
                     ui.label(RichText::new("Working…").size(12.5).color(pal.dim));
                 }
                 if let Some(e) = error {
@@ -7487,7 +7581,7 @@ impl App {
                             ui.add_enabled(!busy, btn)
                         };
                         if resp.clicked() {
-                            self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                            self.tstat_tap(crate::hap::ThermostatChanges {
                                 target_mode: Some(mode),
                                 ..Default::default()
                             });
@@ -7507,7 +7601,7 @@ impl App {
                                 .size(14.0),
                             );
                             if ui.add_enabled(!busy, Button::new("−")).clicked() {
-                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                self.tstat_tap(crate::hap::ThermostatChanges {
                                     heat_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(heat) - 1.0,
                                     )),
@@ -7515,7 +7609,7 @@ impl App {
                                 });
                             }
                             if ui.add_enabled(!busy, Button::new("+")).clicked() {
-                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                self.tstat_tap(crate::hap::ThermostatChanges {
                                     heat_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(heat) + 1.0,
                                     )),
@@ -7534,7 +7628,7 @@ impl App {
                                 .size(14.0),
                             );
                             if ui.add_enabled(!busy, Button::new("−")).clicked() {
-                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                self.tstat_tap(crate::hap::ThermostatChanges {
                                     cool_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(cool) - 1.0,
                                     )),
@@ -7542,7 +7636,7 @@ impl App {
                                 });
                             }
                             if ui.add_enabled(!busy, Button::new("+")).clicked() {
-                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                self.tstat_tap(crate::hap::ThermostatChanges {
                                     cool_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(cool) + 1.0,
                                     )),
@@ -7557,13 +7651,13 @@ impl App {
                             RichText::new(format!("Setpoint {:.0}°F", set_f)).size(14.0),
                         );
                         if ui.add_enabled(!busy, Button::new("−")).clicked() {
-                            self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                            self.tstat_tap(crate::hap::ThermostatChanges {
                                 target_temp_c: Some(crate::hap::f_to_c(set_f - 1.0)),
                                 ..Default::default()
                             });
                         }
                         if ui.add_enabled(!busy, Button::new("+")).clicked() {
-                            self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                            self.tstat_tap(crate::hap::ThermostatChanges {
                                 target_temp_c: Some(crate::hap::f_to_c(set_f + 1.0)),
                                 ..Default::default()
                             });
@@ -7588,7 +7682,7 @@ impl App {
                                 ui.add_enabled(!busy, btn)
                             };
                             if resp.clicked() {
-                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                self.tstat_tap(crate::hap::ThermostatChanges {
                                     fan_on: Some(on),
                                     ..Default::default()
                                 });
@@ -9711,6 +9805,7 @@ impl App {
                                         if ui
                                             .add_enabled(
                                                 !self.tstat_busy
+                                                    && !self.tstat_set_busy
                                                     && self.tstat_pending.is_none(),
                                                 Button::new("Discover devices"),
                                             )
@@ -9749,7 +9844,8 @@ impl App {
                                                         None => {
                                                             if ui
                                                                 .add_enabled(
-                                                                    !self.tstat_busy,
+                                                                    !self.tstat_busy
+                                                                        && !self.tstat_set_busy,
                                                                     Button::new("Start pairing"),
                                                                 )
                                                                 .clicked()
@@ -9797,6 +9893,7 @@ impl App {
                                                 if ui
                                                     .add_enabled(
                                                         !self.tstat_busy
+                                                            && !self.tstat_set_busy
                                                             && !self
                                                                 .tstat_setup_code
                                                                 .trim()
@@ -10435,7 +10532,7 @@ impl eframe::App for App {
         }
         // Thermostat autorefresh — independent of the Tuya session:
         // piggybacks the same interval while on the dashboard.
-        if self.view == View::Dashboard && self.cfg.thermostat.is_some() && !self.tstat_busy && !self.tstat_fetch_busy {
+        if self.view == View::Dashboard && self.cfg.thermostat.is_some() && !self.tstat_busy && !self.tstat_fetch_busy && !self.tstat_set_busy {
             let due = self
                 .tstat_last_fetch
                 .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.prefs.interval))
@@ -10998,7 +11095,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.0");
+        assert_eq!(APP_VERSION, "2.0.1");
     }
 
     #[test]
@@ -11703,6 +11800,108 @@ mod tests {
         install_fonts(&ctx2);
         let texts2 = render_dashboard(&mut app, &ctx2, egui::vec2(1330.0, 1200.0), 3);
         assert!(texts2.iter().any(|(t, _)| t == "Working…"));
+    }
+
+    #[test]
+    fn thermostat_set_busy_shows_no_working_indicator() {
+        // v2.0.1 busy split: a tile/bridge set must not show
+        // "Working…" on the card — the tile patches instantly
+        // instead. Only discovery/pairing (tstat_busy) show it.
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_state = Some(crate::hap::ThermostatState {
+            current_mode: 0,
+            target_mode: 2,
+            current_temp_c: 25.0,
+            target_temp_c: 25.0,
+            ..Default::default()
+        });
+        app.tstat_last_fetch = Some(std::time::Instant::now());
+        app.tstat_busy = false;
+        app.tstat_fetch_busy = false;
+        app.tstat_set_busy = true;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let texts = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1200.0), 3);
+        assert!(
+            !texts.iter().any(|(t, _)| t == "Working…"),
+            "set-busy must not show Working…: {:?}",
+            texts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn thermostat_set_failed_arms_revert_and_keeps_error() {
+        // v2.0.1 failure revert: a SetFailed result clears set-busy,
+        // keeps the error line, and arms the revert guard. The
+        // re-fetch spawn itself is covered by the StateConfirm
+        // precedent (same one-liner); here fetch-busy is pre-set so
+        // no thread spawns and the test stays single-threaded and
+        // deterministic.
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_set_busy = true;
+        app.tstat_fetch_busy = true;
+        app.tstat_tx
+            .send(TstatResult::SetFailed(
+                "Thermostat control failed: boom".to_string(),
+            ))
+            .unwrap();
+        app.poll_net();
+        assert!(!app.tstat_set_busy);
+        assert_eq!(
+            app.tstat_error.as_deref(),
+            Some("Thermostat control failed: boom")
+        );
+        assert!(app.tstat_revert_pending);
+    }
+
+    #[test]
+    fn thermostat_revert_fetch_keeps_set_error() {
+        // v2.0.1: the revert fetch reverts the tile's state but must
+        // not erase the set error it was triggered by — in either
+        // outcome. A later normal fetch clears errors as before
+        // (flag already consumed).
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_state = Some(crate::hap::ThermostatState {
+            target_mode: 2,
+            target_temp_c: 25.0,
+            ..Default::default()
+        });
+        app.tstat_error = Some("Thermostat control failed: boom".to_string());
+        app.tstat_revert_pending = true;
+        app.tstat_fetch_busy = true;
+        app.tstat_tx
+            .send(TstatResult::Fetched(crate::hap::ThermostatState {
+                target_mode: 1,
+                target_temp_c: 21.0,
+                ..Default::default()
+            }))
+            .unwrap();
+        app.poll_net();
+        assert!(!app.tstat_fetch_busy);
+        assert!(!app.tstat_revert_pending);
+        assert_eq!(app.tstat_state.as_ref().unwrap().target_mode, 1);
+        assert_eq!(
+            app.tstat_error.as_deref(),
+            Some("Thermostat control failed: boom")
+        );
+        // A failed revert fetch likewise keeps the set error.
+        app.tstat_revert_pending = true;
+        app.tstat_fetch_busy = true;
+        app.tstat_tx
+            .send(TstatResult::FetchFailed(
+                "Thermostat refresh failed: down".to_string(),
+            ))
+            .unwrap();
+        app.poll_net();
+        assert!(!app.tstat_fetch_busy);
+        assert!(!app.tstat_revert_pending);
+        assert_eq!(
+            app.tstat_error.as_deref(),
+            Some("Thermostat control failed: boom")
+        );
     }
 
     #[test]
@@ -12643,6 +12842,8 @@ mod tests {
             ffmpeg_cache: None,
             tstat_setup_code: String::new(),
             tstat_busy: false,
+            tstat_set_busy: false,
+            tstat_revert_pending: false,
             tstat_fetch_busy: false,
             tstat_state: None,
             tstat_error: None,

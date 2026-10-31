@@ -132,6 +132,14 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.1
+
+- **Thermostat controls respond instantly.** Tapping a mode button,
+  setpoint, or fan now updates the tile right away instead of
+  waiting on the round-trip — no more "Working…" while a change
+  goes out. If a change genuinely fails, the tile shows the error
+  and snaps back to the thermostat's real state.
+
 ## What's new in 2.0.0
 
 - **Renamed to Homestead — and this one is a fresh install.** The app
