@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="2.0.1">
+<meta name="version" content="2.0.2">
 <title>Homestead</title>
 <style>
   /* ============ Design tokens ============ */
@@ -400,7 +400,7 @@
         </select>
       </div>
       <label class="checkline" style="margin:4px 0 16px">
-        <input type="checkbox" id="li-keep"> Keep me logged in on this browser
+        <input type="checkbox" id="li-keep" checked> Keep me logged in on this browser
       </label>
       <button type="submit" class="btn primary" id="li-submit">Log in</button>
       <div class="spinner hidden" id="login-spinner"></div>
@@ -448,6 +448,7 @@
       <span>✎ <b>Edit mode</b> — drag cards to reorder within a section, rename devices, assign groups, hide devices. Use 📌 on any card to pin a shortcut to the top.</span>
       <button class="btn small" id="btn-addgroup">＋ New group</button>
       <button class="btn small" id="btn-addcamera">＋ Add camera</button>
+      <button class="btn small" id="btn-addthermostat">＋ Add thermostat</button>
       <button class="btn small primary" id="btn-doneedit">Done</button>
     </div>
     <div id="update-banner" class="hidden">
@@ -504,7 +505,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">2.0.1</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">2.0.2</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -978,7 +979,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "2.0.1";
+var APP_VERSION = "2.0.2";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/Homestead/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1156,7 +1157,7 @@ function autoSectionLabel(d) {
   return "Ungrouped";
 }
 
-function buildSections(devices, layout, editing) {
+function buildSections(devices, layout, editing, showThermostat) {
   var hidden = {};
   (layout.hidden || []).forEach(function (id) { hidden[id] = true; });
   var visible = devices.filter(function (d) { return !hidden[d.id]; });
@@ -1175,10 +1176,11 @@ function buildSections(devices, layout, editing) {
      then reordered by the user's stored sectionSeq (see
      orderSections): a stored order wins outright, and sections
      missing from it slot in by this default order. */
-  /* The thermostat is its own category section: no devices, never
-     filtered by search, always kept below, so it renders even with
-     no Tuya devices. */
-  sections.push({ key: "thermostat", orderKey: "thermostat", title: "Thermostat", kind: "thermostat", groupId: null, devices: [] });
+  /* v2.0.2: like Cameras, the Thermostat section exists only once
+     a thermostat is paired — or while it is being added from the
+     edit bar (showThermostat covers both). Unpaired, no section
+     at all: no card, no "Not paired" text on the dashboard. */
+  if (showThermostat) sections.push({ key: "thermostat", orderKey: "thermostat", title: "Thermostat", kind: "thermostat", groupId: null, devices: [] });
   var cameras = normal.filter(function (d) { return !assignedToRealGroup(d) && d.isCamera; });
   sections.push({ key: "cameras", orderKey: "cameras", title: "Cameras", kind: "cameras", groupId: null, devices: orderSectionItems(cameras, so["cameras"], layout) });
   var pinned = normal.filter(function (d) { return pinSet[d.id]; });
@@ -1283,7 +1285,7 @@ function storedOnlyKeys(storedSeq, eff) {
    (unfiltered) section list so hidden-by-search sections keep their
    relative places. */
 function moveSection(orderKey, dir) {
-  var sections = buildSections(allItems(), S.layout, true);
+  var sections = buildSections(allItems(), S.layout, true, TSTAT.view === "paired" || TSTAT.pairingOpen);
   S.layout.sectionSeq = movedSectionSeq(S.layout.sectionSeq || [], sections, orderKey, dir);
   saveLayout();
   renderAll();
@@ -1974,7 +1976,7 @@ function doColor(device, hex) {
 function isEditing() { return document.body.classList.contains("editing"); }
 
 function sectionsModel() {
-  return buildSections(filterDevices(allItems(), S.layout, S.query), S.layout, isEditing());
+  return buildSections(filterDevices(allItems(), S.layout, S.query), S.layout, isEditing(), TSTAT.view === "paired" || TSTAT.pairingOpen);
 }
 function sectionByKey(key) {
   var secs = sectionsModel();
@@ -1984,7 +1986,7 @@ function sectionByKey(key) {
 /* The section's full membership (ignoring the search filter) — group
    controls always act on the whole section, not the filtered view. */
 function fullSectionByKey(key) {
-  var secs = buildSections(allItems(), S.layout, isEditing());
+  var secs = buildSections(allItems(), S.layout, isEditing(), TSTAT.view === "paired" || TSTAT.pairingOpen);
   for (var i = 0; i < secs.length; i++) if (secs[i].key === key) return secs[i];
   return null;
 }
@@ -2027,14 +2029,17 @@ var TSTAT_BRIDGE = "http://localhost:18780";
 var TSTAT = {
   started: false, view: "unknown", fetchBusy: false, actionBusy: false, setBusy: false, error: null,
   state: null, devices: [], code: "",
-  pendingId: null, pendingDevice: null, logText: ""
+  pendingId: null, pendingDevice: null, logText: "", pendingPatch: null,
+  pairingOpen: false
 };
 
 /* Busy split: status fetches are silent (fetchBusy, no "Working…"
    text); discovery/pairing/forget show it (actionBusy); tile sets
    are silent too (setBusy, v2.0.1 — the tile patches instantly
-   instead of waiting). Buttons stay disabled while any flag is
-   set, so overlapping operations stay blocked exactly as before. */
+   instead of waiting). Buttons are never disabled (v2.0.2):
+   overlapping taps paint at once and queue in pendingPatch
+   instead of being dropped, so the tile stays live through a
+   slow or timing-out set. */
 function tstatBusy() { return TSTAT.fetchBusy || TSTAT.actionBusy || TSTAT.setBusy; }
 
 function tstatRound(f) { return Math.round(f); }
@@ -2079,6 +2084,7 @@ function tstatFetchStatus(keepError) {
       TSTAT.state = null;
     }
     tstatRender();
+    tstatDrainPending();
   }, function (err) {
     TSTAT.fetchBusy = false;
     if (err instanceof TypeError) {
@@ -2094,6 +2100,7 @@ function tstatFetchStatus(keepError) {
     /* keepError: a failed revert fetch leaves the original set
        error alone (it is the more relevant failure). */
     tstatRender();
+    tstatDrainPending();
   });
 }
 
@@ -2153,6 +2160,7 @@ function tstatFinishPair() {
     TSTAT.actionBusy = false;
     TSTAT.pendingId = null; TSTAT.pendingDevice = null;
     TSTAT.devices = [];
+    TSTAT.pairingOpen = false; /* paired now, so the section stays on its own */
     toast("Thermostat paired");
     tstatFetchStatus();
   }, function (err) {
@@ -2165,11 +2173,15 @@ function tstatFinishPair() {
 }
 
 /* Abandon the open session: the bridge drops it (closing its
-   socket) and the tile returns to Start pairing. Best effort —
-   the session is dropped locally either way. */
+   socket) and the section closes again (v2.0.2: an unpaired
+   dashboard shows no thermostat section). Best effort — the
+   session is dropped locally either way. */
 function tstatCancelPair() {
   var pid = TSTAT.pendingId;
   TSTAT.pendingId = null; TSTAT.pendingDevice = null; TSTAT.code = "";
+  /* v2.0.2: cancelling an add closes the section again — an
+     unpaired dashboard shows no thermostat section at all. */
+  TSTAT.pairingOpen = false;
   tstatRender();
   if (!pid) return;
   tstatCall("/thermostat/pair/cancel", {
@@ -2195,9 +2207,22 @@ function tstatPatchState(patch) {
 }
 
 function tstatSet(patch) {
-  if (tstatBusy()) return;
+  /* v2.0.2 never-disable rule: every tap paints at once. When an
+     operation is running, the tap merges into the pending patch
+     (last-write-wins per key) and is sent as soon as the running
+     operation clears — never dropped, never greyed out. */
   tstatPatchState(patch);
-  TSTAT.setBusy = true; TSTAT.error = null; tstatRender();
+  TSTAT.error = null;
+  if (tstatBusy()) {
+    TSTAT.pendingPatch = Object.assign({}, TSTAT.pendingPatch || {}, patch);
+    tstatRender();
+    return;
+  }
+  tstatSendSet(patch);
+}
+
+function tstatSendSet(patch) {
+  TSTAT.setBusy = true; tstatRender();
   tstatCall("/thermostat/set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2206,16 +2231,29 @@ function tstatSet(patch) {
     TSTAT.setBusy = false;
     if (j.state) TSTAT.state = j.state;
     tstatRender();
+    tstatDrainPending();
   }, function (err) {
     TSTAT.setBusy = false;
-    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; tstatRender(); }
-    else {
+    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; tstatRender(); tstatDrainPending(); }
+    else if (TSTAT.pendingPatch) {
+      /* A queued tap supersedes the revert: its result is
+         authoritative (if it fails, its own failure reverts). */
+      tstatRender();
+      tstatDrainPending();
+    } else {
       TSTAT.error = err.message;
       tstatRender();
       /* Revert to the unit's true state, keeping this error. */
       tstatFetchStatus(true);
     }
   });
+}
+
+/* Send the queued tap, if any, once no operation is running. */
+function tstatDrainPending() {
+  if (tstatBusy() || !TSTAT.pendingPatch) return;
+  var patch = TSTAT.pendingPatch; TSTAT.pendingPatch = null;
+  tstatSendSet(patch);
 }
 
 function tstatSetpoint(delta, which) {
@@ -2233,6 +2271,7 @@ function tstatForget() {
   tstatCall("/thermostat/forget", { method: "POST" }, 30000).then(function () {
     TSTAT.actionBusy = false;
     TSTAT.state = null; TSTAT.devices = [];
+    TSTAT.pairingOpen = false; /* v2.0.2: forget hides the section again */
     toast("Thermostat pairing forgotten");
     tstatFetchStatus();
   }, function (err) {
@@ -2247,10 +2286,8 @@ function tstatStepperRow(label, valueF, which) {
   var row = el("div", "tstat-row");
   row.appendChild(el("span", "tstat-line", label + " " + tstatRound(valueF) + "°F"));
   var minus = el("button", "btn small", "−");
-  minus.disabled = tstatBusy();
   minus.addEventListener("click", function () { tstatSetpoint(-1, which); });
   var plus = el("button", "btn small", "+");
-  plus.disabled = tstatBusy();
   plus.addEventListener("click", function () { tstatSetpoint(1, which); });
   row.appendChild(minus); row.appendChild(plus);
   return row;
@@ -2365,7 +2402,6 @@ function renderThermostatSection(idx, total) {
     }
     top.appendChild(el("span", "spacer"));
     var rb = el("button", "btn small", "↻ Refresh");
-    rb.disabled = tstatBusy();
     rb.addEventListener("click", tstatFetchStatus);
     top.appendChild(rb);
     card.appendChild(top);
@@ -2374,7 +2410,6 @@ function renderThermostatSection(idx, total) {
       var modes = el("div", "tstat-row");
       [["Off", "off"], ["Heat", "heat"], ["Cool", "cool"], ["Auto", "auto"]].forEach(function (m) {
         var b = el("button", "btn small" + (st.mode === m[0] ? " primary" : ""), m[0]);
-        b.disabled = tstatBusy();
         b.addEventListener("click", function () { tstatSet({ mode: m[1] }); });
         modes.appendChild(b);
       });
@@ -2390,8 +2425,7 @@ function renderThermostatSection(idx, total) {
         fan.appendChild(el("span", "tstat-line", "Fan"));
         [["Auto", "auto", false], ["On", "on", true]].forEach(function (f) {
           var b = el("button", "btn small" + (st.fan_on === f[2] ? " primary" : ""), f[0]);
-          b.disabled = tstatBusy();
-          b.addEventListener("click", function () { tstatSet({ fan: f[1] }); });
+            b.addEventListener("click", function () { tstatSet({ fan: f[1] }); });
           fan.appendChild(b);
         });
         card.appendChild(fan);
@@ -2447,7 +2481,15 @@ function renderThermostatSection(idx, total) {
 }
 
 function tstatRender() {
+  /* v2.0.2: the tile exists only while paired or while being
+     added from the edit bar. A pairing completion or forget that
+     flips visibility rebuilds the dashboard instead of patching
+     a tile in place (which would otherwise never appear or
+     never disappear). */
   var old = $("tstat-section");
+  var show = (TSTAT.view === "paired" || !!TSTAT.pairingOpen);
+  if (!old && !show) return;
+  if (!old || !show) { renderAll(); return; }
   if (old) {
     /* Re-render in sequence position (editing move buttons need
        the current index and total). */
@@ -2471,6 +2513,9 @@ function renderAll() {
     if (sec.kind === "thermostat") dash.appendChild(renderThermostatSection(i, sections.length));
     else dash.appendChild(renderSection(sec, i, sections.length));
   });
+  /* v2.0.2: the edit bar's "+ Add thermostat" mirrors "+ Add
+     camera" — it appears only while no thermostat is paired. */
+  $("btn-addthermostat").classList.toggle("hidden", TSTAT.view === "paired");
   if (!TSTAT.started) {
     TSTAT.started = true;
     tstatFetchStatus();
@@ -3429,6 +3474,11 @@ function init() {
   $("btn-doneedit").addEventListener("click", function () { setEditing(false); });
   $("btn-addgroup").addEventListener("click", addGroup);
   $("btn-addcamera").addEventListener("click", function () { openCameraDialog(null); });
+  /* v2.0.2: like "+ Add camera", but for the thermostat — shows
+     the section with the existing pairing UI (Discover devices →
+     Start pairing → code → Finish). Pairing itself still runs
+     through the desktop bridge, as before. */
+  $("btn-addthermostat").addEventListener("click", function () { TSTAT.pairingOpen = true; renderAll(); });
   $("set-gw-url").addEventListener("change", function (ev) {
     S.prefs.gatewayUrl = ev.target.value.trim(); savePrefs();
   });
