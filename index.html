@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.6.3">
-<title>SmartLife &amp; Tuya Desktop</title>
+<meta name="version" content="2.0.0">
+<title>Homestead</title>
 <style>
   /* ============ Design tokens ============ */
   :root{
@@ -148,6 +148,7 @@
   .tstat-row .spacer{flex:1}
   .tstat-line{font-size:14px}
   .tstat-note{font-size:12.5px; color:var(--text-dim); line-height:1.55; margin-top:10px}
+  .tstat-log-pre{white-space:pre-wrap; word-break:break-all; font-size:12px; max-height:180px; overflow:auto; background:var(--card); border:1px solid var(--card-border); border-radius:8px; padding:8px; margin-top:8px}
   .tstat-error{font-size:12.5px; color:var(--danger); margin-top:10px}
   .tstat-dev{display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px solid var(--card-border); flex-wrap:wrap}
   .tstat-dev:first-child{border-top:none}
@@ -372,7 +373,7 @@
   <div id="view-login">
     <form class="login-card" id="login-form" autocomplete="on">
       <div class="login-logo">🏠</div>
-      <h1>SmartLife &amp; Tuya Desktop</h1>
+      <h1>Homestead</h1>
       <div class="sub">Your Smart Life / Tuya devices, in one clean dashboard</div>
       <div class="login-error hidden" id="login-error"></div>
       <div class="field">
@@ -424,7 +425,7 @@
   <!-- ================= APP ================= -->
   <div id="view-app" class="hidden">
     <header class="app">
-      <div class="brand"><span class="logo">🏠</span> SmartLife &amp; Tuya Desktop</div>
+      <div class="brand"><span class="logo">🏠</span> Homestead</div>
       <span class="updated" id="last-updated"></span>
       <div class="hgroup">
         <input type="text" id="inp-search" placeholder="🔍 Search devices…" aria-label="Search devices">
@@ -497,13 +498,13 @@
         Start-with-Windows and system-tray background running, and one-click
         Download &amp; install updates.</p>
         <div>
-          <a class="btn" href="https://github.com/shawnrodis/SmartLifeTuyaDesktop/releases/latest" target="_blank" rel="noopener">Get the Windows app</a>
+          <a class="btn" href="https://github.com/shawnrodis/Homestead/releases/latest" target="_blank" rel="noopener">Get the Windows app</a>
         </div>
       </div>
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.6.3</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">2.0.0</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -512,7 +513,7 @@
         </div>
         <p class="hint" style="margin-top:10px">A web page can't overwrite its own file: save the
         downloaded HTML over your old copy and reload — your saved devices, groups and settings
-        stay in this browser. The online copy at <b>shawnrodis.github.io/SmartLifeTuyaDesktop</b>
+        stay in this browser. The online copy at <b>shawnrodis.github.io/Homestead</b>
         is always the latest version.</p>
       </div>
 
@@ -655,13 +656,13 @@
 <script>
 "use strict";
 /* ================================================================
-   SmartLife & Tuya Desktop (web edition) — single-file Smart Life / Tuya dashboard.
+   Homestead (web edition) — single-file Smart Life / Tuya dashboard.
    Talks to Tuya's legacy consumer cloud API ("homeassistant" API,
    the same one the Smart Life app-era web dashboards use):
      POST {base}auth.do                 — login / token refresh
      POST {base}skill  Discovery        — device list
      POST {base}skill  Control          — device commands
-   All state lives in localStorage under the "slc_" prefix.
+   All state lives in localStorage under the "homestead_" prefix.
    ================================================================ */
 
 /* ---------------- Constants ---------------- */
@@ -702,15 +703,15 @@ var TYPE_ICONS = {
 /* ---------------- Storage helpers ---------------- */
 function slcGet(key, fallback) {
   try {
-    var raw = localStorage.getItem("slc_" + key);
+    var raw = localStorage.getItem("homestead_" + key);
     if (raw === null) return fallback;
     return JSON.parse(raw);
   } catch (e) { return fallback; }
 }
 function slcSet(key, value) {
   try {
-    if (value === null || value === undefined) localStorage.removeItem("slc_" + key);
-    else localStorage.setItem("slc_" + key, JSON.stringify(value));
+    if (value === null || value === undefined) localStorage.removeItem("homestead_" + key);
+    else localStorage.setItem("homestead_" + key, JSON.stringify(value));
   } catch (e) { /* storage unavailable (private mode) — run session-only */ }
 }
 /* Light obfuscation so a saved password isn't plain text at a glance.
@@ -977,8 +978,8 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.6.3";
-var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
+var APP_VERSION = "2.0.0";
+var RELEASES_API = "https://api.github.com/repos/shawnrodis/Homestead/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
 function parseVersionParts(s) {
@@ -999,15 +1000,15 @@ function isNewerVersion(latest, current) {
 /* Extract what's needed from a GitHub "latest release" response. */
 function pickReleaseAssets(json) {
   if (!json || !json.tag_name) return null;
-  var html = null, legacyHtml = null, exe = null;
+  var html = null, exe = null;
   (json.assets || []).forEach(function (a) {
-    // Releases carry the versioned HTML only (SmartLifeTuyaDesktop-v*.html);
-    // the old unversioned name is kept as a fallback for older releases.
-    if (/^SmartLifeTuyaDesktop-v.+\.html$/.test(a.name || "")) html = a;
-    else if (a.name === "SmartLife_Tuya_Desktop.html") legacyHtml = a;
-    if (/^SmartLifeTuyaDesktop-Setup-.*\.exe$/.test(a.name || "")) exe = a;
+    // Releases carry the versioned HTML only (Homestead-v*.html).
+    // No fallback to any other name: an old install must never
+    // "update" into Homestead, and a new install must never pull
+    // an old-named asset.
+    if (/^Homestead-v.+\.html$/.test(a.name || "")) html = a;
+    if (/^Homestead-Setup-.*\.exe$/.test(a.name || "")) exe = a;
   });
-  if (!html) html = legacyHtml;
   if (!html) return null;
   return {
     version: String(json.tag_name).replace(/^v/, ""),
@@ -2024,10 +2025,16 @@ function statusText(d) {
    persisted state — and are cleared on finish or cancel. */
 var TSTAT_BRIDGE = "http://localhost:18780";
 var TSTAT = {
-  started: false, view: "unknown", busy: false, error: null,
+  started: false, view: "unknown", fetchBusy: false, actionBusy: false, error: null,
   state: null, devices: [], code: "",
-  pendingId: null, pendingDevice: null
+  pendingId: null, pendingDevice: null, logText: ""
 };
+
+/* v1.6.4 busy split: status fetches are silent (fetchBusy, no
+   "Working…" text); user actions (set, discover, pairing) show it
+   (actionBusy). Buttons stay disabled while either is set, exactly
+   as the single flag did before. */
+function tstatBusy() { return TSTAT.fetchBusy || TSTAT.actionBusy; }
 
 function tstatRound(f) { return Math.round(f); }
 
@@ -2057,9 +2064,9 @@ function tstatCall(path, opts, timeoutMs) {
 }
 
 function tstatFetchStatus() {
-  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  TSTAT.fetchBusy = true; TSTAT.error = null; tstatRender();
   tstatCall("/thermostat/status", {}, 100000).then(function (j) {
-    TSTAT.busy = false;
+    TSTAT.fetchBusy = false;
     if (j.paired) {
       TSTAT.view = "paired";
       TSTAT.state = j.state || null;
@@ -2070,7 +2077,7 @@ function tstatFetchStatus() {
     }
     tstatRender();
   }, function (err) {
-    TSTAT.busy = false;
+    TSTAT.fetchBusy = false;
     if (err instanceof TypeError) {
       /* Network failure (bridge not listening): the desktop app
          is not running on this computer. */
@@ -2086,14 +2093,14 @@ function tstatFetchStatus() {
 }
 
 function tstatDiscover() {
-  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  TSTAT.actionBusy = true; TSTAT.error = null; tstatRender();
   tstatCall("/thermostat/discover", {}, 60000).then(function (j) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     TSTAT.devices = j.devices || [];
     if (!TSTAT.devices.length) TSTAT.error = "No HomeKit devices found on this network.";
     tstatRender();
   }, function (err) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
     else TSTAT.error = err.message;
     tstatRender();
@@ -2106,19 +2113,19 @@ function tstatDiscover() {
    before Start would already be stale, so the field only appears
    once a session is open. */
 function tstatBeginPair(deviceId) {
-  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  TSTAT.actionBusy = true; TSTAT.error = null; tstatRender();
   tstatCall("/thermostat/pair/begin", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ device_id: deviceId })
   }, 100000).then(function (j) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     TSTAT.pendingId = j.pending_id || null;
     TSTAT.pendingDevice = deviceId;
     TSTAT.code = "";
     tstatRender();
   }, function (err) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
     else TSTAT.error = err.message;
     tstatRender();
@@ -2132,19 +2139,19 @@ function tstatBeginPair(deviceId) {
 function tstatFinishPair() {
   var code = TSTAT.code;
   TSTAT.code = ""; /* used for this request only; never stored */
-  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  TSTAT.actionBusy = true; TSTAT.error = null; tstatRender();
   tstatCall("/thermostat/pair/finish", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pending_id: TSTAT.pendingId, pin: code })
   }, 100000).then(function () {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     TSTAT.pendingId = null; TSTAT.pendingDevice = null;
     TSTAT.devices = [];
     toast("Thermostat paired");
     tstatFetchStatus();
   }, function (err) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     TSTAT.pendingId = null; TSTAT.pendingDevice = null;
     if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
     else TSTAT.error = err.message;
@@ -2168,17 +2175,17 @@ function tstatCancelPair() {
 }
 
 function tstatSet(patch) {
-  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  TSTAT.actionBusy = true; TSTAT.error = null; tstatRender();
   tstatCall("/thermostat/set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch)
   }, 100000).then(function (j) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     if (j.state) TSTAT.state = j.state;
     tstatRender();
   }, function (err) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
     else TSTAT.error = err.message;
     tstatRender();
@@ -2196,14 +2203,14 @@ function tstatSetpoint(delta, which) {
 }
 
 function tstatForget() {
-  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  TSTAT.actionBusy = true; TSTAT.error = null; tstatRender();
   tstatCall("/thermostat/forget", { method: "POST" }, 30000).then(function () {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     TSTAT.state = null; TSTAT.devices = [];
     toast("Thermostat pairing forgotten");
     tstatFetchStatus();
   }, function (err) {
-    TSTAT.busy = false;
+    TSTAT.actionBusy = false;
     if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
     else TSTAT.error = err.message;
     tstatRender();
@@ -2214,10 +2221,10 @@ function tstatStepperRow(label, valueF, which) {
   var row = el("div", "tstat-row");
   row.appendChild(el("span", "tstat-line", label + " " + tstatRound(valueF) + "°F"));
   var minus = el("button", "btn small", "−");
-  minus.disabled = TSTAT.busy;
+  minus.disabled = tstatBusy();
   minus.addEventListener("click", function () { tstatSetpoint(-1, which); });
   var plus = el("button", "btn small", "+");
-  plus.disabled = TSTAT.busy;
+  plus.disabled = tstatBusy();
   plus.addEventListener("click", function () { tstatSetpoint(1, which); });
   row.appendChild(minus); row.appendChild(plus);
   return row;
@@ -2227,14 +2234,17 @@ function renderThermostatSection(idx, total) {
   var wrap = el("div", "section");
   wrap.id = "tstat-section";
   wrap.dataset.sectionKey = "thermostat";
-  var head = el("div", "section-head static");
+  var head = el("div", "section-head static" + (S.layout.collapsed["thermostat"] ? " collapsed" : ""));
+  head.appendChild(el("span", "chev", "▾"));
   head.appendChild(el("h2", null, "Thermostat"));
   head.appendChild(el("span", "spacer"));
   if (isEditing()) {
     /* Same move buttons as every other section (disabled at the
        ends); the order persists in layout.sectionSeq via
-       moveSection. No count badge, collapse chevron, Delete, or
-       "Reset to name order" — the thermostat is a single card. */
+       moveSection. No count badge, Delete, or "Reset to name
+       order" — the thermostat is a single card. The collapse
+       chevron (v1.6.4) matches every other section: clicking the
+       header collapses it. */
     var mvUp = el("button", "btn small", "↑");
     mvUp.title = "Move section up";
     mvUp.disabled = (idx === 0);
@@ -2245,7 +2255,12 @@ function renderThermostatSection(idx, total) {
     mvDn.addEventListener("click", function (ev) { ev.stopPropagation(); moveSection("thermostat", 1); });
     head.appendChild(mvUp); head.appendChild(mvDn);
   }
+  head.addEventListener("click", function () {
+    S.layout.collapsed["thermostat"] = !S.layout.collapsed["thermostat"];
+    saveLayout(); renderAll();
+  });
   wrap.appendChild(head);
+  if (S.layout.collapsed["thermostat"]) return wrap;
   var card = el("div", "card");
   wrap.appendChild(card);
   if (TSTAT.view === "unknown") {
@@ -2263,7 +2278,7 @@ function renderThermostatSection(idx, total) {
     card.appendChild(el("div", "tstat-note", "Control works on your home network only, through the desktop app running on this computer."));
     var drow = el("div", "tstat-row");
     var db = el("button", "btn small primary", "Discover devices");
-    db.disabled = TSTAT.busy || !!TSTAT.pendingId;
+    db.disabled = tstatBusy() || !!TSTAT.pendingId;
     db.addEventListener("click", tstatDiscover);
     drow.appendChild(db);
     card.appendChild(drow);
@@ -2276,7 +2291,7 @@ function renderThermostatSection(idx, total) {
         dev.appendChild(el("span", "meta", "Pairing…"));
       } else {
         var sb = el("button", "btn small primary", "Start pairing");
-        sb.disabled = TSTAT.busy || !!TSTAT.pendingId;
+        sb.disabled = tstatBusy() || !!TSTAT.pendingId;
         sb.addEventListener("click", function () { tstatBeginPair(d.id); });
         dev.appendChild(sb);
       }
@@ -2294,7 +2309,7 @@ function renderThermostatSection(idx, total) {
              (the tile itself only re-renders on fetch
              completions). */
           var btns = document.querySelectorAll("#tstat-section .tstat-pair-btn");
-          for (var i = 0; i < btns.length; i++) btns[i].disabled = TSTAT.busy || !TSTAT.code.trim();
+          for (var i = 0; i < btns.length; i++) btns[i].disabled = tstatBusy() || !TSTAT.code.trim();
         });
         field.appendChild(inp);
         card.appendChild(field);
@@ -2302,11 +2317,11 @@ function renderThermostatSection(idx, total) {
         card.appendChild(el("div", "tstat-note", "The code is sent to the desktop app for this pairing only and is never stored — only the derived keys are saved."));
         var prow = el("div", "tstat-row");
         var fb = el("button", "btn small primary tstat-pair-btn", "Finish pairing");
-        fb.disabled = TSTAT.busy || !TSTAT.code.trim();
+        fb.disabled = tstatBusy() || !TSTAT.code.trim();
         fb.addEventListener("click", tstatFinishPair);
         prow.appendChild(fb);
         var cb = el("button", "btn small", "Cancel");
-        cb.disabled = TSTAT.busy;
+        cb.disabled = tstatBusy();
         cb.addEventListener("click", tstatCancelPair);
         prow.appendChild(cb);
         card.appendChild(prow);
@@ -2316,7 +2331,7 @@ function renderThermostatSection(idx, total) {
     var st = TSTAT.state;
     var top = el("div", "tstat-row");
     if (st) {
-      var line = st.current_mode + " — indoor " + tstatRound(st.temp_f) + "°F, setpoint " + tstatRound(st.target_f) + "°F";
+      var line = st.mode + " — indoor " + tstatRound(st.temp_f) + "°F, setpoint " + tstatRound(st.target_f) + "°F";
       if (st.humidity !== null && st.humidity !== undefined) line += ", humidity " + tstatRound(st.humidity) + "%";
       top.appendChild(el("div", "tstat-line", line));
     } else {
@@ -2324,16 +2339,16 @@ function renderThermostatSection(idx, total) {
     }
     top.appendChild(el("span", "spacer"));
     var rb = el("button", "btn small", "↻ Refresh");
-    rb.disabled = TSTAT.busy;
+    rb.disabled = tstatBusy();
     rb.addEventListener("click", tstatFetchStatus);
     top.appendChild(rb);
     card.appendChild(top);
-    if (TSTAT.busy) card.appendChild(el("div", "tstat-note", "Working…"));
+    if (TSTAT.actionBusy) card.appendChild(el("div", "tstat-note", "Working…"));
     if (st) {
       var modes = el("div", "tstat-row");
       [["Off", "off"], ["Heat", "heat"], ["Cool", "cool"], ["Auto", "auto"]].forEach(function (m) {
         var b = el("button", "btn small" + (st.mode === m[0] ? " primary" : ""), m[0]);
-        b.disabled = TSTAT.busy;
+        b.disabled = tstatBusy();
         b.addEventListener("click", function () { tstatSet({ mode: m[1] }); });
         modes.appendChild(b);
       });
@@ -2349,7 +2364,7 @@ function renderThermostatSection(idx, total) {
         fan.appendChild(el("span", "tstat-line", "Fan"));
         [["Auto", "auto", false], ["On", "on", true]].forEach(function (f) {
           var b = el("button", "btn small" + (st.fan_on === f[2] ? " primary" : ""), f[0]);
-          b.disabled = TSTAT.busy;
+          b.disabled = tstatBusy();
           b.addEventListener("click", function () { tstatSet({ fan: f[1] }); });
           fan.appendChild(b);
         });
@@ -2358,13 +2373,50 @@ function renderThermostatSection(idx, total) {
     }
     var frow = el("div", "tstat-row");
     var fb = el("button", "btn small danger", "Forget pairing");
-    fb.disabled = TSTAT.busy;
+    fb.disabled = tstatBusy();
     fb.addEventListener("click", tstatForget);
     frow.appendChild(fb);
     card.appendChild(frow);
     card.appendChild(el("div", "tstat-note", "This only forgets the keys on this computer. To clear the thermostat side, use HomeKit Reset on the unit (Menu → Reset → HomeKit Reset). It never touches WiFi, schedule, or the Resideo link."));
   }
   if (TSTAT.error) card.appendChild(el("div", "tstat-error", TSTAT.error));
+  /* Diagnostics log (v1.6.4): the desktop app's thermostat ring
+     buffer over the loopback bridge. Refresh loads it; Copy puts
+     it on the clipboard (select+copy fallback). */
+  var logHead = el("div", "tstat-row");
+  logHead.appendChild(el("span", "tstat-line", "Diagnostics log"));
+  logHead.appendChild(el("span", "spacer"));
+  var logRefresh = el("button", "btn small", "↻ Refresh log");
+  logRefresh.addEventListener("click", function () {
+    tstatCall("/thermostat/log", {}, 30000).then(function (j) {
+      TSTAT.logText = (j && j.log) || "";
+      var pre = document.getElementById("tstat-log-pre");
+      if (pre) pre.textContent = TSTAT.logText || "(empty)";
+    }).catch(function () {
+      var pre = document.getElementById("tstat-log-pre");
+      if (pre) pre.textContent = "(desktop app not running)";
+    });
+  });
+  var logCopy = el("button", "btn small", "Copy");
+  logCopy.addEventListener("click", function () {
+    var text = TSTAT.logText || "";
+    function fallback() {
+      var pre = document.getElementById("tstat-log-pre");
+      if (!pre) return;
+      var r = document.createRange(); r.selectNodeContents(pre);
+      var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+      try { document.execCommand("copy"); } catch (e) { /* select manually */ }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(fallback);
+    } else fallback();
+  });
+  logHead.appendChild(logRefresh); logHead.appendChild(logCopy);
+  card.appendChild(logHead);
+  var logPre = el("pre", "tstat-log-pre");
+  logPre.id = "tstat-log-pre";
+  logPre.textContent = TSTAT.logText || "Press Refresh log to load the log.";
+  card.appendChild(logPre);
   return wrap;
 }
 
