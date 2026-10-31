@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.6.2">
+<meta name="version" content="1.6.3">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -140,8 +140,9 @@
   .section-head .spacer{flex:1}
   .section-head.static{cursor:default}
   /* Thermostat (web edition, via the desktop app's loopback bridge):
-     a fixed block above the device sections, mirroring the desktop
-     tile. No port numbers or internals in user-facing copy. */
+     a section in the sequence like Cameras and Lighting, rendered
+     in its stored position. No port numbers or internals in
+     user-facing copy. */
   .tstat-row{display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px}
   .tstat-row:first-child{margin-top:0}
   .tstat-row .spacer{flex:1}
@@ -502,7 +503,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.6.2</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.6.3</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -976,7 +977,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.6.2";
+var APP_VERSION = "1.6.3";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1168,11 +1169,15 @@ function buildSections(devices, layout, editing) {
     var g = layout.assign[d.id];
     return !!(g && (layout.groups || []).some(function (x) { return x.id === g; }));
   }
-  /* Sections are constructed in the v1.2.1 DEFAULT order —
+  /* Sections are constructed in the DEFAULT order — Thermostat →
      Cameras → Pinned → Lighting → user groups → Ungrouped → Scenes —
      then reordered by the user's stored sectionSeq (see
      orderSections): a stored order wins outright, and sections
      missing from it slot in by this default order. */
+  /* The thermostat is its own category section: no devices, never
+     filtered by search, always kept below, so it renders even with
+     no Tuya devices. */
+  sections.push({ key: "thermostat", orderKey: "thermostat", title: "Thermostat", kind: "thermostat", groupId: null, devices: [] });
   var cameras = normal.filter(function (d) { return !assignedToRealGroup(d) && d.isCamera; });
   sections.push({ key: "cameras", orderKey: "cameras", title: "Cameras", kind: "cameras", groupId: null, devices: orderSectionItems(cameras, so["cameras"], layout) });
   var pinned = normal.filter(function (d) { return pinSet[d.id]; });
@@ -1191,7 +1196,7 @@ function buildSections(devices, layout, editing) {
   sections.push({ key: "ungrouped", orderKey: "ungrouped", title: "Ungrouped", kind: "ungrouped", groupId: null, devices: orderSectionItems(ungrouped, so["ungrouped"], layout) });
   if (scenes.length) sections.push({ key: "scenes", orderKey: "scenes", title: "Scenes", kind: "scenes", groupId: null, devices: orderSectionItems(scenes, so["scenes"], layout) });
   var kept = sections.filter(function (s) {
-    return s.devices.length > 0 || (editing && (s.kind === "group" || s.kind === "lighting" || s.kind === "cameras"));
+    return s.devices.length > 0 || s.kind === "thermostat" || (editing && (s.kind === "group" || s.kind === "lighting" || s.kind === "cameras"));
   });
   return orderSections(kept, layout.sectionSeq || []);
 }
@@ -1203,19 +1208,22 @@ function buildSections(devices, layout, editing) {
    edition: stored keys for sections that exist come first in stored
    order; any rendered section missing from the stored list is
    inserted after the nearest already-placed section that precedes
-   it in the DEFAULT order (Cameras → Pinned → Lighting → groups →
-   Ungrouped → Scenes), or at the front when it has none. */
+   it in the DEFAULT order (Thermostat → Cameras → Pinned →
+   Lighting → groups → Ungrouped → Scenes), or at the front when
+   it has none. */
 
-/* Default order rank: built-ins by fixed slot; groups share a slot
-   (stable sort keeps their relative order by group list order). */
+/* Default order rank: thermostat first, then built-ins by fixed
+   slot; groups share a slot (stable sort keeps their relative
+   order by group list order). */
 function sectionDefaultRank(orderKey) {
-  if (orderKey === "cameras") return 0;
-  if (orderKey === "pinned") return 1;
-  if (orderKey === "lighting") return 2;
-  if (orderKey.indexOf("group:") === 0) return 3;
-  if (orderKey === "ungrouped") return 4;
-  if (orderKey === "scenes") return 5;
-  return 6;
+  if (orderKey === "thermostat") return 0;
+  if (orderKey === "cameras") return 1;
+  if (orderKey === "pinned") return 2;
+  if (orderKey === "lighting") return 3;
+  if (orderKey.indexOf("group:") === 0) return 4;
+  if (orderKey === "ungrouped") return 5;
+  if (orderKey === "scenes") return 6;
+  return 7;
 }
 
 function effectiveSectionSeq(orderKeys, storedSeq) {
@@ -2215,11 +2223,28 @@ function tstatStepperRow(label, valueF, which) {
   return row;
 }
 
-function renderThermostatSection() {
+function renderThermostatSection(idx, total) {
   var wrap = el("div", "section");
   wrap.id = "tstat-section";
+  wrap.dataset.sectionKey = "thermostat";
   var head = el("div", "section-head static");
   head.appendChild(el("h2", null, "Thermostat"));
+  head.appendChild(el("span", "spacer"));
+  if (isEditing()) {
+    /* Same move buttons as every other section (disabled at the
+       ends); the order persists in layout.sectionSeq via
+       moveSection. No count badge, collapse chevron, Delete, or
+       "Reset to name order" — the thermostat is a single card. */
+    var mvUp = el("button", "btn small", "↑");
+    mvUp.title = "Move section up";
+    mvUp.disabled = (idx === 0);
+    mvUp.addEventListener("click", function (ev) { ev.stopPropagation(); moveSection("thermostat", -1); });
+    var mvDn = el("button", "btn small", "↓");
+    mvDn.title = "Move section down";
+    mvDn.disabled = (idx === total - 1);
+    mvDn.addEventListener("click", function (ev) { ev.stopPropagation(); moveSection("thermostat", 1); });
+    head.appendChild(mvUp); head.appendChild(mvDn);
+  }
   wrap.appendChild(head);
   var card = el("div", "card");
   wrap.appendChild(card);
@@ -2345,26 +2370,37 @@ function renderThermostatSection() {
 
 function tstatRender() {
   var old = $("tstat-section");
-  if (old) old.replaceWith(renderThermostatSection());
+  if (old) {
+    /* Re-render in sequence position (editing move buttons need
+       the current index and total). */
+    var sections = sectionsModel();
+    var idx = 0;
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i].kind === "thermostat") { idx = i; break; }
+    }
+    old.replaceWith(renderThermostatSection(idx, sections.length || 1));
+  }
 }
 
 function renderAll() {
   var dash = $("dash");
   dash.innerHTML = "";
-  /* Fixed thermostat block above the device sections, mirroring
-     the desktop tile; deliberately outside the section ordering
-     and drag machinery. First render kicks off the bridge check. */
-  dash.appendChild(renderThermostatSection());
+  var sections = sectionsModel();
+  /* The thermostat is a section in the sequence now, like Cameras
+     and Lighting — it renders in its stored position, not as a
+     fixed block above. First render kicks off the bridge check. */
+  sections.forEach(function (sec, i) {
+    if (sec.kind === "thermostat") dash.appendChild(renderThermostatSection(i, sections.length));
+    else dash.appendChild(renderSection(sec, i, sections.length));
+  });
   if (!TSTAT.started) {
     TSTAT.started = true;
     tstatFetchStatus();
   }
-  var sections = sectionsModel();
-  if (!sections.length) {
+  var hasDevices = sections.some(function (s) { return s.kind !== "thermostat"; });
+  if (!hasDevices) {
     dash.appendChild(el("div", "empty-note", "No devices to show. Press ↻ Refresh, or unhide devices in Settings."));
-    return;
   }
-  sections.forEach(function (sec, i) { dash.appendChild(renderSection(sec, i, sections.length)); });
 }
 
 function renderSection(sec, idx, total) {

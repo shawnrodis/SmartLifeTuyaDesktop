@@ -3141,6 +3141,7 @@ fn merge_device_data(fresh: Vec<Value>, previous: &[Value]) -> Vec<Value> {
 
 #[derive(Clone, PartialEq)]
 enum SectionKind {
+    Thermostat,
     Pinned,
     Lighting,
     Cameras,
@@ -3390,19 +3391,22 @@ fn filter_entries<'a>(entries: &'a [CardEntry], layout: &LayoutCfg, query: &str)
         .collect()
 }
 
-/// The sections' DEFAULT order (v1.2.1): Cameras first, then Pinned,
+/// The sections' DEFAULT order: Thermostat first (it was the fixed
+/// block above the sections through v1.6.x, and stays on top by
+/// default now that it is a section), then Cameras, Pinned,
 /// Lighting, user groups (creation order, expanded in place),
 /// Ungrouped, Scenes. Expressed over a built section list so groups
 /// land exactly where they were created relative to each other.
 fn default_section_seq(sections: &[Section]) -> Vec<String> {
     fn slot(s: &Section) -> usize {
         match s.kind {
-            SectionKind::Cameras => 0,
-            SectionKind::Pinned => 1,
-            SectionKind::Lighting => 2,
-            SectionKind::Group => 3,
-            SectionKind::Ungrouped => 4,
-            SectionKind::Scenes => 5,
+            SectionKind::Thermostat => 0,
+            SectionKind::Cameras => 1,
+            SectionKind::Pinned => 2,
+            SectionKind::Lighting => 3,
+            SectionKind::Group => 4,
+            SectionKind::Ungrouped => 5,
+            SectionKind::Scenes => 6,
         }
     }
     let mut idx: Vec<usize> = (0..sections.len()).collect();
@@ -3523,11 +3527,22 @@ fn build_sections(
             None => false,
         }
     };
-    // Sections are CONSTRUCTED in the default order (v1.2.1: Cameras
-    // → Pinned → Lighting → groups → Ungrouped → Scenes) and then
-    // re-sorted by the user's stored section sequence below. An
-    // explicit group assignment always wins; unassigned lights land
-    // in Lighting, unassigned cameras in Cameras.
+    // Sections are CONSTRUCTED in the default order (Thermostat →
+    // Cameras → Pinned → Lighting → groups → Ungrouped → Scenes)
+    // and then re-sorted by the user's stored section sequence
+    // below. An explicit group assignment always wins; unassigned
+    // lights land in Lighting, unassigned cameras in Cameras.
+    // The thermostat is its own category section: it has no device
+    // ids, is never filtered by search, and always survives the
+    // retain below, so it renders even with no Tuya devices.
+    sections.push(Section {
+        key: "thermostat".into(),
+        order_key: "thermostat".into(),
+        title: "Thermostat".into(),
+        kind: SectionKind::Thermostat,
+        group_id: None,
+        ids: Vec::new(),
+    });
     let cameras_sec: Vec<&CardEntry> = normal
         .iter()
         .filter(|d| !assigned(d) && d.camera)
@@ -3607,6 +3622,7 @@ fn build_sections(
     order_sections(&mut sections, &layout.section_seq);
     sections.retain(|s| {
         !s.ids.is_empty()
+            || s.kind == SectionKind::Thermostat
             || (editing
                 && (s.kind == SectionKind::Group
                     || s.kind == SectionKind::Lighting
@@ -5792,7 +5808,7 @@ impl App {
                 SectionKind::Ungrouped | SectionKind::Lighting | SectionKind::Cameras => {
                     self.cfg.layout.assign.remove(&drag.id);
                 }
-                SectionKind::Scenes => {}
+                SectionKind::Scenes | SectionKind::Thermostat => {}
             }
         }
         let mut list: Vec<String> = tsec
@@ -6879,10 +6895,54 @@ impl App {
         }
     }
 
-    /// Thermostat (HomeKit) card on the dashboard, above the device
-    /// sections and deliberately OUTSIDE the drag/order machinery:
-    /// it is one fixed block, never a sortable section.
-    fn thermostat_block(&mut self, ui: &mut Ui) {
+    /// Thermostat (HomeKit) section on the dashboard: its own
+    /// reorderable category section, like Cameras and Lighting. The
+    /// header carries the title, the ↻ Refresh button, and (in
+    /// editing mode) the ↓/↑ move buttons; the card below holds the
+    /// existing thermostat controls unchanged. It is not collapsible
+    /// and has no count badge, Delete, or "Reset to name order".
+    fn thermostat_section_view(&mut self, ui: &mut Ui, sec_idx: usize, sec_total: usize) {
+        let paired = self.cfg.thermostat.is_some();
+        let busy = self.tstat_busy;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Thermostat").size(16.5).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.editing {
+                    // Same move buttons as every other section
+                    // (disabled at the ends); the order persists in
+                    // layout.section_seq via move_section.
+                    if ui
+                        .add_enabled(sec_idx + 1 < sec_total, Button::new("↓").small())
+                        .on_hover_text("Move section down")
+                        .clicked()
+                    {
+                        self.move_section("thermostat", 1);
+                    }
+                    if ui
+                        .add_enabled(sec_idx > 0, Button::new("↑").small())
+                        .on_hover_text("Move section up")
+                        .clicked()
+                    {
+                        self.move_section("thermostat", -1);
+                    }
+                }
+                if ui
+                    .add_enabled(paired && !busy, Button::new("↻ Refresh"))
+                    .clicked()
+                {
+                    self.spawn_tstat_fetch();
+                }
+            });
+        });
+        ui.add_space(8.0);
+        self.thermostat_card(ui);
+        ui.add_space(14.0);
+    }
+
+    /// The thermostat card itself (paired state, mode buttons,
+    /// setpoint, fan, error line). The header lives in
+    /// thermostat_section_view above.
+    fn thermostat_card(&mut self, ui: &mut Ui) {
         let pal = self.pal();
         // Snapshot what the UI needs so button clicks below can spawn
         // threads without borrow fights.
@@ -6896,17 +6956,6 @@ impl App {
             .corner_radius(CornerRadius::same(14))
             .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Thermostat").size(16.5).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(paired && !busy, Button::new("↻ Refresh"))
-                            .clicked()
-                        {
-                            self.spawn_tstat_fetch();
-                        }
-                    });
-                });
                 if !paired {
                     ui.label(
                         RichText::new("Not paired — pair in Settings → Thermostat (HomeKit).")
@@ -7165,11 +7214,18 @@ impl App {
                         ui.add_space(12.0);
                     }
                 }
-                // ---- thermostat (HomeKit): fixed block above the
-                // sections, outside the drag/order machinery ----
-                self.thermostat_block(ui);
-                ui.add_space(12.0);
+                // The thermostat renders in sequence position via
+                // the sections loop below (it is a section like any
+                // other, not a fixed block above them).
+                let avail = ui.available_width();
                 if self.devices.is_empty() && self.cfg.cameras.is_empty() {
+                    // No Tuya devices at all: the thermostat section
+                    // still renders, then the empty note.
+                    for sec in &sections {
+                        if sec.kind == SectionKind::Thermostat {
+                            self.section_view(ui, sec, avail);
+                        }
+                    }
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -7180,14 +7236,18 @@ impl App {
                     });
                     return;
                 }
-                if sections.is_empty() {
+                if sections.iter().all(|s| s.kind == SectionKind::Thermostat) {
+                    // Only the thermostat survived (e.g. the search
+                    // matched no device): show it, then the note.
+                    for sec in &sections {
+                        self.section_view(ui, sec, avail);
+                    }
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("Nothing matches your search.").size(14.0).color(pal.dim));
                     });
                     return;
                 }
-                let avail = ui.available_width();
                 for sec in &sections {
                     self.section_view(ui, sec, avail);
                 }
@@ -7442,6 +7502,13 @@ impl App {
                 .unwrap_or(0);
             (pos, self.sections_cache.len().max(1))
         };
+        // The thermostat is a single card, not a device grid: its
+        // own header + card, no collapse chevron, count badge,
+        // Delete, or "Reset to name order".
+        if sec.kind == SectionKind::Thermostat {
+            self.thermostat_section_view(ui, sec_idx, sec_total);
+            return;
+        }
         // ---- header ----
         ui.horizontal(|ui| {
             let chev = if collapsed { "▸" } else { "▾" };
@@ -10078,11 +10145,13 @@ mod tests {
         let c = cam("tapo1", "");
         let entries = vec![device_entry(&b), device_entry(&plug), camera_entry(&c)];
         let secs = build_sections(&entries, &LayoutCfg::default(), false, "");
-        // v1.2.1 default section order: Cameras first.
-        assert_eq!(keys(&secs), vec!["cameras", "lighting", "ungrouped"]);
-        assert_eq!(secs[0].ids, vec!["cam:1".to_string()]);
-        assert_eq!(secs[1].ids, vec!["lb".to_string()]);
-        assert_eq!(secs[2].ids, vec!["p1".to_string()]);
+        // Default section order: the Thermostat section first, then
+        // Cameras, Lighting, Ungrouped.
+        assert_eq!(keys(&secs), vec!["thermostat", "cameras", "lighting", "ungrouped"]);
+        assert_eq!(secs[0].ids, Vec::<String>::new());
+        assert_eq!(secs[1].ids, vec!["cam:1".to_string()]);
+        assert_eq!(secs[2].ids, vec!["lb".to_string()]);
+        assert_eq!(secs[3].ids, vec!["p1".to_string()]);
         assert!(device_is_light(&b));
         assert!(!device_is_light(&plug));
         assert_eq!(auto_section_label(&entries[0]), "Lighting (automatic)");
@@ -10099,8 +10168,8 @@ mod tests {
         layout.assign.insert("cam:1".into(), "g1".into());
         let entries = vec![device_entry(&b), camera_entry(&c)];
         let secs = build_sections(&entries, &layout, false, "");
-        assert_eq!(keys(&secs), vec!["g1"]);
-        assert_eq!(secs[0].ids.len(), 2);
+        assert_eq!(keys(&secs), vec!["thermostat", "g1"]);
+        assert_eq!(secs[1].ids.len(), 2);
     }
 
     #[test]
@@ -10427,7 +10496,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.6.2");
+        assert_eq!(APP_VERSION, "1.6.3");
     }
 
     #[test]
@@ -10916,17 +10985,17 @@ mod tests {
     }
 
     #[test]
-    fn section_order_default_cameras_first() {
+    fn section_order_default_thermostat_first() {
         let layout = grouped_layout();
         let secs = build_sections(&full_entry_set(), &layout, false, "");
         assert_eq!(
             keys(&secs),
-            vec!["cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
+            vec!["thermostat", "cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
         );
         // And default_section_seq over the same list agrees.
         assert_eq!(
             default_section_seq(&secs),
-            vec!["cameras", "pinned", "lighting", "group:g1", "ungrouped", "scenes"]
+            vec!["thermostat", "cameras", "pinned", "lighting", "group:g1", "ungrouped", "scenes"]
         );
     }
 
@@ -10940,7 +11009,10 @@ mod tests {
             "cameras".into(),
         ];
         let secs = build_sections(&full_entry_set(), &layout, false, "");
-        assert_eq!(keys(&secs), vec!["scenes", "ungrouped", "lighting", "cameras"]);
+        // The thermostat is missing from the stored order, so it
+        // slots first (no default-order predecessor); the rest
+        // keeps the stored order.
+        assert_eq!(keys(&secs), vec!["thermostat", "scenes", "ungrouped", "lighting", "cameras"]);
     }
 
     #[test]
@@ -10951,12 +11023,13 @@ mod tests {
         let mut layout = grouped_layout();
         layout.section_seq = vec!["scenes".into(), "lighting".into()];
         let secs = build_sections(&full_entry_set(), &layout, false, "");
-        // cameras (front, no predecessor) → pinned (after cameras) →
-        // scenes → lighting (stored relative order) → group (after
-        // lighting) → ungrouped (after the group).
+        // thermostat (front, no predecessor) → cameras (after
+        // thermostat) → pinned (after cameras) → scenes → lighting
+        // (stored relative order) → group (after lighting) →
+        // ungrouped (after the group).
         assert_eq!(
             keys(&secs),
-            vec!["cameras", "pinned", "scenes", "lighting", "g1", "ungrouped"]
+            vec!["thermostat", "cameras", "pinned", "scenes", "lighting", "g1", "ungrouped"]
         );
     }
 
@@ -10968,18 +11041,27 @@ mod tests {
         let secs = build_sections(&full_entry_set(), &layout, false, "");
         assert_eq!(
             keys(&secs),
-            vec!["cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
+            vec!["thermostat", "cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
         );
         // Move Ungrouped up one: it swaps with the group.
         let seq = moved_section_seq(&layout.section_seq, &secs, "ungrouped", -1);
         assert_eq!(
             seq,
-            vec!["cameras", "pinned", "lighting", "ungrouped", "group:g1", "scenes"]
+            vec!["thermostat", "cameras", "pinned", "lighting", "ungrouped", "group:g1", "scenes"]
         );
-        let seq2 = moved_section_seq(&seq, &secs, "cameras", -1);
+        let seq2 = moved_section_seq(&seq, &secs, "thermostat", -1);
         assert_eq!(seq2, seq); // already first: no-op
         let seq3 = moved_section_seq(&seq, &secs, "scenes", 1);
         assert_eq!(seq3, seq); // already last: no-op
+        // The thermostat itself moves like any other section: down
+        // one swaps it with Cameras, back up restores it.
+        let seq_down = moved_section_seq(&seq, &secs, "thermostat", 1);
+        assert_eq!(
+            seq_down,
+            vec!["cameras", "thermostat", "pinned", "lighting", "ungrouped", "group:g1", "scenes"]
+        );
+        let seq_back = moved_section_seq(&seq_down, &secs, "thermostat", -1);
+        assert_eq!(seq_back, seq);
         // Stored keys for sections that aren't rendered right now
         // are re-appended, not forgotten.
         let mut layout2 = LayoutCfg::default();
@@ -10997,12 +11079,66 @@ mod tests {
         assert_eq!(back.section_seq, layout.section_seq);
         assert_eq!(back.cam_sizes.get("cam:1").map(|s| s.as_str()), Some("wide"));
         // And a rebuild with the round-tripped layout honours it:
-        // pinned has moved with the bulb, ungrouped sits above g1.
+        // the thermostat stays on top, pinned has moved with the
+        // bulb, ungrouped sits above g1.
         let secs2 = build_sections(&full_entry_set(), &back, false, "");
         assert_eq!(
             keys(&secs2),
-            vec!["cameras", "pinned", "lighting", "ungrouped", "g1", "scenes"]
+            vec!["thermostat", "cameras", "pinned", "lighting", "ungrouped", "g1", "scenes"]
         );
+    }
+
+    #[test]
+    fn thermostat_section_defaults_first_and_survives_search() {
+        // Old configs whose stored order never mentions the
+        // thermostat: it slots first, like any new section with no
+        // default-order predecessor.
+        let mut layout = grouped_layout();
+        layout.section_seq = vec!["scenes".into(), "lighting".into()];
+        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        assert_eq!(secs[0].key, "thermostat");
+        assert_eq!(secs[0].order_key, "thermostat");
+        assert_eq!(secs[0].title, "Thermostat");
+        // No devices at all: the thermostat section still renders.
+        let empty = build_sections(&[], &LayoutCfg::default(), false, "");
+        assert_eq!(keys(&empty), vec!["thermostat"]);
+        // A search matching no device drops every device section
+        // but never the thermostat (it is not a device).
+        let nomatch = build_sections(
+            &full_entry_set(),
+            &LayoutCfg::default(),
+            false,
+            "zzz-no-such-device",
+        );
+        assert_eq!(keys(&nomatch), vec!["thermostat"]);
+    }
+
+    #[test]
+    fn thermostat_section_moves_and_persists() {
+        // A stored order placing the thermostat mid-list is
+        // honoured, moves work both ways, and the key survives a
+        // serde round-trip of the whole layout.
+        let mut layout = grouped_layout();
+        layout.section_seq = vec![
+            "lighting".into(),
+            "thermostat".into(),
+            "cameras".into(),
+            "pinned".into(),
+            "group:g1".into(),
+            "ungrouped".into(),
+            "scenes".into(),
+        ];
+        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        assert_eq!(secs[1].key, "thermostat");
+        let down = moved_section_seq(&layout.section_seq, &secs, "thermostat", 1);
+        assert_eq!(down[2], "thermostat");
+        let up = moved_section_seq(&down, &secs, "thermostat", -1);
+        assert_eq!(up, layout.section_seq);
+        let text = serde_json::to_string(&layout).unwrap();
+        let back: LayoutCfg = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.section_seq, layout.section_seq);
+        let secs2 = build_sections(&full_entry_set(), &back, false, "");
+        assert_eq!(secs2[1].key, "thermostat");
     }
 
     // ---------------- v1.2.1: camera ids, edit/delete ----------------
@@ -11942,7 +12078,7 @@ mod tests {
             let ctx = egui::Context::default();
             install_fonts(&ctx);
             // Rendered at 1200pt tall (was 1080): the dashboard now
-            // carries the fixed Thermostat block above the sections,
+            // carries the Thermostat section at the top by default,
             // so the last section no longer fits in a 1080 fold.
             // Height does not affect the name budgets under test.
             let texts = render_dashboard(&mut app, &ctx, egui::vec2(w, 1200.0), 3);
@@ -11969,6 +12105,29 @@ mod tests {
         install_fonts(&ctx);
         let texts = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1700.0), 3);
         assert_names_whole(&texts, &GATE_NAMES, "editing w=1330");
+        // The thermostat is a section in the sequence, not a fixed
+        // block: it renders first by default and moves with the
+        // section machinery (ordered by section_seq, movable).
+        let mut app = gate_app();
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1200.0), 3);
+        let cache = &app.sections_cache;
+        assert!(
+            cache.len() > 1,
+            "expected several sections, got {:?}",
+            cache.iter().map(|s| s.key.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            cache.iter().any(|s| s.key == "thermostat"),
+            "thermostat section missing from sections_cache: {:?}",
+            cache.iter().map(|s| s.key.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(cache[0].key, "thermostat");
+        let moved = moved_section_seq(&app.cfg.layout.section_seq, cache, "thermostat", 1);
+        assert_eq!(moved[1], "thermostat");
+        let back = moved_section_seq(&moved, cache, "thermostat", -1);
+        assert_eq!(back[0], "thermostat");
     }
 
     #[test]

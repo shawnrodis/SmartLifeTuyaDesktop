@@ -132,6 +132,21 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.6.3
+
+- **Fixed: the thermostat tile showed 0 values (Off, 32°F) instead of
+  the real state.** Two causes: the app only recognized full-length
+  characteristic labels (some thermostats use short ones), and it
+  trusted the first model answer for values even when that answer
+  carried none. Labels are now normalized, and the app fetches the
+  readings explicitly when the first answer omits them.
+- **Thermostat is now its own moveable category.** It used to be
+  pinned at the top of the dashboard; it now sits in the section
+  order like Cameras and Lighting, with the same up/down move
+  buttons in editing mode, and its position is saved. It still
+  starts at the top by default, and it still shows even with no
+  devices or under a search.
+
 ## What's new in 1.6.2
 
 - **Fixed: the thermostat tile couldn't read the thermostat's state

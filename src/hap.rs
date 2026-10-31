@@ -1357,8 +1357,26 @@ pub struct CharInfo {
     pub format: Option<String>,
 }
 
+/// Normalize a HAP service/characteristic type to its 8-digit prefix.
+/// Full UUIDs ("0000004A-0000-1000-8000-0026BB765291") truncate to the
+/// first 8 chars as before, but some accessories (including the
+/// Resideo T6) report short forms ("4A", "11", "004A"): the part
+/// before any '-' is uppercased and left-padded with '0' to 8 chars,
+/// so "4A" -> "0000004A" and full-UUID matching is unchanged.
 fn short_type(full: &str) -> String {
-    full.get(..8).unwrap_or("").to_ascii_uppercase()
+    let base = full.split('-').next().unwrap_or("");
+    let upper = base.to_ascii_uppercase();
+    let count = upper.chars().count();
+    if count >= 8 {
+        upper.chars().take(8).collect()
+    } else {
+        let mut s = String::with_capacity(8);
+        for _ in 0..(8 - count) {
+            s.push('0');
+        }
+        s.push_str(&upper);
+        s
+    }
 }
 
 /// HAP service / characteristic type prefixes (from the spec).
@@ -1395,6 +1413,13 @@ pub struct ThermostatState {
     pub w_heat_to: Option<(u32, u32)>,
     pub w_cool_to: Option<(u32, u32)>,
     pub w_fan_active: Option<(u32, u32)>,
+    // Read targets (aid, iid) for characteristics that are never
+    // written but must be readable via /characteristics when
+    // /accessories omits their values.
+    pub r_current_mode: Option<(u32, u32)>,
+    pub r_current_temp: Option<(u32, u32)>,
+    pub r_humidity: Option<(u32, u32)>,
+    pub r_units: Option<(u32, u32)>,
 }
 
 fn as_f64(v: &serde_json::Value) -> Option<f64> {
@@ -1424,6 +1449,39 @@ pub fn state_from_accessories(accs: &[AccessoryInfo]) -> ThermostatState {
             if stype == SVC_THERMOSTAT {
                 for ch in &svc.characteristics {
                     let ctype = short_type(&ch.type_uuid);
+                    // Record the address regardless of whether a value
+                    // is present: /accessories may omit values, and the
+                    // /characteristics overlay then reads them by
+                    // address. (Previously targets were recorded only
+                    // inside the value arms below, so a valueless
+                    // /accessories left nothing to overlay.)
+                    match ctype.as_str() {
+                        CH_CURRENT_MODE => {
+                            st.r_current_mode = Some((acc.aid, ch.iid));
+                        }
+                        CH_TARGET_MODE => {
+                            st.w_target_mode = Some((acc.aid, ch.iid));
+                        }
+                        CH_CURRENT_TEMP => {
+                            st.r_current_temp = Some((acc.aid, ch.iid));
+                        }
+                        CH_TARGET_TEMP => {
+                            st.w_target_temp = Some((acc.aid, ch.iid));
+                        }
+                        CH_TEMP_UNITS => {
+                            st.r_units = Some((acc.aid, ch.iid));
+                        }
+                        CH_HEAT_TO => {
+                            st.w_heat_to = Some((acc.aid, ch.iid));
+                        }
+                        CH_COOL_TO => {
+                            st.w_cool_to = Some((acc.aid, ch.iid));
+                        }
+                        CH_HUMIDITY => {
+                            st.r_humidity = Some((acc.aid, ch.iid));
+                        }
+                        _ => {}
+                    }
                     let v = match &ch.value {
                         Some(v) => v,
                         None => continue,
@@ -1438,7 +1496,6 @@ pub fn state_from_accessories(accs: &[AccessoryInfo]) -> ThermostatState {
                             if let Some(m) = as_u8(v) {
                                 st.target_mode = m;
                             }
-                            st.w_target_mode = Some((acc.aid, ch.iid));
                         }
                         CH_CURRENT_TEMP => {
                             if let Some(t) = as_f64(v) {
@@ -1449,7 +1506,6 @@ pub fn state_from_accessories(accs: &[AccessoryInfo]) -> ThermostatState {
                             if let Some(t) = as_f64(v) {
                                 st.target_temp_c = t;
                             }
-                            st.w_target_temp = Some((acc.aid, ch.iid));
                         }
                         CH_TEMP_UNITS => {
                             st.temp_units_f = as_u8(v).map(|u| u == 1).unwrap_or(false);
@@ -1458,13 +1514,11 @@ pub fn state_from_accessories(accs: &[AccessoryInfo]) -> ThermostatState {
                             if let Some(t) = as_f64(v) {
                                 st.heat_to_c = Some(t);
                             }
-                            st.w_heat_to = Some((acc.aid, ch.iid));
                         }
                         CH_COOL_TO => {
                             if let Some(t) = as_f64(v) {
                                 st.cool_to_c = Some(t);
                             }
-                            st.w_cool_to = Some((acc.aid, ch.iid));
                         }
                         CH_HUMIDITY => {
                             if let Some(h) = as_f64(v) {
@@ -1478,10 +1532,12 @@ pub fn state_from_accessories(accs: &[AccessoryInfo]) -> ThermostatState {
             if stype == SVC_FAN {
                 for ch in &svc.characteristics {
                     if short_type(&ch.type_uuid) == CH_FAN_ACTIVE {
+                        // Address recorded even without a value, so the
+                        // overlay can read it via /characteristics.
+                        st.w_fan_active = Some((acc.aid, ch.iid));
                         if let Some(v) = &ch.value {
                             st.fan_on = as_u8(v).map(|u| u != 0);
                         }
-                        st.w_fan_active = Some((acc.aid, ch.iid));
                     }
                 }
             }
@@ -1505,10 +1561,111 @@ pub struct ThermostatChanges {
     pub fan_on: Option<bool>,
 }
 
+/// Apply /characteristics values onto a state mapped from
+/// /accessories, using the same per-type mapping in both directions.
+/// A value present in the overlay wins over the /accessories value;
+/// a missing entry leaves the /accessories value untouched.
+fn overlay_values(
+    st: &mut ThermostatState,
+    vals: &HashMap<(u32, u32), serde_json::Value>,
+) {
+    if let Some(t) = st.r_current_mode {
+        if let Some(v) = vals.get(&t) {
+            if let Some(m) = as_u8(v) {
+                st.current_mode = m;
+            }
+        }
+    }
+    if let Some(t) = st.w_target_mode {
+        if let Some(v) = vals.get(&t) {
+            if let Some(m) = as_u8(v) {
+                st.target_mode = m;
+            }
+        }
+    }
+    if let Some(t) = st.r_current_temp {
+        if let Some(v) = vals.get(&t) {
+            if let Some(t) = as_f64(v) {
+                st.current_temp_c = t;
+            }
+        }
+    }
+    if let Some(t) = st.w_target_temp {
+        if let Some(v) = vals.get(&t) {
+            if let Some(t) = as_f64(v) {
+                st.target_temp_c = t;
+            }
+        }
+    }
+    if let Some(t) = st.w_heat_to {
+        if let Some(v) = vals.get(&t) {
+            if let Some(t) = as_f64(v) {
+                st.heat_to_c = Some(t);
+            }
+        }
+    }
+    if let Some(t) = st.w_cool_to {
+        if let Some(v) = vals.get(&t) {
+            if let Some(t) = as_f64(v) {
+                st.cool_to_c = Some(t);
+            }
+        }
+    }
+    if let Some(t) = st.r_humidity {
+        if let Some(v) = vals.get(&t) {
+            if let Some(h) = as_f64(v) {
+                st.humidity = Some(h);
+            }
+        }
+    }
+    if let Some(t) = st.r_units {
+        if let Some(v) = vals.get(&t) {
+            st.temp_units_f = as_u8(v).map(|u| u == 1).unwrap_or(false);
+        }
+    }
+    if let Some(t) = st.w_fan_active {
+        if let Some(v) = vals.get(&t) {
+            st.fan_on = as_u8(v).map(|u| u != 0);
+        }
+    }
+}
+
+/// One session's full read: /accessories mapping plus a
+/// /characteristics overlay for every discovered target. The overlay
+/// never fails the fetch: if the accessory won't answer
+/// /characteristics, the /accessories-derived state stands.
+fn fetch_via(sess: &mut SecureConn) -> HapResult<ThermostatState> {
+    let accs = sess.get_accessories()?;
+    let mut st = state_from_accessories(&accs);
+    let mut ids: Vec<(u32, u32)> = Vec::new();
+    for t in [
+        st.r_current_mode,
+        st.w_target_mode,
+        st.r_current_temp,
+        st.w_target_temp,
+        st.w_heat_to,
+        st.w_cool_to,
+        st.r_humidity,
+        st.r_units,
+        st.w_fan_active,
+    ] {
+        if let Some(id) = t {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    if !ids.is_empty() {
+        if let Ok(vals) = sess.get_characteristics(&ids) {
+            overlay_values(&mut st, &vals);
+        }
+    }
+    Ok(st)
+}
+
 fn fetch_state_inner(pairing: &ThermostatPairing) -> HapResult<ThermostatState> {
     let mut sess = SecureConn::open(pairing)?;
-    let accs = sess.get_accessories()?;
-    Ok(state_from_accessories(&accs))
+    fetch_via(&mut sess)
 }
 
 /// Fetch the thermostat state, with one automatic retry on IO failure
@@ -1529,8 +1686,7 @@ pub fn set_state(
     changes: &ThermostatChanges,
 ) -> HapResult<ThermostatState> {
     let mut sess = SecureConn::open(pairing)?;
-    let accs = sess.get_accessories()?;
-    let mut st = state_from_accessories(&accs);
+    let mut st = fetch_via(&mut sess)?;
     let mut writes: Vec<(u32, u32, serde_json::Value)> = Vec::new();
     if let Some(m) = changes.target_mode {
         if let Some(t) = st.w_target_mode {
@@ -1568,32 +1724,11 @@ pub fn set_state(
             .collect();
         return err(format!("thermostat rejected write(s): {}", desc.join(", ")));
     }
-    // Read back the written characteristics and patch the state.
+    // Read back the written characteristics and patch the state with
+    // the same overlay mapping the fetch path uses.
     let ids: Vec<(u32, u32)> = writes.iter().map(|(a, i, _)| (*a, *i)).collect();
     let back = sess.get_characteristics(&ids)?;
-    for (aid, iid, _) in &writes {
-        if let Some(v) = back.get(&(*aid, *iid)) {
-            if Some((*aid, *iid)) == st.w_target_mode {
-                if let Some(m) = as_u8(v) {
-                    st.target_mode = m;
-                }
-            } else if Some((*aid, *iid)) == st.w_target_temp {
-                if let Some(t) = as_f64(v) {
-                    st.target_temp_c = t;
-                }
-            } else if Some((*aid, *iid)) == st.w_heat_to {
-                if let Some(t) = as_f64(v) {
-                    st.heat_to_c = Some(t);
-                }
-            } else if Some((*aid, *iid)) == st.w_cool_to {
-                if let Some(t) = as_f64(v) {
-                    st.cool_to_c = Some(t);
-                }
-            } else if Some((*aid, *iid)) == st.w_fan_active {
-                st.fan_on = as_u8(v).map(|u| u != 0);
-            }
-        }
-    }
+    overlay_values(&mut st, &back);
     Ok(st)
 }
 
@@ -2574,6 +2709,229 @@ mod tests {
         let mut conn = Conn::connect("127.0.0.1", port).unwrap();
         let (_code, body) = conn.post_plain("/x", b"", "text/plain").unwrap();
         assert_eq!(body, b"hello");
+        server.join().unwrap();
+    }
+
+    // -- Thermostat state mapping: short UUIDs + value overlay -------
+    // Field failure (v1.6.2): the tile rendered all defaults (Off,
+    // 32°F/32°F = 0°C) while the wall unit showed Cool 77°F/77°F.
+    // fetch_state had succeeded, but state_from_accessories matched
+    // nothing: either the T6 uses short-form type UUIDs, or its
+    // /accessories omits values (or both).
+
+    #[test]
+    fn short_type_normalization() {
+        assert_eq!(short_type("4A"), "0000004A");
+        assert_eq!(short_type("11"), "00000011");
+        assert_eq!(short_type("004A"), "0000004A");
+        assert_eq!(short_type("4a"), "0000004A");
+        assert_eq!(short_type("0000004A"), "0000004A");
+        assert_eq!(
+            short_type("0000004A-0000-1000-8000-0026BB765291"),
+            "0000004A"
+        );
+        assert_eq!(
+            short_type("0000000d-0000-1000-8000-0026BB765291"),
+            "0000000D"
+        );
+        assert_eq!(short_type(""), "00000000");
+    }
+
+    fn fetch_char_entry(iid: u32, typ: &str, value: Option<&str>) -> String {
+        match value {
+            Some(v) => format!(
+                "{{\"iid\":{},\"type\":\"{}\",\"value\":{}}}",
+                iid, typ, v
+            ),
+            None => format!("{{\"iid\":{},\"type\":\"{}\"}}", iid, typ),
+        }
+    }
+
+    /// Full thermostat /accessories record. `short` selects short-form
+    /// type UUIDs ("4A") vs full UUIDs; `with_values` includes the
+    /// "value" key on every characteristic or omits it entirely.
+    /// iid layout: 11 current mode, 12 target mode, 13 current temp,
+    /// 14 target temp, 15 heat-to, 16 cool-to, 17 humidity, 18 units,
+    /// 21 fan active. Values describe Cool, 25°C/25°C, heat 20°C,
+    /// cool 26°C, 45% humidity, Celsius units, fan on.
+    fn fetch_test_accessories(short: bool, with_values: bool) -> Vec<u8> {
+        let ty = |full: &str, short_form: &str| -> String {
+            if short {
+                short_form.to_string()
+            } else {
+                format!("{}-0000-1000-8000-0026BB765291", full)
+            }
+        };
+        let v = |val: &'static str| -> Option<&'static str> {
+            if with_values {
+                Some(val)
+            } else {
+                None
+            }
+        };
+        let svc = |iid: u32, typ: &str, chars: Vec<String>| -> String {
+            format!(
+                "{{\"iid\":{},\"type\":\"{}\",\"characteristics\":[{}]}}",
+                iid,
+                typ,
+                chars.join(",")
+            )
+        };
+        let info = svc(
+            1,
+            &ty("0000003E", "3E"),
+            vec![fetch_char_entry(2, &ty("00000023", "23"), v("\"T6 Pro\""))],
+        );
+        let tstat = svc(
+            10,
+            &ty("0000004A", "4A"),
+            vec![
+                fetch_char_entry(11, &ty("0000000F", "0F"), v("2")),
+                fetch_char_entry(12, &ty("00000033", "33"), v("2")),
+                fetch_char_entry(13, &ty("00000011", "11"), v("25.0")),
+                fetch_char_entry(14, &ty("00000035", "35"), v("25.0")),
+                fetch_char_entry(15, &ty("00000012", "12"), v("20.0")),
+                fetch_char_entry(16, &ty("0000000D", "0D"), v("26.0")),
+                fetch_char_entry(17, &ty("00000010", "10"), v("45")),
+                fetch_char_entry(18, &ty("00000036", "36"), v("0")),
+            ],
+        );
+        let fan = svc(
+            20,
+            &ty("00000040", "40"),
+            vec![fetch_char_entry(21, &ty("000000B0", "B0"), v("1"))],
+        );
+        format!(
+            "{{\"accessories\":[{{\"aid\":1,\"services\":[{},{},{}]}}]}}",
+            info, tstat, fan
+        )
+        .into_bytes()
+    }
+
+    fn fetch_test_characteristics() -> Vec<u8> {
+        br#"{"characteristics":[{"aid":1,"iid":11,"value":2},{"aid":1,"iid":12,"value":2},{"aid":1,"iid":13,"value":25.0},{"aid":1,"iid":14,"value":25.0},{"aid":1,"iid":15,"value":20.0},{"aid":1,"iid":16,"value":26.0},{"aid":1,"iid":17,"value":45},{"aid":1,"iid":18,"value":0},{"aid":1,"iid":21,"value":1}]}"#.to_vec()
+    }
+
+    /// Serve one fetch_via round-trip: /accessories (Content-Length),
+    /// then the /characteristics overlay request. Asserts the overlay
+    /// asks for exactly the nine discovered targets. `char_body` =
+    /// None closes the socket on the overlay request instead of
+    /// answering (overlay failure: the fetch must still succeed).
+    fn spawn_fetch_responder(
+        acc_body: Vec<u8>,
+        char_body: Option<Vec<u8>>,
+    ) -> (u16, thread::JoinHandle<()>) {
+        spawn_secure_responder(move |s, resp_ctr, req_ctr| {
+            let mut acc_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                acc_body.len()
+            )
+            .into_bytes();
+            acc_resp.extend_from_slice(&acc_body);
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &acc_resp);
+            let req = read_framed_request(s, &TEST_OUT_KEY, req_ctr);
+            assert!(
+                req.starts_with(
+                    b"GET /characteristics?id=1.11,1.12,1.13,1.14,1.15,1.16,1.17,1.18,1.21 "
+                ),
+                "unexpected overlay request: {}",
+                String::from_utf8_lossy(&req)
+            );
+            if let Some(body) = char_body {
+                let mut char_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                char_resp.extend_from_slice(&body);
+                write_framed(s, &TEST_IN_KEY, resp_ctr, &char_resp);
+            }
+            // Returning closes the socket.
+        })
+    }
+
+    fn assert_cool_25(st: &ThermostatState, expected_name: &str) {
+        assert_eq!(st.name, expected_name);
+        assert_eq!(st.current_mode, 2);
+        assert_eq!(st.target_mode, 2);
+        assert_eq!(st.current_temp_c, 25.0);
+        assert_eq!(st.target_temp_c, 25.0);
+        assert_eq!(st.heat_to_c, Some(20.0));
+        assert_eq!(st.cool_to_c, Some(26.0));
+        assert_eq!(st.humidity, Some(45.0));
+        assert!(!st.temp_units_f);
+        assert_eq!(st.fan_on, Some(true));
+        assert_eq!(st.r_current_mode, Some((1, 11)));
+        assert_eq!(st.w_target_mode, Some((1, 12)));
+        assert_eq!(st.r_current_temp, Some((1, 13)));
+        assert_eq!(st.w_target_temp, Some((1, 14)));
+        assert_eq!(st.w_heat_to, Some((1, 15)));
+        assert_eq!(st.w_cool_to, Some((1, 16)));
+        assert_eq!(st.r_humidity, Some((1, 17)));
+        assert_eq!(st.r_units, Some((1, 18)));
+        assert_eq!(st.w_fan_active, Some((1, 21)));
+    }
+
+    #[test]
+    fn fetch_short_form_uuids_with_values() {
+        let (port, server) = spawn_fetch_responder(
+            fetch_test_accessories(true, true),
+            Some(fetch_test_characteristics()),
+        );
+        let mut sess = secure_test_conn(port);
+        let st = fetch_via(&mut sess).unwrap();
+        assert_cool_25(&st, "T6 Pro");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_short_form_overlay_failure() {
+        // Isolates the /accessories mapping for short forms: with the
+        // overlay dead, the state must still come from the short-form
+        // record alone (previously "4A" matched nothing -> defaults).
+        let (port, server) =
+            spawn_fetch_responder(fetch_test_accessories(true, true), None);
+        let mut sess = secure_test_conn(port);
+        let st = fetch_via(&mut sess).unwrap();
+        assert_cool_25(&st, "T6 Pro");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_no_accessory_values_overlay() {
+        // /accessories carries no values at all: targets are still
+        // discovered (value-independent recording) and the overlay
+        // supplies every value. The name is not overlaid, so it stays
+        // empty here -- the tile does not need it.
+        let (port, server) = spawn_fetch_responder(
+            fetch_test_accessories(false, false),
+            Some(fetch_test_characteristics()),
+        );
+        let mut sess = secure_test_conn(port);
+        let st = fetch_via(&mut sess).unwrap();
+        assert_cool_25(&st, "");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_full_values_regression() {
+        let (port, server) = spawn_fetch_responder(
+            fetch_test_accessories(false, true),
+            Some(fetch_test_characteristics()),
+        );
+        let mut sess = secure_test_conn(port);
+        let st = fetch_via(&mut sess).unwrap();
+        assert_cool_25(&st, "T6 Pro");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_overlay_failure_keeps_accessory_values() {
+        let (port, server) =
+            spawn_fetch_responder(fetch_test_accessories(false, true), None);
+        let mut sess = secure_test_conn(port);
+        let st = fetch_via(&mut sess).unwrap();
+        assert_cool_25(&st, "T6 Pro");
         server.join().unwrap();
     }
 }
