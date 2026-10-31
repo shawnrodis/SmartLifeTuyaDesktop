@@ -132,6 +132,20 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.3
+
+- **Thermostat sets verify before reporting failure.** A lost
+  response no longer means a false "control failed" — the app
+  re-checks the exact settings it wrote, and if the change stuck
+  there is no error line at all. Genuine failures get a short
+  plain-language message instead of a network dump.
+- **Refresh states match login states.** A refresh cycle that comes
+  back thin no longer knocks known-good lights to Off: the app
+  keeps the last-known state instead of defaulting, and heals the
+  stored data on the next full cycle — so autorefresh shows the
+  same states as a fresh login, with no re-login needed. The
+  diagnostics log notes when a thin payload is held.
+
 ## What's new in 2.0.2
 
 - **Thermostat section hides until paired, like Cameras.** No section,

@@ -2007,6 +2007,160 @@ pub fn apply_changes_to_state(st: &mut ThermostatState, changes: &ThermostatChan
     }
 }
 
+/// Outcome of verifying a PUT whose response was lost (v2.0.3).
+enum VerifyOutcome {
+    /// A fresh fetch shows every written characteristic at its
+    /// intended value: the write applied despite the lost response.
+    Applied(ThermostatState),
+    /// A fresh fetch shows at least one written characteristic at
+    /// its old value: the write genuinely did not apply.
+    NotApplied,
+    /// Every verification fetch failed: nothing could be proven.
+    Unverifiable,
+}
+
+/// True when a freshly fetched state shows every written
+/// characteristic at its written value (v2.0.3). Only written
+/// fields are compared — live readings (indoor temperature,
+/// humidity) legitimately differ. Temperatures compare after
+/// quantization with the characteristic's own step/range, so a
+/// fetch reporting 25.5 °C matches a 25.5 °C write exactly.
+/// Unknown addresses are ignored, mirroring
+/// apply_writes_to_state.
+fn writes_match_state(
+    fetched: &ThermostatState,
+    base: &ThermostatState,
+    writes: &[(u32, u32, serde_json::Value)],
+) -> bool {
+    for (a, i, v) in writes {
+        let addr = (*a, *i);
+        if Some(addr) == base.w_target_mode {
+            match as_u8(v) {
+                Some(m) if fetched.target_mode == m => {}
+                _ => return false,
+            }
+        } else if Some(addr) == base.w_target_temp {
+            let Some(want) = as_f64(v) else {
+                return false;
+            };
+            if quantize_temp(
+                fetched.target_temp_c,
+                base.step_target_temp,
+                base.min_target_temp,
+                base.max_target_temp,
+            ) != quantize_temp(
+                want,
+                base.step_target_temp,
+                base.min_target_temp,
+                base.max_target_temp,
+            ) {
+                return false;
+            }
+        } else if Some(addr) == base.w_heat_to {
+            match (fetched.heat_to_c, as_f64(v)) {
+                (Some(got), Some(want))
+                    if quantize_temp(got, base.step_heat_to, base.min_heat_to, base.max_heat_to)
+                        == quantize_temp(want, base.step_heat_to, base.min_heat_to, base.max_heat_to) => {}
+                _ => return false,
+            }
+        } else if Some(addr) == base.w_cool_to {
+            match (fetched.cool_to_c, as_f64(v)) {
+                (Some(got), Some(want))
+                    if quantize_temp(got, base.step_cool_to, base.min_cool_to, base.max_cool_to)
+                        == quantize_temp(want, base.step_cool_to, base.min_cool_to, base.max_cool_to) => {}
+                _ => return false,
+            }
+        } else if Some(addr) == base.w_fan_active {
+            match as_u8(v) {
+                Some(u) if fetched.fan_on == Some(u != 0) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Verify written characteristics against fresh fetches (v2.0.3):
+/// the unit may need a moment to accept a new connection after a
+/// write whose response was lost, so a fetch failure — or a fetch
+/// showing the old state — retries a small bounded number of times
+/// with a brief delay before any failure is concluded. Returns on
+/// the first fetch showing the intended state. A fetch that
+/// succeeded but showed the old state still counts as evidence
+/// (NotApplied) even if later attempts fail. `fetch` is a closure
+/// so tests can inject scripted outcomes; production passes a
+/// fresh single-attempt fetch (fetch_state_inner) so the bound
+/// stays tight instead of doubling through fetch_state's own retry.
+fn verify_writes<F>(
+    mut fetch: F,
+    base: &ThermostatState,
+    writes: &[(u32, u32, serde_json::Value)],
+) -> VerifyOutcome
+where
+    F: FnMut() -> HapResult<ThermostatState>,
+{
+    const ATTEMPTS: usize = 3;
+    const DELAY_MS: u64 = 300;
+    let mut saw_fresh_mismatch = false;
+    for attempt in 0..ATTEMPTS {
+        match fetch() {
+            Ok(fetched) => {
+                if writes_match_state(&fetched, base, writes) {
+                    return VerifyOutcome::Applied(fetched);
+                }
+                saw_fresh_mismatch = true;
+            }
+            Err(_) => {}
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+        }
+    }
+    if saw_fresh_mismatch {
+        VerifyOutcome::NotApplied
+    } else {
+        VerifyOutcome::Unverifiable
+    }
+}
+
+/// Resolve a PUT whose response was lost (v2.0.3): the write may
+/// already have applied on the unit, so verify against the unit's
+/// true state before declaring failure. Applied → Confirmed with
+/// the fetched state (the tile shows truth, no error line).
+/// Anything else → the original PUT error, for the caller to
+/// humanize; the full detail stays in the diagnostics log here.
+fn verify_put_applied(
+    pairing: &ThermostatPairing,
+    base: &ThermostatState,
+    writes: &[(u32, u32, serde_json::Value)],
+    put_err: HapError,
+    started: std::time::Instant,
+) -> HapResult<SetOutcome> {
+    match verify_writes(|| fetch_state_inner(pairing), base, writes) {
+        VerifyOutcome::Applied(fetched) => {
+            tstat_log(&format!(
+                "Set verified after lost PUT response: fetch shows intended state ({:.1}s)",
+                started.elapsed().as_secs_f64()
+            ));
+            Ok(SetOutcome::Confirmed(fetched))
+        }
+        VerifyOutcome::NotApplied => {
+            tstat_log(&format!(
+                "Set NOT applied: verify shows old state after lost PUT response: {put_err} ({:.1}s)",
+                started.elapsed().as_secs_f64()
+            ));
+            Err(put_err)
+        }
+        VerifyOutcome::Unverifiable => {
+            tstat_log(&format!(
+                "Set unverifiable: all verify fetches failed after lost PUT response: {put_err} ({:.1}s)",
+                started.elapsed().as_secs_f64()
+            ));
+            Err(put_err)
+        }
+    }
+}
+
 /// Apply changes, then read back exactly the written characteristics
 /// and report the actual values (the returned state reflects the
 /// readback). If the PUT succeeds but the readback fails, the set
@@ -2060,7 +2214,16 @@ pub fn set_state(
         return Ok(SetOutcome::Confirmed(st));
     }
     let secs = || started.elapsed().as_secs_f64();
-    let failures = sess.put_characteristics(&writes)?;
+    // A PUT error here usually means the response was lost (e.g. a
+    // connection timeout) — not that the write failed: the unit may
+    // already have applied it. Verify against the unit's true state
+    // before declaring failure (v2.0.3); a per-characteristic
+    // rejection below is different — the unit answered, so the
+    // write genuinely did not apply.
+    let failures = match sess.put_characteristics(&writes) {
+        Ok(f) => f,
+        Err(put_err) => return verify_put_applied(pairing, &st, &writes, put_err, started),
+    };
     if !failures.is_empty() {
         let desc: Vec<String> = failures
             .iter()
@@ -2517,6 +2680,189 @@ mod tests {
         assert!(text.contains("refresh_token=[redacted]"));
         assert!(!text.contains("topsecretvalue"));
         tstat_log_clear();
+    }
+
+    // v2.0.3 verify-before-failure fixtures: a base state whose
+    // mode + setpoint write targets the writes address.
+    fn verify_base() -> ThermostatState {
+        ThermostatState {
+            w_target_mode: Some((1, 2)),
+            w_target_temp: Some((1, 3)),
+            w_heat_to: Some((1, 4)),
+            w_cool_to: Some((1, 5)),
+            w_fan_active: Some((1, 6)),
+            step_target_temp: Some(0.5),
+            step_heat_to: Some(0.5),
+            step_cool_to: Some(0.5),
+            target_mode: 0,
+            target_temp_c: 25.0,
+            heat_to_c: Some(20.0),
+            cool_to_c: Some(26.0),
+            fan_on: Some(false),
+            ..Default::default()
+        }
+    }
+
+    fn verify_writes_vec() -> Vec<(u32, u32, serde_json::Value)> {
+        vec![
+            (1, 2, serde_json::json!(2)),
+            (1, 3, serde_json::json!(25.5)),
+        ]
+    }
+
+    fn verify_intended() -> ThermostatState {
+        ThermostatState {
+            target_mode: 2,
+            target_temp_c: 25.5,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn writes_match_state_applied() {
+        assert!(writes_match_state(
+            &verify_intended(),
+            &verify_base(),
+             &verify_writes_vec()
+        ));
+    }
+
+    #[test]
+    fn writes_match_state_old_state_mismatch() {
+        // The pre-write state itself must never count as applied.
+        assert!(!writes_match_state(
+            &verify_base(),
+            &verify_base(),
+             &verify_writes_vec()
+        ));
+    }
+
+    #[test]
+    fn writes_match_state_partial_mismatch() {
+        // Mode applied but setpoint still old: not a match.
+        let mut fetched = verify_intended();
+        fetched.target_temp_c = 25.0;
+        assert!(!writes_match_state(&fetched, &verify_base(), &verify_writes_vec()));
+    }
+
+    #[test]
+    fn writes_match_state_temp_dust_matches() {
+        // Binary float dust on the fetched side is scrubbed by
+        // quantization, so it still matches the written value.
+        let mut fetched = verify_intended();
+        fetched.target_temp_c = 25.500000000000004;
+        assert!(writes_match_state(&fetched, &verify_base(), &verify_writes_vec()));
+        fetched.target_temp_c = 25.0;
+        assert!(!writes_match_state(&fetched, &verify_base(), &verify_writes_vec()));
+    }
+
+    #[test]
+    fn writes_match_state_fan_and_thresholds() {
+        let writes = vec![
+            (1, 4, serde_json::json!(21.0)),
+            (1, 6, serde_json::json!(1)),
+        ];
+        let mut fetched = verify_base();
+        fetched.heat_to_c = Some(21.0);
+        fetched.fan_on = Some(true);
+        assert!(writes_match_state(&fetched, &verify_base(), &writes));
+        fetched.fan_on = Some(false);
+        assert!(!writes_match_state(&fetched, &verify_base(), &writes));
+        fetched.fan_on = Some(true);
+        fetched.heat_to_c = None;
+        assert!(!writes_match_state(&fetched, &verify_base(), &writes));
+    }
+
+    #[test]
+    fn verify_writes_applied_after_retries() {
+        // Applied-but-response-lost: first fetch fails, second
+        // shows the old state, third shows the intended state.
+        let base = verify_base();
+        let old = verify_base();
+        let intended = verify_intended();
+        let mut calls = 0;
+        let outcome = verify_writes(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Err(HapError::Msg("down".to_string())),
+                    2 => Ok(old.clone()),
+                    _ => Ok(intended.clone()),
+                }
+            },
+            &base,
+             &verify_writes_vec(),
+        );
+        assert_eq!(calls, 3);
+        match outcome {
+            VerifyOutcome::Applied(st) => {
+                assert_eq!(st.target_mode, 2);
+                assert_eq!(st.target_temp_c, 25.5);
+            }
+            other => panic!("expected Applied, got {}", match other {
+                VerifyOutcome::NotApplied => "NotApplied",
+                VerifyOutcome::Unverifiable => "Unverifiable",
+                VerifyOutcome::Applied(_) => unreachable!(),
+            }),
+        }
+    }
+
+    #[test]
+    fn verify_writes_not_applied_after_retries() {
+        // Genuinely failed: every fetch shows the old state.
+        let base = verify_base();
+        let old = verify_base();
+        let mut calls = 0;
+        let outcome = verify_writes(
+            || {
+                calls += 1;
+                Ok(old.clone())
+            },
+            &base,
+             &verify_writes_vec(),
+        );
+        assert_eq!(calls, 3);
+        assert!(matches!(outcome, VerifyOutcome::NotApplied));
+    }
+
+    #[test]
+    fn verify_writes_unverifiable_when_all_fetch_fail() {
+        let base = verify_base();
+        let mut calls = 0;
+        let outcome = verify_writes(
+            || {
+                calls += 1;
+                Err(HapError::Msg("down".to_string()))
+            },
+            &base,
+             &verify_writes_vec(),
+        );
+        assert_eq!(calls, 3);
+        assert!(matches!(outcome, VerifyOutcome::Unverifiable));
+    }
+
+    #[test]
+    fn verify_writes_mismatch_then_errors_is_not_applied() {
+        // A fetch that succeeded but showed the old state is
+        // evidence, even if later attempts fail: NotApplied, not
+        // Unverifiable.
+        let base = verify_base();
+        let old = verify_base();
+        let mut calls = 0;
+        let outcome = verify_writes(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(old.clone())
+                } else {
+                    Err(HapError::Msg("down".to_string()))
+                }
+            },
+            &base,
+             &verify_writes_vec(),
+        );
+        assert_eq!(calls, 3);
+        assert!(matches!(outcome, VerifyOutcome::NotApplied));
     }
 
     #[test]

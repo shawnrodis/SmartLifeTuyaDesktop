@@ -3294,6 +3294,15 @@ fn fresh_value_counts(key: &str, v: &Value) -> bool {
 /// payloads can't take the controls away, because the merged data
 /// still carries the keys and their last-known values (same merge
 /// the web edition performs).
+/// A fresh entry that carries NO usable data object at all (key
+/// missing, null, or not an object) gets its last-known data
+/// restored wholesale: without this, the device parses to
+/// all-defaults (Off) and the data-less entry then poisons every
+/// later merge — it drops out of prev_by_id — which is how a
+/// single thin cycle turned the whole dashboard Off while a
+/// third-party dashboard on the same account still showed the
+/// lights On. Explicit values always win: a fresh real reading
+/// (including an explicit Off) is never overwritten.
 fn merge_device_data(fresh: Vec<Value>, previous: &[Value]) -> Vec<Value> {
     if previous.is_empty() {
         return fresh;
@@ -3311,19 +3320,72 @@ fn merge_device_data(fresh: Vec<Value>, previous: &[Value]) -> Vec<Value> {
         .map(|mut d| {
             let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if let Some(prev_data) = prev_by_id.get(&id) {
-                if let Some(data) = d.get_mut("data").and_then(|v| v.as_object_mut()) {
-                    for (k, v) in prev_data.iter() {
-                        let counts = data
-                            .get(k)
-                            .map(|fv| fresh_value_counts(k, fv))
-                            .unwrap_or(false);
-                        if !counts {
-                            data.insert(k.clone(), v.clone());
+                match d.get_mut("data").and_then(|v| v.as_object_mut()) {
+                    Some(data) => {
+                        for (k, v) in prev_data.iter() {
+                            let counts = data
+                                .get(k)
+                                .map(|fv| fresh_value_counts(k, fv))
+                                .unwrap_or(false);
+                            if !counts {
+                                data.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(obj) = d.as_object_mut() {
+                            obj.insert("data".to_string(), Value::Object((*prev_data).clone()));
                         }
                     }
                 }
             }
             d
+        })
+        .collect()
+}
+
+/// Display names of devices whose fresh discovery entry carries no
+/// usable state data (no data object, a non-object data value, or
+/// a data object without a "state" key) while the previous entry
+/// did carry a state key. Pure: the worker logs the result so the
+/// diagnostics log shows which devices the preserve-last-known
+/// path held, instead of a thin payload silently zeroing states.
+/// Device display names only — no state values, no credentials.
+fn devices_with_missing_state(fresh: &[Value], previous: &[Value]) -> Vec<String> {
+    let prev_had_state: HashMap<&str, ()> = previous
+        .iter()
+        .filter_map(|d| {
+            let id = d.get("id")?.as_str()?;
+            let data = d.get("data")?.as_object()?;
+            if data.contains_key("state") {
+                Some((id, ()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    fresh
+        .iter()
+        .filter_map(|d| {
+            let id = d.get("id")?.as_str()?;
+            if !prev_had_state.contains_key(id) {
+                return None;
+            }
+            let usable = d
+                .get("data")
+                .and_then(|v| v.as_object())
+                .map(|m| m.contains_key("state"))
+                .unwrap_or(false);
+            if usable {
+                None
+            } else {
+                Some(
+                    d.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id)
+                        .to_string(),
+                )
+            }
         })
         .collect()
 }
@@ -4172,6 +4234,16 @@ fn net_discovery(
         .and_then(|p| p.get("devices"))
         .and_then(|v| v.as_array())
     {
+        // Diagnostics: name the devices whose fresh entry carries
+        // no state data, so a thin payload is visible in the log
+        // instead of silently zeroing states (v2.0.3).
+        let kept = devices_with_missing_state(devs, previous_raw);
+        if !kept.is_empty() {
+            crate::hap::tstat_log(&format!(
+                "discovery: kept last-known state for {} (fresh payload missing state data)",
+                kept.join(", ")
+            ));
+        }
         return Ok(merge_device_data(devs.clone(), previous_raw));
     }
     let code = json
@@ -5265,10 +5337,60 @@ impl App {
     // ---------------- device state ----------------
 
     fn set_devices(&mut self, raw: Vec<Value>, persist: bool) {
-        self.raw_devices = raw.clone();
-        self.devices = raw.iter().map(parse_device).collect();
+        // Preserve last-known parsed state when a merged entry
+        // still carries no usable state data (missing, empty, or
+        // non-object data, or a data object without a "state"
+        // key). This is the poisoned-anchor case the raw merge
+        // cannot repair — the previous raw entry itself lacks
+        // data, so it drops out of the merge — and parsing it
+        // would regress a known-good state to Off on missing
+        // data. Only lights and switches are retained (their
+        // state is the displayed power flag); scenes and other
+        // kinds parse normally so renames and fresh readings
+        // still flow. Explicit state values always flow through
+        // parse_device, so genuine on/off changes are unaffected.
+        // The retained device's own raw (which optimistic
+        // controls keep in sync) becomes the stored entry, so
+        // the anchor and the cache heal instead of staying
+        // poisoned.
+        let prev_by_id: HashMap<&str, &Device> =
+            self.devices.iter().map(|d| (d.id.as_str(), d)).collect();
+        let mut kept: Vec<String> = Vec::new();
+        let mut stored: Vec<Value> = Vec::with_capacity(raw.len());
+        let mut parsed: Vec<Device> = Vec::with_capacity(raw.len());
+        for r in raw {
+            let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let usable_state = r
+                .get("data")
+                .and_then(|v| v.as_object())
+                .map(|m| m.contains_key("state"))
+                .unwrap_or(false);
+            if !usable_state {
+                if let Some(prev) = prev_by_id.get(id.as_str()) {
+                    if prev.kind == "light" || prev.kind == "switch" {
+                        kept.push(prev.name.clone());
+                        stored.push(prev.raw.clone());
+                        parsed.push((*prev).clone());
+                        continue;
+                    }
+                }
+            }
+            parsed.push(parse_device(&r));
+            stored.push(r);
+        }
+        if !kept.is_empty() {
+            crate::hap::tstat_log(&format!(
+                "display: kept last-known state for {} (merged entry has no state data)",
+                kept.join(", ")
+            ));
+        }
+        self.raw_devices = stored;
+        self.devices = parsed;
         self.prune_layout();
-        self.cfg.cache_devices = Some(Value::Array(raw));
+        // Cache the stored list (with retained raws), not the
+        // incoming one, so the cache anchor heals instead of
+        // staying poisoned by data-less entries.
+        self.cfg.cache_devices = Some(Value::Array(self.raw_devices.clone()));
         self.last_fetch = Some(Instant::now());
         self.last_updated = format!(
             "Updated {}",
@@ -6736,6 +6858,36 @@ impl App {
         }
     }
 
+    /// Short plain reason for a thermostat set failure (v2.0.3):
+    /// the tile must never show a raw OS error dump for a failed
+    /// set (a timeout used to surface as a full Winsock paragraph
+    /// while the wall unit had applied the change). The full error
+    /// still goes to the diagnostics log at the hap layer; the tile
+    /// — and the web edition via the bridge error body — shows only
+    /// this short reason.
+    fn humanize_tstat_error(e: &str) -> String {
+        let lower = e.to_lowercase();
+        if lower.contains("os error")
+            || lower.contains("network error")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("connection")
+            || lower.contains("unreachable")
+            || lower.contains("reset by peer")
+            || lower.contains("broken pipe")
+        {
+            "the thermostat could not be reached — check that it is online and try again"
+                .to_string()
+        } else if lower.contains("rejected")
+            || lower.contains("invalid value")
+            || lower.contains("-70410")
+        {
+            "the thermostat did not accept the change".to_string()
+        } else {
+            "the thermostat did not confirm the change — try again".to_string()
+        }
+    }
+
     /// Tile/bridge set (v2.0.1 busy split): sets set-busy only, so
     /// the card never shows "Working…" for a set — the tile updates
     /// instantly from the caller's optimistic patch instead. Returns
@@ -6756,7 +6908,10 @@ impl App {
             let _ = tx.send(match res {
                 Ok(crate::hap::SetOutcome::Confirmed(st)) => TstatResult::State(st),
                 Ok(crate::hap::SetOutcome::Optimistic(st)) => TstatResult::StateConfirm(st),
-                Err(e) => TstatResult::SetFailed(format!("Thermostat control failed: {}", e)),
+                Err(e) => TstatResult::SetFailed(format!(
+                    "Thermostat control failed: {}",
+                    Self::humanize_tstat_error(&e.to_string())
+                )),
             });
         });
         true
@@ -11328,7 +11483,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.2");
+        assert_eq!(APP_VERSION, "2.0.3");
     }
 
     #[test]
@@ -11645,6 +11800,165 @@ mod tests {
         let d = parse_device(&merged[0]);
         assert_eq!(d.brightness_pct, Some(30));
         assert_eq!(d.temp_slider, Some(temp_reported_to_slider(5000.0)));
+    }
+
+    // ---------------- v2.0.3: never regress on missing state data ----------------
+
+    #[test]
+    fn merge_restores_data_wholesale_when_fresh_data_missing() {
+        // The Desk Light / whole-dashboard-Off mechanism: a fresh
+        // entry with no data object used to parse to all-defaults
+        // (Off) and poison every later merge (it drops out of
+        // prev_by_id). Now the last-known data is restored whole.
+        let previous = vec![raw_dev(
+            "desk",
+            json!({ "state": "true", "brightness": 180, "color_temp": 5000, "online": true }),
+        )];
+        // No "data" key at all.
+        let fresh_no_data =
+            vec![json!({ "id": "desk", "name": "desk", "dev_type": "light" })];
+        let merged = merge_device_data(fresh_no_data, &previous);
+        let d = parse_device(&merged[0]);
+        assert!(d.state, "state restored, not reset to Off");
+        assert_eq!(d.brightness_pct, Some(18));
+        // Null data restores the same way.
+        let fresh_null_data = vec![json!({ "id": "desk", "name": "desk", "dev_type": "light", "data": null })];
+        let merged = merge_device_data(fresh_null_data, &previous);
+        assert!(parse_device(&merged[0]).state);
+        // A non-object data value restores the same way.
+        let fresh_str_data =
+            vec![json!({ "id": "desk", "name": "desk", "dev_type": "light", "data": "x" })];
+        let merged = merge_device_data(fresh_str_data, &previous);
+        assert!(parse_device(&merged[0]).state);
+    }
+
+    #[test]
+    fn partial_payload_updates_present_keeps_missing() {
+        // One cycle, two lights: A reports an explicit Off (must
+        // update), B arrives with no data at all (must keep On).
+        let previous = vec![
+            raw_dev("a", json!({ "state": true, "brightness": 800 })),
+            raw_dev("b", json!({ "state": true, "brightness": 800 })),
+        ];
+        let fresh = vec![
+            raw_dev("a", json!({ "state": false, "brightness": 800 })),
+            json!({ "id": "b", "name": "b", "dev_type": "light" }),
+        ];
+        let merged = merge_device_data(fresh, &previous);
+        assert!(!parse_device(&merged[0]).state, "explicit Off updates");
+        let db = parse_device(&merged[1]);
+        assert!(db.state, "missing data keeps last-known On");
+        assert_eq!(db.brightness_pct, Some(80));
+    }
+
+    #[test]
+    fn missing_state_diagnostic_names_only_stateless_entries() {
+        let previous = vec![
+            raw_dev("a", json!({ "state": true })),
+            raw_dev("b", json!({ "state": true })),
+            raw_dev("c", json!({ "brightness": 100 })),
+        ];
+        let fresh = vec![
+            json!({ "id": "a", "name": "A Light", "dev_type": "light" }),
+            json!({ "id": "b", "name": "B Light", "dev_type": "light", "data": { "state": false } }),
+            json!({ "id": "c", "name": "C Light", "dev_type": "light", "data": {} }),
+            json!({ "id": "d", "name": "D Light", "dev_type": "light" }),
+        ];
+        // a: previous had state, fresh has no data -> named.
+        // b: fresh carries explicit state -> not named.
+        // c: previous had no state key -> not named.
+        // d: no previous entry -> not named.
+        assert_eq!(
+            devices_with_missing_state(&fresh, &previous),
+            vec!["A Light".to_string()]
+        );
+    }
+
+    #[test]
+    fn login_style_payload_yields_correct_states_for_all_six() {
+        // The user's exact scenario as a fresh (login-style)
+        // payload: all six lights On, Desk Light dim/warm, the
+        // RGB strip colour-only.
+        let payloads = vec![
+            json!({ "id": "desk", "name": "Desk Light", "dev_type": "light", "data": { "state": "true", "brightness": 180, "color_temp": 5000, "online": true } }),
+            json!({ "id": "rgb", "name": "Desk RGB strip", "dev_type": "light", "data": { "state": true, "color_mode": "colour", "hue": 200, "saturation": 0.5, "online": true } }),
+            json!({ "id": "k1", "name": "Kitchen Light 1", "dev_type": "light", "data": { "state": true, "brightness": 1000, "color_temp": 12000, "online": true } }),
+            json!({ "id": "k2", "name": "Kitchen Light 2", "dev_type": "light", "data": { "state": true, "brightness": 1000, "color_temp": 12000, "online": true } }),
+            json!({ "id": "love", "name": "Love's Bed Light", "dev_type": "light", "data": { "state": true, "brightness": 1000, "color_temp": 12000, "online": true } }),
+            json!({ "id": "shawn", "name": "Shawn's Bed Light", "dev_type": "light", "data": { "state": true, "brightness": 1000, "color_temp": 12000, "online": true } }),
+        ];
+        let devices: Vec<Device> = payloads.iter().map(parse_device).collect();
+        assert!(devices.iter().all(|d| d.state), "all six parse On");
+        assert_eq!(devices[0].brightness_pct, Some(18));
+        assert!(devices[1].has_color && !devices[1].has_brightness);
+    }
+
+    #[test]
+    fn set_devices_retains_light_when_merged_lacks_state() {
+        // Poisoned-anchor display case (the Desk Light pattern):
+        // the merged entry carries brightness/temp but no state
+        // key, and the previous raw anchor itself has no data, so
+        // the merge cannot restore. The displayed device must
+        // keep its last-known state, not reset to Off.
+        let on_payload = json!({ "id": "desk", "name": "Desk Light", "dev_type": "light",
+            "data": { "state": "true", "brightness": 180, "color_temp": 5000, "online": true } });
+        let mut app = test_app(vec![parse_device(&on_payload)]);
+        // Simulate the poisoned anchor: raw_devices holds a
+        // data-less entry (as a thin cycle would have stored).
+        app.raw_devices = vec![json!({ "id": "desk", "name": "Desk Light", "dev_type": "light" })];
+        let stateless = json!({ "id": "desk", "name": "Desk Light", "dev_type": "light",
+            "data": { "brightness": 180, "color_temp": 5000, "online": true } });
+        app.set_devices(vec![stateless], false);
+        let d = &app.devices[0];
+        assert!(d.state, "Desk Light keeps last-known On");
+        assert_eq!(d.brightness_pct, Some(18));
+        // The stored entry is the retained raw, so the anchor heals.
+        assert_eq!(
+            app.raw_devices[0]
+                .get("data")
+                .and_then(|v| v.get("state"))
+                .and_then(|v| v.as_str()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn set_devices_retains_light_when_merged_data_missing() {
+        let on_payload = json!({ "id": "desk", "name": "Desk Light", "dev_type": "light",
+            "data": { "state": "true", "brightness": 180, "color_temp": 5000, "online": true } });
+        let mut app = test_app(vec![parse_device(&on_payload)]);
+        app.raw_devices = vec![json!({ "id": "desk", "name": "Desk Light", "dev_type": "light" })];
+        app.set_devices(
+            vec![json!({ "id": "desk", "name": "Desk Light", "dev_type": "light" })],
+            false,
+        );
+        assert!(app.devices[0].state, "data-less entry keeps last-known On");
+    }
+
+    #[test]
+    fn set_devices_explicit_false_still_turns_light_off() {
+        // Genuine Off must flow: an explicit state=false in the
+        // merged entry turns the light off even with a previous On.
+        let on_payload = json!({ "id": "desk", "name": "Desk Light", "dev_type": "light",
+            "data": { "state": "true", "brightness": 180, "color_temp": 5000, "online": true } });
+        let mut app = test_app(vec![parse_device(&on_payload)]);
+        let off = json!({ "id": "desk", "name": "Desk Light", "dev_type": "light",
+            "data": { "state": false, "brightness": 180, "color_temp": 5000, "online": true } });
+        app.set_devices(vec![off], false);
+        assert!(!app.devices[0].state, "explicit Off updates");
+    }
+
+    #[test]
+    fn set_devices_scene_without_state_parses_fresh() {
+        // Scenes are exempt from retention: a scene entry without
+        // state data parses fresh (renames flow) instead of
+        // sticking to the previous parsed scene.
+        let old_scene =
+            json!({ "id": "sc1", "name": "Old Name", "dev_type": "scene", "data": {} });
+        let mut app = test_app(vec![parse_device(&old_scene)]);
+        let renamed = json!({ "id": "sc1", "name": "New Name", "dev_type": "scene" });
+        app.set_devices(vec![renamed], false);
+        assert_eq!(app.devices[0].name, "New Name");
     }
 
     #[test]
@@ -12333,6 +12647,54 @@ mod tests {
             Some("Thermostat control failed: boom")
         );
         assert!(!app.tstat_revert_pending, "queued tap supersedes revert");
+        assert!(app.tstat_pending_set.is_none(), "queued tap drained");
+    }
+
+    #[test]
+    fn humanize_tstat_error_plain_text() {
+        // v2.0.3: the tile must never show a raw OS error dump.
+        let dumped = App::humanize_tstat_error(
+            "network error: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. (os error 10060)",
+        );
+        assert_eq!(
+            dumped,
+            "the thermostat could not be reached — check that it is online and try again"
+        );
+        assert!(!dumped.contains("os error"));
+        assert_eq!(
+            App::humanize_tstat_error("thermostat rejected write(s): 1.2 -> status -70410"),
+            "the thermostat did not accept the change"
+        );
+        assert_eq!(
+            App::humanize_tstat_error("bad accessory response: trailing characters"),
+            "the thermostat did not confirm the change — try again"
+        );
+    }
+
+    #[test]
+    fn thermostat_verified_success_with_queued_tap_drains_no_error() {
+        // v2.0.3: an older set whose PUT response was lost but whose
+        // write verified against the unit arrives as State, not
+        // SetFailed — so a tap queued behind it must never see a
+        // false failure: no error line, and the queued tap drains
+        // (its own result settles the tile next).
+        let mut app = gate_app();
+        app.tstat_set_busy = true;
+        app.tstat_pending_set = Some(crate::hap::ThermostatChanges {
+            target_mode: Some(1),
+            ..Default::default()
+        });
+        app.tstat_tx
+            .send(TstatResult::State(crate::hap::ThermostatState {
+                target_mode: 2,
+                target_temp_c: 25.5,
+                ..Default::default()
+            }))
+            .unwrap();
+        app.poll_net();
+        assert!(!app.tstat_set_busy);
+        assert_eq!(app.tstat_error, None);
+        assert_eq!(app.tstat_state.as_ref().unwrap().target_mode, 2);
         assert!(app.tstat_pending_set.is_none(), "queued tap drained");
     }
 
