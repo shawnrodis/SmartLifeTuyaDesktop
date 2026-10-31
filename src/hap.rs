@@ -90,8 +90,107 @@ fn tstat_log_buf() -> &'static std::sync::Mutex<std::collections::VecDeque<Strin
     BUF.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
+/// Redact credential material from a log line. Two forms are
+/// covered, longest-key-first so `refresh_token=` is never
+/// half-eaten as `token=`:
+/// - `key=value` (query strings, error text): the value runs to
+///   the next delimiter (`&`, whitespace, quote, comma, semicolon,
+///   or end of string). A quoted value keeps its quotes.
+/// - `"key": "value"` (JSON): the value inside the quotes is
+///   replaced, quotes kept.
+/// Key matching is case-insensitive. Everything else passes
+/// through untouched, so ordinary lines (counts, statuses,
+/// durations) are byte-identical after sanitizing.
+pub fn sanitize_log_line(line: &str) -> String {
+    const KEYS: [&str; 3] = ["refresh_token", "access_token", "token"];
+    let lower = line.to_ascii_lowercase();
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // (value_start, json_form) for the first matching form.
+        let mut action: Option<(usize, bool)> = None;
+        for key in KEYS {
+            // Form A: key=...
+            if lower[i..].starts_with(key)
+                && lower[i + key.len()..].starts_with('=')
+            {
+                action = Some((i + key.len() + 1, false));
+                break;
+            }
+            // Form B: "key": "value" (optional spaces after colon).
+            if bytes[i] == b'"'
+                && lower[i + 1..].starts_with(key)
+                && lower[i + 1 + key.len()..].starts_with("\":")
+            {
+                let mut j = i + 1 + key.len() + 2;
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'"' {
+                    action = Some((j + 1, true));
+                    break;
+                }
+            }
+        }
+        match action {
+            Some((value_start, json_form)) => {
+                out.push_str(&line[i..value_start]);
+                if json_form {
+                    let mut j = value_start;
+                    while j < bytes.len() && bytes[j] != b'"' {
+                        j += 1;
+                    }
+                    out.push_str("[redacted]");
+                    if j < bytes.len() {
+                        out.push('"');
+                        j += 1;
+                    }
+                    i = j;
+                } else if value_start < bytes.len()
+                    && (bytes[value_start] == b'"' || bytes[value_start] == b'\'')
+                {
+                    let q = bytes[value_start] as char;
+                    out.push(q);
+                    let mut j = value_start + 1;
+                    while j < bytes.len() && bytes[j] != q as u8 {
+                        j += 1;
+                    }
+                    out.push_str("[redacted]");
+                    if j < bytes.len() {
+                        out.push(q);
+                        j += 1;
+                    }
+                    i = j;
+                } else {
+                    out.push_str("[redacted]");
+                    let mut j = value_start;
+                    while j < bytes.len()
+                        && !matches!(
+                            bytes[j],
+                            b'&' | b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b',' | b';'
+                        )
+                    {
+                        j += 1;
+                    }
+                    i = j;
+                }
+            }
+            None => {
+                let ch_len = line[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                out.push_str(&line[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+    }
+    out
+}
+
 /// Push one timestamped line, evicting the oldest past the cap.
+/// The line is sanitized first, so no call site can leak a token
+/// into the diagnostics buffer by accident.
 pub fn tstat_log(line: &str) {
+    let line = sanitize_log_line(line);
     let stamp = chrono::Local::now().format("%H:%M:%S");
     let mut buf = match tstat_log_buf().lock() {
         Ok(g) => g,
@@ -2360,6 +2459,64 @@ mod tests {
         assert!(set.contains("1.278 -> status -70410"));
         assert!(!set.contains(pin));
         assert!(!set.contains(key_hex));
+    }
+
+    #[test]
+    fn sanitize_log_line_redacts_tokens() {
+        // Query-string form: value runs to & or end of string.
+        assert_eq!(
+            sanitize_log_line("discovery failed: Network error: https://x/auth.do?grant_type=refresh_token&refresh_token=abc123&rand=0.5"),
+            "discovery failed: Network error: https://x/auth.do?grant_type=refresh_token&refresh_token=[redacted]&rand=0.5"
+        );
+        assert_eq!(
+            sanitize_log_line("refresh_token=abc123"),
+            "refresh_token=[redacted]"
+        );
+        // JSON-ish form: value runs to the closing quote.
+        assert_eq!(
+            sanitize_log_line("resp {\"access_token\":\"sekrit\",\"x\":1}"),
+            "resp {\"access_token\":\"[redacted]\",\"x\":1}"
+        );
+        assert_eq!(
+            sanitize_log_line("resp {\"token\": \"sekrit\"}"),
+            "resp {\"token\": \"[redacted]\"}"
+        );
+        // Quoted value in key= form keeps its quotes.
+        assert_eq!(
+            sanitize_log_line("token=\"sekrit\" done"),
+            "token=\"[redacted]\" done"
+        );
+        // Bare token=, and key matching is case-insensitive.
+        assert_eq!(
+            sanitize_log_line("Token=sekrit done"),
+            "Token=[redacted] done"
+        );
+        // Longest-key-first: refresh_token= is not half-eaten.
+        assert_eq!(
+            sanitize_log_line("a refresh_token=zz b"),
+            "a refresh_token=[redacted] b"
+        );
+        // Ordinary lines pass through byte-identical.
+        for plain in [
+            "discovery ok: 6 devices",
+            "discovery rate-limited: streak 2, backoff 120s",
+            "discovery failed: API error: FrequentlyInvoke",
+            "Set: mode=Cool — PUT ok, readback ok (1.2s)",
+        ] {
+            assert_eq!(sanitize_log_line(plain), plain);
+        }
+    }
+
+    #[test]
+    fn tstat_log_sanitizes_on_push() {
+        // Central guarantee: even a call site that passes a raw
+        // error string cannot land token material in the buffer.
+        tstat_log_clear();
+        tstat_log("discovery failed: refresh_token=topsecretvalue");
+        let text = tstat_log_text();
+        assert!(text.contains("refresh_token=[redacted]"));
+        assert!(!text.contains("topsecretvalue"));
+        tstat_log_clear();
     }
 
     #[test]

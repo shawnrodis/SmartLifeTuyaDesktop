@@ -132,6 +132,28 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.2
+
+- **Thermostat section hides until paired, like Cameras.** No section,
+  no card, no "Not paired" text on the dashboard until a thermostat
+  is actually paired. Add one from the editing-mode edit bar's
+  "+ Add thermostat" button (desktop jumps to the Thermostat panel
+  in Settings; web reveals the pairing flow).
+- **Lights refresh heals itself.** When a session goes stale, the app
+  now re-signs in in the background with the saved login and retries
+  — for manual Refresh and autorefresh alike. If no login is saved,
+  the diagnostics log says so plainly instead of freezing silently.
+  Fresh sign-ins now default "Keep me logged in" to on.
+- **Diagnostics log covers Tuya sync too.** Discovery and login
+  outcomes (ok, rate-limited with backoff, failed with the message)
+  are logged alongside the thermostat entries, sanitized so no
+  credentials or tokens ever land in the log.
+- **Thermostat buttons never grey out.** Every tap paints instantly,
+  even while another set is still running or timing out; rapid taps
+  merge so only the latest intent reaches the thermostat, and a
+  failed set still shows its error and snaps back — with buttons
+  live throughout.
+
 ## What's new in 2.0.1
 
 - **Thermostat controls respond instantly.** Tapping a mode button,

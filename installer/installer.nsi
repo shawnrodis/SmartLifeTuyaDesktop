@@ -4,7 +4,7 @@
 ; Add/Remove Programs entry.
 
 !define APP_NAME "Homestead"
-!define APP_VERSION "2.0.1"
+!define APP_VERSION "2.0.2"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/Homestead"
 

@@ -3702,6 +3702,7 @@ fn build_sections(
     layout: &LayoutCfg,
     editing: bool,
     query: &str,
+    thermostat_paired: bool,
 ) -> Vec<Section> {
     let visible: Vec<&CardEntry> = filter_entries(entries, layout, query)
         .into_iter()
@@ -3726,16 +3727,21 @@ fn build_sections(
     // below. An explicit group assignment always wins; unassigned
     // lights land in Lighting, unassigned cameras in Cameras.
     // The thermostat is its own category section: it has no device
-    // ids, is never filtered by search, and always survives the
-    // retain below, so it renders even with no Tuya devices.
-    sections.push(Section {
-        key: "thermostat".into(),
-        order_key: "thermostat".into(),
-        title: "Thermostat".into(),
-        kind: SectionKind::Thermostat,
-        group_id: None,
-        ids: Vec::new(),
-    });
+    // ids and is never filtered by search — but like Cameras, it
+    // only exists once a thermostat is actually paired. Until
+    // then there is no section, no card, and no "Not paired"
+    // text on the dashboard; the edit bar's "+ Add thermostat"
+    // button is the entry point to pairing.
+    if thermostat_paired {
+        sections.push(Section {
+            key: "thermostat".into(),
+            order_key: "thermostat".into(),
+            title: "Thermostat".into(),
+            kind: SectionKind::Thermostat,
+            group_id: None,
+            ids: Vec::new(),
+        });
+    }
     let cameras_sec: Vec<&CardEntry> = normal
         .iter()
         .filter(|d| !assigned(d) && d.camera)
@@ -3815,6 +3821,8 @@ fn build_sections(
     order_sections(&mut sections, &layout.section_seq);
     sections.retain(|s| {
         !s.ids.is_empty()
+            // The thermostat has no device ids by design; it is
+            // kept exactly when it was pushed (paired) above.
             || s.kind == SectionKind::Thermostat
             || (editing
                 && (s.kind == SectionKind::Group
@@ -4150,6 +4158,14 @@ fn net_discovery(
         if is_rate_limit_code(code) {
             return Err(DiscoveryFail::Frequent);
         }
+        // A dead session surfaces here as a token/auth code (the
+        // access token was revoked or expired server-side, e.g. by
+        // a sign-in on another install). Classified separately so
+        // the worker can background re-auth instead of treating it
+        // like a generic failure (v2.0.2).
+        if is_auth_failure_code(code) {
+            return Err(DiscoveryFail::Auth(format!("API error: {}", code)));
+        }
     }
     if let Some(devs) = json
         .get("payload")
@@ -4169,6 +4185,10 @@ fn net_discovery(
 enum DiscoveryFail {
     Frequent,
     Msg(String),
+    /// The skill response says the session itself is dead
+    /// (revoked/expired token). Unlike Msg, this is always worth a
+    /// background re-login with saved credentials (v2.0.2).
+    Auth(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -4186,6 +4206,31 @@ fn is_rate_limit_code(code: &str) -> bool {
     code.eq_ignore_ascii_case("FrequentlyInvoke")
         || code.eq_ignore_ascii_case("TooManyRequests")
         || code.to_ascii_lowercase().contains("frequent")
+}
+
+/// True when a skill-response header code means the session is dead
+/// (revoked/expired token), as opposed to rate limiting or a generic
+/// failure. Discovery calls carry no device id, so a token/auth code
+/// here can only be about the session itself. Deliberately narrow:
+/// a code like InvalidDeviceId is not an auth failure.
+fn is_auth_failure_code(code: &str) -> bool {
+    let c = code.to_ascii_lowercase();
+    c.contains("token")
+        || c.contains("auth")
+        || c.contains("session")
+        || c.contains("login")
+        || c.contains("unauthorized")
+        || c.contains("expired")
+        || c.contains("permission")
+}
+
+/// True when a DiscErr should carry the no-saved-login hint:
+/// "Session expired" is returned by fresh_session exactly when the
+/// refresh token is dead and no saved credentials exist to re-login
+/// with, so that message with no saved login names the gate that
+/// makes background re-auth impossible.
+fn session_expired_hint_needed(err: &str, has_saved_creds: bool) -> bool {
+    err == "Session expired" && !has_saved_creds
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -4613,12 +4658,18 @@ struct App {
     /// below, so tile taps never show the indicator.)
     tstat_busy: bool,
     /// Set-busy (v2.0.1 split): a tile or bridge set is running.
-    /// Serialization only — it never shows "Working…" anywhere.
-    /// The card's buttons stay disabled while it is set, so
-    /// overlapping sets stay blocked exactly as before; the tile
-    /// itself updates instantly from the optimistic patch instead
-    /// of waiting for the round-trip.
+    /// Serialization only — it never shows "Working…" anywhere
+    /// and never disables a button (v2.0.2): overlapping taps
+    /// paint at once and queue in `tstat_pending_set` below
+    /// instead of being dropped, and the tile itself updates
+    /// instantly from the optimistic patch instead of waiting
+    /// for the round-trip.
     tstat_set_busy: bool,
+    /// Queued tile tap (v2.0.2 never-disable rule): the latest
+    /// tap that arrived while an operation was running, merged
+    /// last-write-wins per field, sent by
+    /// `drain_tstat_pending_set` as soon as the channel is free.
+    tstat_pending_set: Option<crate::hap::ThermostatChanges>,
     /// Set-failure revert guard (v2.0.1): true from a SetFailed
     /// result until the prompt re-fetch it triggers resolves. While
     /// set, a Fetched/FetchFailed result reverts the tile's state
@@ -4628,8 +4679,8 @@ struct App {
     /// Fetch-busy (v1.6.4 split): a status fetch is running
     /// (autorefresh, manual Refresh, post-pairing, bridge Status,
     /// optimistic re-fetch). Fetches are silent: no "Working…"
-    /// text anywhere, though the Refresh button stays disabled
-    /// while one runs. All three flags together keep operations
+    /// text anywhere, and the Refresh button stays enabled while
+    /// one runs (v2.0.2). All three flags together keep operations
     /// serialized exactly as the single flag did before.
     tstat_fetch_busy: bool,
     tstat_state: Option<crate::hap::ThermostatState>,
@@ -4645,6 +4696,11 @@ struct App {
     tstat_tx: Sender<TstatResult>,
     tstat_rx: Receiver<TstatResult>,
     tstat_last_fetch: Option<Instant>,
+    /// Jump-to-Thermostat request for Settings (v2.0.2): set by
+    /// the edit bar's "+ Add thermostat" button; consumed by
+    /// view_settings, which scrolls the Thermostat (HomeKit)
+    /// panel into view once, then clears it.
+    settings_jump_thermostat: bool,
     /// Web-edition bridge requests (see bridge.rs). Drained once per
     /// frame in poll_net and answered through the same thermostat
     /// spawns as the desktop tile — never a parallel session.
@@ -4774,7 +4830,7 @@ impl App {
             li_pass: String::new(),
             li_region: "1".to_string(),
             li_platform: "smart_life".to_string(),
-            li_keep: false,
+            li_keep: true,
             login_error: None,
             query: String::new(),
             editing: false,
@@ -4827,6 +4883,7 @@ impl App {
             tstat_setup_code: String::new(),
             tstat_busy: false,
             tstat_set_busy: false,
+            tstat_pending_set: None,
             tstat_revert_pending: false,
             tstat_fetch_busy: false,
             tstat_state: None,
@@ -4836,6 +4893,7 @@ impl App {
             tstat_tx,
             tstat_rx,
             tstat_last_fetch: None,
+            settings_jump_thermostat: false,
             bridge_rx,
             bridge_pending: None,
         };
@@ -5007,7 +5065,7 @@ impl App {
                 Ok(session) => match net_discovery(&client, &session, &prefs, &previous) {
                     Ok(devices) => NetResult::LoginOk { session, devices },
                     Err(DiscoveryFail::Frequent) => NetResult::LoginOk { session, devices: Vec::new() },
-                    Err(DiscoveryFail::Msg(e)) => NetResult::LoginErr(e),
+                    Err(DiscoveryFail::Msg(e)) | Err(DiscoveryFail::Auth(e)) => NetResult::LoginErr(e),
                 },
                 Err(e) => NetResult::LoginErr(e),
             };
@@ -5016,8 +5074,15 @@ impl App {
     }
 
     fn spawn_discovery(&mut self, force: bool) {
-        let Some(session) = self.session.clone() else { return };
+        let Some(session) = self.session.clone() else {
+            // Diagnostics (v2.0.2): a skipped cycle must name its
+            // gate in the log — a silent early return here looks
+            // exactly like a frozen dashboard otherwise.
+            crate::hap::tstat_log("discovery skipped: no session");
+            return;
+        };
         if self.disc_busy {
+            crate::hap::tstat_log("discovery skipped: already running");
             return;
         }
         self.disc_busy = true;
@@ -5031,6 +5096,54 @@ impl App {
                 Ok(s1) => match net_discovery(&client, &s1, &prefs, &previous) {
                     Ok(devices) => NetResult::DiscOk { session: s1, devices },
                     Err(DiscoveryFail::Frequent) => NetResult::DiscFrequent { session: s1 },
+                    Err(DiscoveryFail::Auth(e)) => {
+                        // Background re-auth (v2.0.2): the session
+                        // is dead, so simulate sign-out/sign-in — a
+                        // full login with the saved credentials,
+                        // skipping the refresh token (which is what
+                        // just failed). One attempt, then one
+                        // retry; never a loop. No sign-in form is
+                        // ever shown on this path.
+                        crate::hap::tstat_log(&format!(
+                            "discovery auth failure: {e} — background re-login"
+                        ));
+                        match &creds {
+                            Some((c, pw)) => match net_auth(&client, c, pw, &prefs) {
+                                Ok(s2) => {
+                                    crate::hap::tstat_log(
+                                        "background re-login ok — retrying discovery",
+                                    );
+                                    match net_discovery(&client, &s2, &prefs, &previous) {
+                                        Ok(devices) => {
+                                            NetResult::DiscOk { session: s2, devices }
+                                        }
+                                        Err(DiscoveryFail::Frequent) => {
+                                            NetResult::DiscFrequent { session: s2 }
+                                        }
+                                        Err(DiscoveryFail::Auth(e2))
+                                        | Err(DiscoveryFail::Msg(e2)) => {
+                                            crate::hap::tstat_log(&format!(
+                                                "discovery failed after background re-login: {e2}"
+                                            ));
+                                            NetResult::DiscErr(e2)
+                                        }
+                                    }
+                                }
+                                Err(ae) => {
+                                    crate::hap::tstat_log(&format!(
+                                        "background re-login failed: {ae}"
+                                    ));
+                                    NetResult::DiscErr(e)
+                                }
+                            },
+                            None => {
+                                crate::hap::tstat_log(
+                                    "session expired, no saved login — background re-auth unavailable (sign in again with Keep me logged in)",
+                                );
+                                NetResult::DiscErr(e)
+                            }
+                        }
+                    }
                     Err(DiscoveryFail::Msg(e)) => {
                         // One retry after a forced re-auth (like the web edition).
                         match fresh_session(&client, &s1, &creds, &prefs, true) {
@@ -5040,6 +5153,7 @@ impl App {
                                     NetResult::DiscFrequent { session: s2 }
                                 }
                                 Err(DiscoveryFail::Msg(e2)) => NetResult::DiscErr(e2),
+                                Err(DiscoveryFail::Auth(e2)) => NetResult::DiscErr(e2),
                             },
                             Err(_) => NetResult::DiscErr(e),
                         }
@@ -6385,7 +6499,7 @@ impl App {
     /// ~1 s inside net_control (that wait is its extra spacing), so
     /// the summary only ever names genuine failures (v1.2.0).
     fn group_broadcast(&mut self, sec: &Section, kind: GroupKind, num: i64, hex: Option<String>) {
-        let full = build_sections(&self.all_entries(), &self.cfg.layout, self.editing, "");
+        let full = build_sections(&self.all_entries(), &self.cfg.layout, self.editing, "", self.cfg.thermostat.is_some());
         let Some(fsec) = full.iter().find(|s| s.key == sec.key) else { return };
         let members: Vec<Device> = fsec
             .ids
@@ -6455,7 +6569,7 @@ impl App {
     /// effective refresh interval instead. The backoff grows with
     /// consecutive hits (interval ×2, ×4, ×8; at least 60 s, at most
     /// 5 min) and resets on the next successful fetch.
-    fn note_rate_limited(&mut self) {
+    fn note_rate_limited(&mut self) -> u64 {
         self.disc_freq_streak = self.disc_freq_streak.saturating_add(1);
         let shift = self.disc_freq_streak.min(3);
         let secs = self
@@ -6466,6 +6580,7 @@ impl App {
             .max(60)
             .min(300);
         self.disc_backoff_until = Some(Instant::now() + Duration::from_secs(secs));
+        secs
     }
 
     // ---------------- thermostat (HomeKit/HAP) spawns ----------------
@@ -6562,28 +6677,71 @@ impl App {
         true
     }
 
-    /// Tile tap helper (v2.0.1): spawn a thermostat set and, when it
-    /// spawns, patch local state at once so the tile shows the tapped
-    /// mode/setpoint/fan immediately instead of waiting for the
-    /// round-trip. The authoritative result replaces the patch when
-    /// it arrives, and a real failure reverts it via re-fetch. A
-    /// blocked tap (another operation running) patches nothing, so
-    /// the tile never paints a change that was never sent.
+    /// Tile tap helper (v2.0.2 never-disable rule): a tap ALWAYS
+    /// paints at once, even while a set, fetch, or discovery is
+    /// running — the buttons never grey out and taps are never
+    /// dropped. When the channel is free the set spawns at once;
+    /// when it is busy the tap merges into `tstat_pending_set`
+    /// (last-write-wins per field) and goes out as soon as the
+    /// running operation clears. The authoritative result replaces
+    /// the patch when it arrives, and a real failure with no
+    /// queued tap reverts it via re-fetch.
     fn tstat_tap(&mut self, changes: crate::hap::ThermostatChanges) {
-        if self.spawn_tstat_set(changes.clone()) {
-            if let Some(st) = self.tstat_state.as_mut() {
-                crate::hap::apply_changes_to_state(st, &changes);
-            }
-            self.tstat_error = None;
+        if let Some(st) = self.tstat_state.as_mut() {
+            crate::hap::apply_changes_to_state(st, &changes);
+        }
+        self.tstat_error = None;
+        if !self.spawn_tstat_set(changes.clone()) {
+            self.tstat_pending_set = Some(match self.tstat_pending_set.take() {
+                Some(pending) => Self::merge_tstat_pending(pending, changes),
+                None => changes,
+            });
+        }
+    }
+
+    /// Merge a queued tap into the pending intent (v2.0.2): later
+    /// taps win per field, untouched fields carry over — so a mode
+    /// tap followed by a setpoint tap while a set is in flight
+    /// sends both, not just the last tap's single field.
+    fn merge_tstat_pending(
+        base: crate::hap::ThermostatChanges,
+        overlay: crate::hap::ThermostatChanges,
+    ) -> crate::hap::ThermostatChanges {
+        crate::hap::ThermostatChanges {
+            target_mode: overlay.target_mode.or(base.target_mode),
+            target_temp_c: overlay.target_temp_c.or(base.target_temp_c),
+            heat_to_c: overlay.heat_to_c.or(base.heat_to_c),
+            cool_to_c: overlay.cool_to_c.or(base.cool_to_c),
+            fan_on: overlay.fan_on.or(base.fan_on),
+        }
+    }
+
+    /// Send the queued tile tap, if any, once the channel is free
+    /// (v2.0.2): no operation running, no bridge job outstanding,
+    /// and no pairing session open — a set must never interleave
+    /// with pair-setup. Called after every thermostat result is
+    /// handled, so a tap queued during a slow or timing-out set
+    /// goes out the moment that set resolves.
+    fn drain_tstat_pending_set(&mut self) {
+        if self.tstat_busy
+            || self.tstat_fetch_busy
+            || self.tstat_set_busy
+            || self.bridge_pending.is_some()
+            || self.tstat_pending.is_some()
+        {
+            return;
+        }
+        if let Some(changes) = self.tstat_pending_set.take() {
+            let _ = self.spawn_tstat_set(changes);
         }
     }
 
     /// Tile/bridge set (v2.0.1 busy split): sets set-busy only, so
     /// the card never shows "Working…" for a set — the tile updates
     /// instantly from the caller's optimistic patch instead. Returns
-    /// true when the set actually spawned; the tile handler patches
-    /// local state only on true, so a blocked tap never paints a
-    /// change that was never sent.
+    /// true when the set actually spawned; a false return means
+    /// the tile handler queues the tap in `tstat_pending_set`
+    /// (v2.0.2) instead of dropping it.
     fn spawn_tstat_set(&mut self, changes: crate::hap::ThermostatChanges) -> bool {
         if self.tstat_busy || self.tstat_fetch_busy || self.tstat_set_busy {
             return false;
@@ -6835,10 +6993,13 @@ impl App {
                 TstatResult::StateConfirm(st) => {
                     // Optimistic set: the PUT applied, the readback
                     // didn't. Show the intended state now, then
-                    // re-fetch promptly to confirm against the unit.
-                    // The re-fetch always spawns here: the set just
-                    // cleared set-busy and no fetch can be running
-                    // (operations are serialized across all flags).
+                    // re-fetch promptly to confirm against the unit,
+                    // unless a tap was queued while the set ran (the
+                    // drain after this message sends it instead).
+                    // The re-fetch spawns here only with no queued
+                    // tap: the set just cleared set-busy and no
+                    // fetch can be running (operations are
+                    // serialized across all flags).
                     self.tstat_set_busy = false;
                     self.tstat_revert_pending = false;
                     self.tstat_error = None;
@@ -6854,19 +7015,26 @@ impl App {
                         }
                         other => self.bridge_pending = other,
                     }
-                    let _ = self.spawn_tstat_fetch();
+                    // A queued tap supersedes the confirm re-fetch:
+                    // the drain after this message sends it, and its
+                    // result is authoritative. Otherwise re-fetch to
+                    // confirm the optimistic state against the unit.
+                    if self.tstat_pending_set.is_none() {
+                        let _ = self.spawn_tstat_fetch();
+                    }
                 }
                 TstatResult::SetFailed(e) => {
                     // A real set failure: the tile keeps the error
                     // line, and a prompt re-fetch reverts any
                     // optimistic patch to the unit's true state
                     // instead of waiting for the next autorefresh.
-                    // The re-fetch always spawns here: the set just
-                    // cleared set-busy and no fetch can be running
-                    // (operations are serialized across all flags).
+                    // The re-fetch always spawns here, unless a tap
+                    // was queued while the set ran: then the drain
+                    // after this message sends it instead, and its
+                    // result is authoritative (if it fails, its own
+                    // SetFailed arms the revert then).
                     self.tstat_set_busy = false;
                     self.tstat_error = Some(e.clone());
-                    self.tstat_revert_pending = true;
                     match self.bridge_pending.take() {
                         Some(bp) => {
                             let mut body = json!({ "error": e });
@@ -6880,7 +7048,10 @@ impl App {
                         }
                         None => {}
                     }
-                    let _ = self.spawn_tstat_fetch();
+                    if self.tstat_pending_set.is_none() {
+                        self.tstat_revert_pending = true;
+                        let _ = self.spawn_tstat_fetch();
+                    }
                 }
                 TstatResult::Failed(e) => {
                     self.tstat_busy = false;
@@ -6912,6 +7083,9 @@ impl App {
                     }
                 }
             }
+            // A queued tile tap goes out as soon as the operation
+            // that blocked it clears (v2.0.2 never-disable rule).
+            self.drain_tstat_pending_set();
         }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -6929,15 +7103,21 @@ impl App {
                         // silent (v1.2.0) — cached devices (if any) are
                         // already on screen, and the backoff lets
                         // autorefresh quietly fill the list in.
-                        self.note_rate_limited();
+                        let secs = self.note_rate_limited();
+                        crate::hap::tstat_log(&format!(
+                            "login rate-limited: streak {}, backoff {}s",
+                            self.disc_freq_streak, secs
+                        ));
                         self.save();
                     } else {
+                        crate::hap::tstat_log(&format!("login ok: {} devices", devices.len()));
                         self.set_devices(devices, true);
                     }
                 }
                 NetResult::LoginErr(e) => {
                     self.login_busy = false;
                     self.pending_login = None;
+                    crate::hap::tstat_log(&format!("login failed: {e}"));
                     if self.view == View::Login {
                         self.login_error = Some(e);
                     } else {
@@ -6950,6 +7130,7 @@ impl App {
                     self.disc_backoff_until = None;
                     self.session = Some(session.clone());
                     self.cfg.session = Some(session);
+                    crate::hap::tstat_log(&format!("discovery ok: {} devices", devices.len()));
                     self.set_devices(devices, true);
                 }
                 NetResult::DiscFrequent { session } => {
@@ -6959,13 +7140,33 @@ impl App {
                     self.save();
                     // Silent (v1.2.0): keep showing the last known
                     // states and back off internally — no toast.
-                    self.note_rate_limited();
+                    // The diagnostics log still names the gate, so a
+                    // frozen dashboard is diagnosable (v2.0.2).
+                    let secs = self.note_rate_limited();
+                    crate::hap::tstat_log(&format!(
+                        "discovery rate-limited: streak {}, backoff {}s",
+                        self.disc_freq_streak, secs
+                    ));
                     if !self.devices.is_empty() {
                         self.last_fetch = Some(Instant::now());
                     }
                 }
                 NetResult::DiscErr(e) => {
                     self.disc_busy = false;
+                    crate::hap::tstat_log(&format!("discovery failed: {e}"));
+                    // A "Session expired" here came from
+                    // fresh_session, which returns it exactly when
+                    // the refresh token is dead and no saved login
+                    // exists to re-login with — so with no saved
+                    // login the log must name that gate instead of
+                    // leaving a frozen dashboard unexplained
+                    // (v2.0.2). No sign-in form is popped: the
+                    // dashboard stays up and the next cycle retries.
+                    if session_expired_hint_needed(&e, self.cfg.creds.is_some()) {
+                        crate::hap::tstat_log(
+                            "session expired, no saved login — background re-auth unavailable (sign in again with Keep me logged in)",
+                        );
+                    }
                     self.toast(e, true);
                 }
                 NetResult::ControlDone { id, ok, backup, announce } => {
@@ -7400,6 +7601,11 @@ impl App {
                             if ui.add(Button::new("+ Add camera")).clicked() {
                                 self.open_camera_form(None);
                             }
+                            if self.cfg.thermostat.is_none()
+                                && ui.add(Button::new("+ Add thermostat")).clicked()
+                            {
+                                self.open_thermostat_settings();
+                            }
                             if ui.add(Button::new("+ New group")).clicked() {
                                 self.new_group = Some(String::new());
                             }
@@ -7407,6 +7613,15 @@ impl App {
                     });
                 });
         }
+    }
+
+    /// Open Settings scrolled to the Thermostat (HomeKit) panel
+    /// (v2.0.2): the edit bar's "+ Add thermostat" button. The
+    /// jump itself happens in view_settings, which scrolls the
+    /// panel into view once and clears the flag.
+    fn open_thermostat_settings(&mut self) {
+        self.view = View::Settings;
+        self.settings_jump_thermostat = true;
     }
 
     fn set_editing(&mut self, on: bool) {
@@ -7438,9 +7653,6 @@ impl App {
     /// name order".
     fn thermostat_section_view(&mut self, ui: &mut Ui, sec_idx: usize, sec_total: usize) {
         let paired = self.cfg.thermostat.is_some();
-        let busy = self.tstat_busy;
-        let set_busy = self.tstat_set_busy;
-        let fetch_busy = self.tstat_fetch_busy;
         let collapsed = self
             .cfg
             .layout
@@ -7479,7 +7691,7 @@ impl App {
                     }
                 }
                 if ui
-                    .add_enabled(paired && !busy && !set_busy && !fetch_busy, Button::new("↻ Refresh"))
+                    .add_enabled(paired, Button::new("↻ Refresh"))
                     .clicked()
                 {
                     self.spawn_tstat_fetch();
@@ -7519,12 +7731,12 @@ impl App {
     fn thermostat_card(&mut self, ui: &mut Ui) {
         let pal = self.pal();
         // Snapshot what the UI needs so button clicks below can spawn
-        // threads without borrow fights. `busy` gates the buttons
-        // (a set or a pairing/discovery blocks new taps); only the
-        // action flag shows "Working…" — sets are silent since
+        // threads without borrow fights. The buttons are never
+        // gated (v2.0.2): a tap always paints at once and queues
+        // behind a running operation instead of greying out; only
+        // the action flag shows "Working…" — sets are silent since
         // v2.0.1 (the tile patches instantly instead).
         let paired = self.cfg.thermostat.is_some();
-        let busy = self.tstat_busy || self.tstat_set_busy;
         let action_busy = self.tstat_busy;
         let state = self.tstat_state.clone();
         let error = self.tstat_error.clone();
@@ -7576,9 +7788,9 @@ impl App {
                         };
                         let btn = Button::new(text);
                         let resp = if selected {
-                            ui.add_enabled(!busy, btn.fill(self.accent()))
+                            ui.add(btn.fill(self.accent()))
                         } else {
-                            ui.add_enabled(!busy, btn)
+                            ui.add(btn)
                         };
                         if resp.clicked() {
                             self.tstat_tap(crate::hap::ThermostatChanges {
@@ -7600,7 +7812,7 @@ impl App {
                                 ))
                                 .size(14.0),
                             );
-                            if ui.add_enabled(!busy, Button::new("−")).clicked() {
+                            if ui.add(Button::new("−")).clicked() {
                                 self.tstat_tap(crate::hap::ThermostatChanges {
                                     heat_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(heat) - 1.0,
@@ -7608,7 +7820,7 @@ impl App {
                                     ..Default::default()
                                 });
                             }
-                            if ui.add_enabled(!busy, Button::new("+")).clicked() {
+                            if ui.add(Button::new("+")).clicked() {
                                 self.tstat_tap(crate::hap::ThermostatChanges {
                                     heat_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(heat) + 1.0,
@@ -7627,7 +7839,7 @@ impl App {
                                 ))
                                 .size(14.0),
                             );
-                            if ui.add_enabled(!busy, Button::new("−")).clicked() {
+                            if ui.add(Button::new("−")).clicked() {
                                 self.tstat_tap(crate::hap::ThermostatChanges {
                                     cool_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(cool) - 1.0,
@@ -7635,7 +7847,7 @@ impl App {
                                     ..Default::default()
                                 });
                             }
-                            if ui.add_enabled(!busy, Button::new("+")).clicked() {
+                            if ui.add(Button::new("+")).clicked() {
                                 self.tstat_tap(crate::hap::ThermostatChanges {
                                     cool_to_c: Some(crate::hap::f_to_c(
                                         crate::hap::c_to_f(cool) + 1.0,
@@ -7650,13 +7862,13 @@ impl App {
                         ui.label(
                             RichText::new(format!("Setpoint {:.0}°F", set_f)).size(14.0),
                         );
-                        if ui.add_enabled(!busy, Button::new("−")).clicked() {
+                        if ui.add(Button::new("−")).clicked() {
                             self.tstat_tap(crate::hap::ThermostatChanges {
                                 target_temp_c: Some(crate::hap::f_to_c(set_f - 1.0)),
                                 ..Default::default()
                             });
                         }
-                        if ui.add_enabled(!busy, Button::new("+")).clicked() {
+                        if ui.add(Button::new("+")).clicked() {
                             self.tstat_tap(crate::hap::ThermostatChanges {
                                 target_temp_c: Some(crate::hap::f_to_c(set_f + 1.0)),
                                 ..Default::default()
@@ -7677,9 +7889,9 @@ impl App {
                             };
                             let btn = Button::new(text);
                             let resp = if selected {
-                                ui.add_enabled(!busy, btn.fill(self.accent()))
+                                ui.add(btn.fill(self.accent()))
                             } else {
-                                ui.add_enabled(!busy, btn)
+                                ui.add(btn)
                             };
                             if resp.clicked() {
                                 self.tstat_tap(crate::hap::ThermostatChanges {
@@ -7696,7 +7908,7 @@ impl App {
     fn view_dashboard(&mut self, ui: &mut Ui) {
         let pal = self.pal();
         let entries = self.all_entries();
-        let sections = build_sections(&entries, &self.cfg.layout, self.editing, &self.query);
+        let sections = build_sections(&entries, &self.cfg.layout, self.editing, &self.query, self.cfg.thermostat.is_some());
         self.sections_cache = sections.clone();
         // Geometry maps are rebuilt by section_view below; update_drag
         // has already consumed last frame's rects in this update pass.
@@ -7782,11 +7994,13 @@ impl App {
                 }
                 // The thermostat renders in sequence position via
                 // the sections loop below (it is a section like any
-                // other, not a fixed block above them).
+                // other, not a fixed block above them) — but only
+                // when paired; until then it is absent entirely.
                 let avail = ui.available_width();
                 if self.devices.is_empty() && self.cfg.cameras.is_empty() {
                     // No Tuya devices at all: the thermostat section
-                    // still renders, then the empty note.
+                    // renders here too when paired, then the empty
+                    // note; when unpaired only the note shows.
                     for sec in &sections {
                         if sec.kind == SectionKind::Thermostat {
                             self.section_view(ui, sec, avail);
@@ -7802,9 +8016,13 @@ impl App {
                     });
                     return;
                 }
-                if sections.iter().all(|s| s.kind == SectionKind::Thermostat) {
-                    // Only the thermostat survived (e.g. the search
-                    // matched no device): show it, then the note.
+                if sections.is_empty()
+                    || sections.iter().all(|s| s.kind == SectionKind::Thermostat)
+                {
+                    // Nothing survived: either the search matched no
+                    // device (the paired thermostat still shows, the
+                    // unpaired dashboard shows only the note), or
+                    // every device section was filtered out.
                     for sec in &sections {
                         self.section_view(ui, sec, avail);
                     }
@@ -7830,7 +8048,7 @@ impl App {
         if sec.kind != SectionKind::Lighting && sec.kind != SectionKind::Group {
             return;
         }
-        let full = build_sections(&self.all_entries(), &self.cfg.layout, self.editing, "");
+        let full = build_sections(&self.all_entries(), &self.cfg.layout, self.editing, "", self.cfg.thermostat.is_some());
         let Some(fsec) = full.iter().find(|s| s.key == sec.key) else { return };
         let members: Vec<Device> = fsec
             .ids
@@ -9739,6 +9957,7 @@ impl App {
                             }
                         });
                         // ---- Thermostat (HomeKit) ----
+                        let tstat_panel_top = ui.cursor().top();
                         Self::settings_panel(ui, &pal, "Thermostat (HomeKit)", |ui| {
                             ui.label(
                                 RichText::new("Control a HomeKit thermostat (e.g. the Resideo T6 Pro) directly over your home network — no cloud, no account. This works only while this computer is on the same home network as the thermostat; away from home, use the Resideo app or Alexa.")
@@ -9952,6 +10171,20 @@ impl App {
                                 );
                             });
                         });
+                        if self.settings_jump_thermostat {
+                            // One-shot jump (v2.0.2): the edit bar's
+                            // "+ Add thermostat" button asked for
+                            // this panel. Scroll it to the top of
+                            // the Settings view, then clear the
+                            // flag (scroll_to_rect applies via the
+                            // scroll target on the next frame).
+                            self.settings_jump_thermostat = false;
+                            let rect = egui::Rect::from_min_max(
+                                egui::pos2(0.0, tstat_panel_top),
+                                egui::pos2(ui.available_width(), ui.cursor().top()),
+                            );
+                            ui.scroll_to_rect(rect, Some(Align::TOP));
+                        }
                         // ---- Hidden devices ----
                         Self::settings_panel(ui, &pal, "Hidden devices", |ui| {
                             ui.label(
@@ -10743,7 +10976,7 @@ mod tests {
         let plug = dev("p1", "Plug", json!({ "state": false }));
         let c = cam("tapo1", "");
         let entries = vec![device_entry(&b), device_entry(&plug), camera_entry(&c)];
-        let secs = build_sections(&entries, &LayoutCfg::default(), false, "");
+        let secs = build_sections(&entries, &LayoutCfg::default(), false, "", true);
         // Default section order: the Thermostat section first, then
         // Cameras, Lighting, Ungrouped.
         assert_eq!(keys(&secs), vec!["thermostat", "cameras", "lighting", "ungrouped"]);
@@ -10766,7 +10999,7 @@ mod tests {
         layout.assign.insert("lb".into(), "g1".into());
         layout.assign.insert("cam:1".into(), "g1".into());
         let entries = vec![device_entry(&b), camera_entry(&c)];
-        let secs = build_sections(&entries, &layout, false, "");
+        let secs = build_sections(&entries, &layout, false, "", true);
         assert_eq!(keys(&secs), vec!["thermostat", "g1"]);
         assert_eq!(secs[1].ids.len(), 2);
     }
@@ -11095,7 +11328,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.1");
+        assert_eq!(APP_VERSION, "2.0.2");
     }
 
     #[test]
@@ -11150,6 +11383,7 @@ mod tests {
         // Tuya's burst answer, in its exact spelling and variants.
         assert!(is_rate_limit_code("FrequentlyInvoke"));
         assert!(is_rate_limit_code("frequentlyinvoke"));
+        assert!(is_rate_limit_code("FREQUENTLYINVOKE"));
         assert!(is_rate_limit_code("TooManyRequests"));
         assert!(!is_rate_limit_code("SUCCESS"));
         assert!(!is_rate_limit_code("DEVICE_OFFLINE"));
@@ -11586,7 +11820,7 @@ mod tests {
     #[test]
     fn section_order_default_thermostat_first() {
         let layout = grouped_layout();
-        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        let secs = build_sections(&full_entry_set(), &layout, false, "", true);
         assert_eq!(
             keys(&secs),
             vec!["thermostat", "cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
@@ -11607,7 +11841,7 @@ mod tests {
             "lighting".into(),
             "cameras".into(),
         ];
-        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        let secs = build_sections(&full_entry_set(), &layout, false, "", true);
         // The thermostat is missing from the stored order, so it
         // slots first (no default-order predecessor); the rest
         // keeps the stored order.
@@ -11621,7 +11855,7 @@ mod tests {
         // slots in by the default order around them.
         let mut layout = grouped_layout();
         layout.section_seq = vec!["scenes".into(), "lighting".into()];
-        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        let secs = build_sections(&full_entry_set(), &layout, false, "", true);
         // thermostat (front, no predecessor) → cameras (after
         // thermostat) → pinned (after cameras) → scenes → lighting
         // (stored relative order) → group (after lighting) →
@@ -11637,7 +11871,7 @@ mod tests {
         // Moving within the RENDERED list, ends are no-ops, and the
         // result survives a serde round-trip of the whole layout.
         let mut layout = grouped_layout();
-        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        let secs = build_sections(&full_entry_set(), &layout, false, "", true);
         assert_eq!(
             keys(&secs),
             vec!["thermostat", "cameras", "pinned", "lighting", "g1", "ungrouped", "scenes"]
@@ -11666,7 +11900,7 @@ mod tests {
         let mut layout2 = LayoutCfg::default();
         layout2.assign.insert("p1".into(), "g1".into());
         layout2.groups.push(Group { id: "g1".into(), name: "Kitchen".into() });
-        let secs_no_pins = build_sections(&full_entry_set(), &layout2, false, "");
+        let secs_no_pins = build_sections(&full_entry_set(), &layout2, false, "", true);
         let with_extra = vec!["pinned".to_string()];
         let seq4 = moved_section_seq(&with_extra, &secs_no_pins, "cameras", 1);
         assert_eq!(seq4.last().map(|s| s.as_str()), Some("pinned"));
@@ -11680,7 +11914,7 @@ mod tests {
         // And a rebuild with the round-tripped layout honours it:
         // the thermostat stays on top, pinned has moved with the
         // bulb, ungrouped sits above g1.
-        let secs2 = build_sections(&full_entry_set(), &back, false, "");
+        let secs2 = build_sections(&full_entry_set(), &back, false, "", true);
         assert_eq!(
             keys(&secs2),
             vec!["thermostat", "cameras", "pinned", "lighting", "ungrouped", "g1", "scenes"]
@@ -11721,7 +11955,7 @@ mod tests {
             "ungrouped".into(),
             "scenes".into(),
         ];
-        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        let secs = build_sections(&full_entry_set(), &layout, false, "", true);
         assert_eq!(secs[0].key, "thermostat");
         // First position: ↑ disabled, ↓ enabled (the header's
         // add_enabled conditions: sec_idx > 0 / sec_idx + 1 < total).
@@ -11734,7 +11968,7 @@ mod tests {
         // moving back up restores it to first.
         let mut layout2 = grouped_layout();
         layout2.section_seq = down.clone();
-        let secs2 = build_sections(&full_entry_set(), &layout2, false, "");
+        let secs2 = build_sections(&full_entry_set(), &layout2, false, "", true);
         assert_eq!(secs2[1].key, "thermostat");
         let back = moved_section_seq(&down, &secs2, "thermostat", -1);
         assert_eq!(back[0], "thermostat");
@@ -11743,9 +11977,13 @@ mod tests {
     #[test]
     fn thermostat_collapsed_renders_header_only() {
         // v1.6.4: collapsing the Thermostat section hides the card
-        // (here: the unpaired notice) but keeps the header, and the
-        // collapsed flag round-trips through the saved layout.
+        // but keeps the header, and the collapsed flag round-trips
+        // through the saved layout. v2.0.2: the test app is paired
+        // — an unpaired dashboard has no Thermostat section at all
+        // (see thermostat_hidden_until_paired), so collapse is only
+        // meaningful when paired.
         let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
         app.cfg.layout.collapsed.insert("thermostat".to_string(), true);
         let ctx = egui::Context::default();
         install_fonts(&ctx);
@@ -11753,7 +11991,7 @@ mod tests {
         let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
         assert!(drawn.iter().any(|t| *t == "Thermostat"));
         assert!(
-            !drawn.iter().any(|t| t.contains("Not paired")),
+            !drawn.iter().any(|t| t.contains("No reading yet")),
             "collapsed thermostat must hide the card: {:?}",
             drawn
         );
@@ -11762,10 +12000,88 @@ mod tests {
         assert_eq!(back.collapsed.get("thermostat"), Some(&true));
         // Expanded, the card is back.
         let mut app2 = gate_app();
+        app2.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
         let ctx2 = egui::Context::default();
         install_fonts(&ctx2);
         let texts2 = render_dashboard(&mut app2, &ctx2, egui::vec2(1330.0, 1200.0), 3);
-        assert!(texts2.iter().any(|(t, _)| t.contains("Not paired")));
+        assert!(texts2.iter().any(|(t, _)| t.contains("No reading yet")));
+    }
+
+    #[test]
+    fn thermostat_hidden_until_paired() {
+        // v2.0.2: like Cameras, the Thermostat section does not
+        // exist on the dashboard until a thermostat is paired —
+        // no section, no card, no "Not paired" text, on the
+        // dashboard, with no devices, or under a search.
+        let secs = build_sections(&full_entry_set(), &LayoutCfg::default(), false, "", false);
+        assert!(!secs.iter().any(|s| s.kind == SectionKind::Thermostat));
+        let paired = build_sections(&full_entry_set(), &LayoutCfg::default(), false, "", true);
+        assert!(paired[0].kind == SectionKind::Thermostat);
+        // Dashboard render level: unpaired shows no Thermostat
+        // header at all; paired shows it.
+        let mut app = gate_app();
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let texts = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1200.0), 3);
+        assert!(!texts.iter().any(|(t, _)| t.as_str() == "Thermostat"));
+        let mut app2 = gate_app();
+        app2.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        let ctx2 = egui::Context::default();
+        install_fonts(&ctx2);
+        let texts2 = render_dashboard(&mut app2, &ctx2, egui::vec2(1330.0, 1200.0), 3);
+        assert!(texts2.iter().any(|(t, _)| t.as_str() == "Thermostat"));
+        // Search matching nothing: unpaired shows only the note,
+        // paired still shows the thermostat above the note.
+        let mut app3 = gate_app();
+        app3.query = "zzz-no-such-device".to_string();
+        let ctx3 = egui::Context::default();
+        install_fonts(&ctx3);
+        let texts3 = render_dashboard(&mut app3, &ctx3, egui::vec2(1330.0, 1200.0), 3);
+        assert!(!texts3.iter().any(|(t, _)| t.as_str() == "Thermostat"));
+        assert!(texts3
+            .iter()
+            .any(|(t, _)| t.contains("Nothing matches your search")));
+        let mut app4 = gate_app();
+        app4.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app4.query = "zzz-no-such-device".to_string();
+        let ctx4 = egui::Context::default();
+        install_fonts(&ctx4);
+        let texts4 = render_dashboard(&mut app4, &ctx4, egui::vec2(1330.0, 1200.0), 3);
+        assert!(texts4.iter().any(|(t, _)| t.as_str() == "Thermostat"));
+        assert!(texts4
+            .iter()
+            .any(|(t, _)| t.contains("Nothing matches your search")));
+    }
+
+    #[test]
+    fn add_thermostat_button_routes_to_settings() {
+        // v2.0.2: the edit bar's "+ Add thermostat" button opens
+        // Settings and arms the jump to the Thermostat panel.
+        let mut app = gate_app();
+        assert!(app.cfg.thermostat.is_none());
+        app.open_thermostat_settings();
+        assert!(matches!(app.view, View::Settings));
+        assert!(app.settings_jump_thermostat);
+        // The button itself renders in the edit bar only while
+        // unpaired and editing.
+        let mut app2 = gate_app();
+        app2.editing = true;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let texts = render_header(&mut app2, &ctx, egui::vec2(1330.0, 200.0), 3);
+        assert!(texts.iter().any(|(t, _)| t.as_str() == "+ Add thermostat"));
+        let mut app3 = gate_app();
+        app3.editing = true;
+        app3.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        let ctx3 = egui::Context::default();
+        install_fonts(&ctx3);
+        let texts3 = render_header(&mut app3, &ctx3, egui::vec2(1330.0, 200.0), 3);
+        assert!(!texts3.iter().any(|(t, _)| t.as_str() == "+ Add thermostat"));
+        let mut app4 = gate_app();
+        let ctx4 = egui::Context::default();
+        install_fonts(&ctx4);
+        let texts4 = render_header(&mut app4, &ctx4, egui::vec2(1330.0, 200.0), 3);
+        assert!(!texts4.iter().any(|(t, _)| t.as_str() == "+ Add thermostat"));
     }
 
     #[test]
@@ -11905,28 +12221,419 @@ mod tests {
     }
 
     #[test]
+    fn thermostat_tap_while_set_busy_paints_and_queues() {
+        // v2.0.2 never-disable rule: a tap during a running set
+        // (e.g. a slow one heading for a timeout) still paints at
+        // once and queues as the pending intent instead of being
+        // dropped.
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_state = Some(crate::hap::ThermostatState {
+            current_mode: 0,
+            target_mode: 0,
+            current_temp_c: 25.0,
+            target_temp_c: 25.0,
+            fan_on: Some(false),
+            ..Default::default()
+        });
+        app.tstat_set_busy = true;
+        app.tstat_tap(crate::hap::ThermostatChanges {
+            target_mode: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(app.tstat_state.as_ref().unwrap().target_mode, 2);
+        let pending = app.tstat_pending_set.as_ref().expect("tap queued");
+        assert_eq!(pending.target_mode, Some(2));
+        assert!(app.tstat_set_busy, "in-flight set untouched");
+    }
+
+    #[test]
+    fn thermostat_queued_taps_merge_last_write_wins() {
+        // v2.0.2: taps queued behind a running set merge per field
+        // — a mode tap followed by a setpoint tap sends both, and
+        // a repeated mode tap keeps only the latest mode.
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_state = Some(crate::hap::ThermostatState {
+            target_mode: 0,
+            target_temp_c: 25.0,
+            ..Default::default()
+        });
+        app.tstat_set_busy = true;
+        app.tstat_tap(crate::hap::ThermostatChanges {
+            target_mode: Some(2),
+            ..Default::default()
+        });
+        app.tstat_tap(crate::hap::ThermostatChanges {
+            target_temp_c: Some(26.0),
+            ..Default::default()
+        });
+        let pending = app.tstat_pending_set.as_ref().unwrap();
+        assert_eq!(pending.target_mode, Some(2));
+        assert_eq!(pending.target_temp_c, Some(26.0));
+        assert_eq!(app.tstat_state.as_ref().unwrap().target_mode, 2);
+        assert_eq!(app.tstat_state.as_ref().unwrap().target_temp_c, 26.0);
+        app.tstat_tap(crate::hap::ThermostatChanges {
+            target_mode: Some(1),
+            ..Default::default()
+        });
+        let pending = app.tstat_pending_set.as_ref().unwrap();
+        assert_eq!(pending.target_mode, Some(1));
+        assert_eq!(pending.target_temp_c, Some(26.0));
+    }
+
+    #[test]
+    fn thermostat_pending_set_drains_only_when_free() {
+        // v2.0.2: the drain hands the pending intent out only when
+        // no operation is running, and consumes the slot when it
+        // does. (No pairing here, so the drain's spawn fails fast
+        // with no thread — the gate itself is what is tested.)
+        let mut app = gate_app();
+        app.tstat_pending_set = Some(crate::hap::ThermostatChanges {
+            target_mode: Some(2),
+            ..Default::default()
+        });
+        app.tstat_set_busy = true;
+        app.drain_tstat_pending_set();
+        assert!(app.tstat_pending_set.is_some(), "set-busy keeps slot");
+        app.tstat_set_busy = false;
+        app.tstat_fetch_busy = true;
+        app.drain_tstat_pending_set();
+        assert!(app.tstat_pending_set.is_some(), "fetch-busy keeps slot");
+        app.tstat_fetch_busy = false;
+        app.tstat_busy = true;
+        app.drain_tstat_pending_set();
+        assert!(app.tstat_pending_set.is_some(), "action-busy keeps slot");
+        app.tstat_busy = false;
+        app.drain_tstat_pending_set();
+        assert!(app.tstat_pending_set.is_none(), "free channel drains slot");
+    }
+
+    #[test]
+    fn thermostat_set_failed_with_queued_tap_skips_revert() {
+        // v2.0.2: when a tap was queued behind a failing set, the
+        // failure does not arm the revert fetch — the queued tap
+        // supersedes it (its own result settles the tile). The
+        // error line itself is still kept.
+        let mut app = gate_app();
+        app.tstat_set_busy = true;
+        app.tstat_pending_set = Some(crate::hap::ThermostatChanges {
+            target_mode: Some(2),
+            ..Default::default()
+        });
+        app.tstat_tx
+            .send(TstatResult::SetFailed(
+                "Thermostat control failed: boom".to_string(),
+            ))
+            .unwrap();
+        app.poll_net();
+        assert!(!app.tstat_set_busy);
+        assert_eq!(
+            app.tstat_error.as_deref(),
+            Some("Thermostat control failed: boom")
+        );
+        assert!(!app.tstat_revert_pending, "queued tap supersedes revert");
+        assert!(app.tstat_pending_set.is_none(), "queued tap drained");
+    }
+
+    #[test]
+    fn thermostat_buttons_stay_clickable_while_set_busy() {
+        // v2.0.2 field gate: with a set in flight, clicking the
+        // Cool button still paints at once and queues the tap.
+        // A disabled egui button swallows the click, so a
+        // painted+queued tap is the clickability proof — and it
+        // also proves the button is not rendered dim, since
+        // egui's dim look is exactly the disabled state.
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_state = Some(crate::hap::ThermostatState {
+            current_mode: 0,
+            target_mode: 0,
+            current_temp_c: 25.0,
+            target_temp_c: 25.0,
+            fan_on: Some(false),
+            ..Default::default()
+        });
+        app.tstat_last_fetch = Some(std::time::Instant::now());
+        app.tstat_set_busy = true;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let size = egui::vec2(1330.0, 1200.0);
+        let mut clock = 10.0;
+        drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        let out = drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        let texts = drawn_texts(&out);
+        let cool = texts
+            .iter()
+            .find(|(t, _)| t.as_str() == "Cool")
+            .map(|(_, p)| *p)
+            .expect("Cool button drawn");
+        drive_frame(&mut app, &ctx, size, &mut clock, vec![egui::Event::PointerMoved(cool)]);
+        drive_frame(
+            &mut app,
+            &ctx,
+            size,
+            &mut clock,
+            vec![egui::Event::PointerButton {
+                pos: cool,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        drive_frame(
+            &mut app,
+            &ctx,
+            size,
+            &mut clock,
+            vec![egui::Event::PointerButton {
+                pos: cool,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        assert_eq!(
+            app.tstat_state.as_ref().unwrap().target_mode,
+            2,
+            "tap painted while set busy"
+        );
+        let pending = app
+            .tstat_pending_set
+            .as_ref()
+            .expect("tap queued while set busy");
+        assert_eq!(pending.target_mode, Some(2));
+    }
+
+    #[test]
+    fn thermostat_header_refresh_click_spawns_fetch_when_free() {
+        // v2.0.2: the section header's Refresh button is never
+        // disabled — clicking it while free spawns the fetch.
+        // (The spawned thread fails fast on the default pairing's
+        // empty keys and its result is never polled here.)
+        let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
+        app.tstat_state = Some(crate::hap::ThermostatState {
+            current_mode: 0,
+            target_mode: 2,
+            current_temp_c: 25.0,
+            target_temp_c: 25.0,
+            ..Default::default()
+        });
+        app.tstat_last_fetch = Some(std::time::Instant::now());
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let size = egui::vec2(1330.0, 1200.0);
+        let mut clock = 10.0;
+        drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        let out = drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        let texts = drawn_texts(&out);
+        let refresh = texts
+            .iter()
+            .find(|(t, _)| t.as_str() == "↻ Refresh")
+            .map(|(_, p)| *p)
+            .expect("Refresh button drawn");
+        drive_frame(&mut app, &ctx, size, &mut clock, vec![egui::Event::PointerMoved(refresh)]);
+        drive_frame(
+            &mut app,
+            &ctx,
+            size,
+            &mut clock,
+            vec![egui::Event::PointerButton {
+                pos: refresh,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        drive_frame(
+            &mut app,
+            &ctx,
+            size,
+            &mut clock,
+            vec![egui::Event::PointerButton {
+                pos: refresh,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        drive_frame(&mut app, &ctx, size, &mut clock, vec![]);
+        assert!(app.tstat_fetch_busy, "Refresh click spawned a fetch");
+    }
+
+    fn test_session() -> Session {
+        Session {
+            access_token: "test-token".to_string(),
+            refresh_token: None,
+            expires_at_ms: 0,
+            region: "1".to_string(),
+        }
+    }
+
+    #[test]
+    fn disc_frequent_leaves_timestamp_frozen_and_sets_backoff() {
+        // v2.0.2 regression: a rate-limited cycle is silent by
+        // design (no toast), but it must never move the Updated
+        // stamp — a frozen stamp with stale tiles is exactly how a
+        // DiscFrequent storm masquerades as all-Off, and the
+        // diagnostics log is what names the gate instead.
+        let mut app = test_app(vec![]);
+        app.last_updated = "Updated 14:14:46".to_string();
+        app.disc_busy = true;
+        app.tx
+            .send(NetResult::DiscFrequent { session: test_session() })
+            .unwrap();
+        app.poll_net();
+        assert!(!app.disc_busy);
+        assert_eq!(app.last_updated, "Updated 14:14:46");
+        assert_eq!(app.disc_freq_streak, 1);
+        assert!(app.disc_backoff_until.is_some());
+    }
+
+    #[test]
+    fn disc_ok_updates_timestamp() {
+        // The complement: a completed cycle moves the stamp and
+        // replaces the device list with the fresh states.
+        let mut app = test_app(vec![]);
+        app.last_updated = "Updated 14:14:46".to_string();
+        app.disc_busy = true;
+        app.tx
+            .send(NetResult::DiscOk {
+                session: test_session(),
+                devices: vec![json!({
+                    "id": "l1",
+                    "name": "Desk Light",
+                    "dev_type": "light",
+                    "data": { "online": true, "state": true, "brightness": 800 }
+                })],
+            })
+            .unwrap();
+        app.poll_net();
+        assert!(!app.disc_busy);
+        assert_ne!(app.last_updated, "Updated 14:14:46");
+        assert!(app.last_updated.starts_with("Updated "));
+        assert_eq!(app.devices.len(), 1);
+        assert!(app.devices[0].state);
+        assert!(app.disc_backoff_until.is_none());
+    }
+
+    #[test]
+    fn auth_failure_code_classifier() {
+        // Token/auth/session wording means the session is dead;
+        // success, rate-limit, and device-level codes are
+        // explicitly not auth failures.
+        for code in [
+            "InvalidAccessToken",
+            "invalidaccesstoken",
+            "TokenExpired",
+            "AccessTokenInvalid",
+            "Unauthorized",
+            "SessionExpired",
+            "LoginRequired",
+            "PermissionDenied",
+        ] {
+            assert!(
+                is_auth_failure_code(code),
+                "{code} should classify as auth failure"
+            );
+        }
+        for code in [
+            "SUCCESS",
+            "FrequentlyInvoke",
+            "TooManyRequests",
+            "InvalidDeviceId",
+            "DeviceOffline",
+            "",
+        ] {
+            assert!(
+                !is_auth_failure_code(code),
+                "{code} should not classify as auth failure"
+            );
+        }
+    }
+
+    #[test]
+    fn session_expired_hint_decision() {
+        // Pure decision behind the DiscErr handler's hint line:
+        // only fresh_session's "Session expired" with no saved
+        // login names the missing-credentials gate.
+        assert!(session_expired_hint_needed("Session expired", false));
+        assert!(!session_expired_hint_needed("Session expired", true));
+        assert!(!session_expired_hint_needed(
+            "API error: InvalidAccessToken",
+            false
+        ));
+        assert!(!session_expired_hint_needed("Network error: boom", false));
+    }
+
+    #[test]
+    fn disc_err_session_expired_without_saved_login_logs_hint_and_stays_on_dashboard() {
+        // v2.0.2: the frozen-dashboard failure must name its gate
+        // in the diagnostics log, and must never pop a sign-in form
+        // unprompted — the dashboard stays up for the next cycle.
+        let mut app = test_app(vec![]);
+        assert!(app.cfg.creds.is_none());
+        app.disc_busy = true;
+        app.tx
+            .send(NetResult::DiscErr("Session expired".to_string()))
+            .unwrap();
+        app.poll_net();
+        assert!(!app.disc_busy);
+        assert!(matches!(app.view, View::Dashboard));
+        assert!(crate::hap::tstat_log_text().contains("no saved login"));
+    }
+
+    #[test]
+    fn rate_limit_backoff_stays_bounded() {
+        // interval * 2^min(streak,3), clamped to [60, 300]s: a
+        // storm backs off without ever parking refreshes for good.
+        let mut app = test_app(vec![]);
+        let mut prev = 0;
+        for _ in 0..6 {
+            let secs = app.note_rate_limited();
+            assert!((60..=300).contains(&secs), "backoff {secs}s out of bounds");
+            assert!(secs >= prev, "backoff must not shrink with streak");
+            prev = secs;
+        }
+    }
+
+    #[test]
     fn thermostat_section_defaults_first_and_survives_search() {
         // Old configs whose stored order never mentions the
         // thermostat: it slots first, like any new section with no
         // default-order predecessor.
         let mut layout = grouped_layout();
         layout.section_seq = vec!["scenes".into(), "lighting".into()];
-        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        let secs = build_sections(&full_entry_set(), &layout, false, "", true);
         assert_eq!(secs[0].key, "thermostat");
         assert_eq!(secs[0].order_key, "thermostat");
         assert_eq!(secs[0].title, "Thermostat");
-        // No devices at all: the thermostat section still renders.
-        let empty = build_sections(&[], &LayoutCfg::default(), false, "");
+        // No devices at all: the thermostat section still renders
+        // when paired — and is absent until a thermostat is paired.
+        let empty = build_sections(&[], &LayoutCfg::default(), false, "", true);
         assert_eq!(keys(&empty), vec!["thermostat"]);
+        let empty_unpaired = build_sections(&[], &LayoutCfg::default(), false, "", false);
+        assert!(empty_unpaired.is_empty());
         // A search matching no device drops every device section
-        // but never the thermostat (it is not a device).
+        // but never the paired thermostat (it is not a device).
         let nomatch = build_sections(
             &full_entry_set(),
             &LayoutCfg::default(),
             false,
             "zzz-no-such-device",
+            true,
         );
         assert_eq!(keys(&nomatch), vec!["thermostat"]);
+        let nomatch_unpaired = build_sections(
+            &full_entry_set(),
+            &LayoutCfg::default(),
+            false,
+            "zzz-no-such-device",
+            false,
+        );
+        assert!(nomatch_unpaired.is_empty());
     }
 
     #[test]
@@ -11944,7 +12651,7 @@ mod tests {
             "ungrouped".into(),
             "scenes".into(),
         ];
-        let secs = build_sections(&full_entry_set(), &layout, false, "");
+        let secs = build_sections(&full_entry_set(), &layout, false, "", true);
         assert_eq!(secs[1].key, "thermostat");
         let down = moved_section_seq(&layout.section_seq, &secs, "thermostat", 1);
         assert_eq!(down[2], "thermostat");
@@ -11953,7 +12660,7 @@ mod tests {
         let text = serde_json::to_string(&layout).unwrap();
         let back: LayoutCfg = serde_json::from_str(&text).unwrap();
         assert_eq!(back.section_seq, layout.section_seq);
-        let secs2 = build_sections(&full_entry_set(), &back, false, "");
+        let secs2 = build_sections(&full_entry_set(), &back, false, "", true);
         assert_eq!(secs2[1].key, "thermostat");
     }
 
@@ -12843,6 +13550,7 @@ mod tests {
             tstat_setup_code: String::new(),
             tstat_busy: false,
             tstat_set_busy: false,
+            tstat_pending_set: None,
             tstat_revert_pending: false,
             tstat_fetch_busy: false,
             tstat_state: None,
@@ -12852,6 +13560,7 @@ mod tests {
             tstat_tx,
             tstat_rx,
             tstat_last_fetch: None,
+            settings_jump_thermostat: false,
             bridge_rx,
             bridge_pending: None,
         }
@@ -12909,6 +13618,33 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new())
                     .show(ctx, |ui| app.view_dashboard(ui));
+            });
+            texts = drawn_texts(&out);
+            out.textures_delta.clear();
+        }
+        texts
+    }
+
+    /// Same harness for the header (which owns the edit bar):
+    /// render `frames` frames of `header()` and return the last
+    /// frame's drawn texts.
+    fn render_header(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        frames: usize,
+    ) -> Vec<(String, egui::Pos2)> {
+        let mut texts = Vec::new();
+        for i in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(10.0 + i as f64 * 0.05),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new())
+                    .show(ctx, |ui| app.header(ui));
             });
             texts = drawn_texts(&out);
             out.textures_delta.clear();
@@ -13053,7 +13789,11 @@ mod tests {
         // The thermostat is a section in the sequence, not a fixed
         // block: it renders first by default and moves with the
         // section machinery (ordered by section_seq, movable).
+        // v2.0.2: the section exists only when paired, so this
+        // block uses a paired app; the unpaired case is covered
+        // by thermostat_hidden_until_paired.
         let mut app = gate_app();
+        app.cfg.thermostat = Some(crate::hap::ThermostatPairing::default());
         let ctx = egui::Context::default();
         install_fonts(&ctx);
         let _ = render_dashboard(&mut app, &ctx, egui::vec2(1330.0, 1200.0), 3);
