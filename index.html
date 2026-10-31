@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="2.0.0">
+<meta name="version" content="2.0.1">
 <title>Homestead</title>
 <style>
   /* ============ Design tokens ============ */
@@ -504,7 +504,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">2.0.0</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">2.0.1</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -978,7 +978,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "2.0.0";
+var APP_VERSION = "2.0.1";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/Homestead/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -2025,16 +2025,17 @@ function statusText(d) {
    persisted state — and are cleared on finish or cancel. */
 var TSTAT_BRIDGE = "http://localhost:18780";
 var TSTAT = {
-  started: false, view: "unknown", fetchBusy: false, actionBusy: false, error: null,
+  started: false, view: "unknown", fetchBusy: false, actionBusy: false, setBusy: false, error: null,
   state: null, devices: [], code: "",
   pendingId: null, pendingDevice: null, logText: ""
 };
 
-/* v1.6.4 busy split: status fetches are silent (fetchBusy, no
-   "Working…" text); user actions (set, discover, pairing) show it
-   (actionBusy). Buttons stay disabled while either is set, exactly
-   as the single flag did before. */
-function tstatBusy() { return TSTAT.fetchBusy || TSTAT.actionBusy; }
+/* Busy split: status fetches are silent (fetchBusy, no "Working…"
+   text); discovery/pairing/forget show it (actionBusy); tile sets
+   are silent too (setBusy, v2.0.1 — the tile patches instantly
+   instead of waiting). Buttons stay disabled while any flag is
+   set, so overlapping operations stay blocked exactly as before. */
+function tstatBusy() { return TSTAT.fetchBusy || TSTAT.actionBusy || TSTAT.setBusy; }
 
 function tstatRound(f) { return Math.round(f); }
 
@@ -2063,14 +2064,16 @@ function tstatCall(path, opts, timeoutMs) {
   });
 }
 
-function tstatFetchStatus() {
-  TSTAT.fetchBusy = true; TSTAT.error = null; tstatRender();
+function tstatFetchStatus(keepError) {
+  TSTAT.fetchBusy = true;
+  if (!keepError) TSTAT.error = null;
+  tstatRender();
   tstatCall("/thermostat/status", {}, 100000).then(function (j) {
     TSTAT.fetchBusy = false;
     if (j.paired) {
       TSTAT.view = "paired";
       TSTAT.state = j.state || null;
-      if (!j.state) TSTAT.error = "No reading yet — press Refresh.";
+      if (!j.state && !keepError) TSTAT.error = "No reading yet — press Refresh.";
     } else {
       TSTAT.view = "unpaired";
       TSTAT.state = null;
@@ -2083,11 +2086,13 @@ function tstatFetchStatus() {
          is not running on this computer. */
       TSTAT.view = "unreachable";
       TSTAT.error = null;
-    } else {
+    } else if (!keepError) {
       TSTAT.error = err.message;
       if (err.body && err.body.paired === true) { TSTAT.view = "paired"; TSTAT.state = null; }
       else if (TSTAT.view === "unknown") TSTAT.view = "unpaired";
     }
+    /* keepError: a failed revert fetch leaves the original set
+       error alone (it is the more relevant failure). */
     tstatRender();
   });
 }
@@ -2174,21 +2179,42 @@ function tstatCancelPair() {
   }, 30000).catch(function () { /* already dropped locally */ });
 }
 
+/* v2.0.1 instant tile: apply a set patch to local state at once
+   (mode string, setpoints, fan) so the tile shows the tapped value
+   immediately; the bridge reply reconciles it with the unit's true
+   state afterwards. Only fields the patch names move. */
+function tstatPatchState(patch) {
+  var st = TSTAT.state;
+  if (!st) return;
+  var modes = { off: "Off", heat: "Heat", cool: "Cool", auto: "Auto" };
+  if (patch.mode && modes[patch.mode]) st.mode = modes[patch.mode];
+  if (patch.target_f !== undefined) st.target_f = patch.target_f;
+  if (patch.heat_to_f !== undefined) st.heat_to_f = patch.heat_to_f;
+  if (patch.cool_to_f !== undefined) st.cool_to_f = patch.cool_to_f;
+  if (patch.fan !== undefined) st.fan_on = (patch.fan === "on");
+}
+
 function tstatSet(patch) {
-  TSTAT.actionBusy = true; TSTAT.error = null; tstatRender();
+  if (tstatBusy()) return;
+  tstatPatchState(patch);
+  TSTAT.setBusy = true; TSTAT.error = null; tstatRender();
   tstatCall("/thermostat/set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch)
   }, 100000).then(function (j) {
-    TSTAT.actionBusy = false;
+    TSTAT.setBusy = false;
     if (j.state) TSTAT.state = j.state;
     tstatRender();
   }, function (err) {
-    TSTAT.actionBusy = false;
-    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
-    else TSTAT.error = err.message;
-    tstatRender();
+    TSTAT.setBusy = false;
+    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; tstatRender(); }
+    else {
+      TSTAT.error = err.message;
+      tstatRender();
+      /* Revert to the unit's true state, keeping this error. */
+      tstatFetchStatus(true);
+    }
   });
 }
 
