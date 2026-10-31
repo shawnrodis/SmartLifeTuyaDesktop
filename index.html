@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.6.0">
+<meta name="version" content="1.6.1">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -502,7 +502,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.6.0</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.6.1</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -976,7 +976,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.6.0";
+var APP_VERSION = "1.6.1";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -2008,13 +2008,17 @@ function statusText(d) {
    The browser page cannot speak HomeKit, so thermostat control
    goes through the desktop app's loopback bridge on this computer
    (the desktop app must be running). The bridge serves thermostat
-   endpoints only. The setup code below is sent to it for one
-   pairing request and is never stored anywhere — not in
-   localStorage, not in any persisted state. */
+   endpoints only. Pairing is two-step, because rotating-code
+   thermostats show a fresh code on every attempt: Start pairing
+   opens the session (no code needed), then Finish sends the code
+   the thermostat is showing. The code and the pending id below
+   live in memory only — never in localStorage, never in any
+   persisted state — and are cleared on finish or cancel. */
 var TSTAT_BRIDGE = "http://localhost:18780";
 var TSTAT = {
   started: false, view: "unknown", busy: false, error: null,
-  state: null, devices: [], code: ""
+  state: null, devices: [], code: "",
+  pendingId: null, pendingDevice: null
 };
 
 function tstatRound(f) { return Math.round(f); }
@@ -2088,25 +2092,71 @@ function tstatDiscover() {
   });
 }
 
-function tstatPair(deviceId) {
-  var code = TSTAT.code;
-  TSTAT.code = ""; /* used for this request only; never stored */
+/* Step 1 of two-step pairing: open the pair-setup session. No
+   code is needed here — the thermostat shows its fresh code
+   during the attempt, and Finish (step 2) sends it. A code typed
+   before Start would already be stale, so the field only appears
+   once a session is open. */
+function tstatBeginPair(deviceId) {
   TSTAT.busy = true; TSTAT.error = null; tstatRender();
-  tstatCall("/thermostat/pair", {
+  tstatCall("/thermostat/pair/begin", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ device_id: deviceId, pin: code })
-  }, 100000).then(function () {
+    body: JSON.stringify({ device_id: deviceId })
+  }, 100000).then(function (j) {
     TSTAT.busy = false;
-    TSTAT.devices = [];
-    toast("Thermostat paired");
-    tstatFetchStatus();
+    TSTAT.pendingId = j.pending_id || null;
+    TSTAT.pendingDevice = deviceId;
+    TSTAT.code = "";
+    tstatRender();
   }, function (err) {
     TSTAT.busy = false;
     if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
     else TSTAT.error = err.message;
     tstatRender();
   });
+}
+
+/* Step 2: finish the session opened by Start pairing with the
+   code the thermostat is showing now. The session is spent
+   either way (success or failure), so the tile always returns to
+   Start pairing afterwards. */
+function tstatFinishPair() {
+  var code = TSTAT.code;
+  TSTAT.code = ""; /* used for this request only; never stored */
+  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  tstatCall("/thermostat/pair/finish", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pending_id: TSTAT.pendingId, pin: code })
+  }, 100000).then(function () {
+    TSTAT.busy = false;
+    TSTAT.pendingId = null; TSTAT.pendingDevice = null;
+    TSTAT.devices = [];
+    toast("Thermostat paired");
+    tstatFetchStatus();
+  }, function (err) {
+    TSTAT.busy = false;
+    TSTAT.pendingId = null; TSTAT.pendingDevice = null;
+    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
+    else TSTAT.error = err.message;
+    tstatRender();
+  });
+}
+
+/* Abandon the open session: the bridge drops it (closing its
+   socket) and the tile returns to Start pairing. Best effort —
+   the session is dropped locally either way. */
+function tstatCancelPair() {
+  var pid = TSTAT.pendingId;
+  TSTAT.pendingId = null; TSTAT.pendingDevice = null; TSTAT.code = "";
+  tstatRender();
+  if (!pid) return;
+  tstatCall("/thermostat/pair/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pending_id: pid })
+  }, 30000).catch(function () { /* already dropped locally */ });
 }
 
 function tstatSet(patch) {
@@ -2188,36 +2238,54 @@ function renderThermostatSection() {
     card.appendChild(el("div", "tstat-note", "Control works on your home network only, through the desktop app running on this computer."));
     var drow = el("div", "tstat-row");
     var db = el("button", "btn small primary", "Discover devices");
-    db.disabled = TSTAT.busy;
+    db.disabled = TSTAT.busy || !!TSTAT.pendingId;
     db.addEventListener("click", tstatDiscover);
     drow.appendChild(db);
     card.appendChild(drow);
-    var field = el("div", "field");
-    field.style.marginTop = "12px";
-    field.appendChild(el("label", null, "Setup code (shown on the thermostat screen during pairing, or on the sticker in the box):"));
-    var inp = el("input");
-    inp.type = "text"; inp.id = "tstat-code"; inp.placeholder = "123-45-678";
-    inp.value = TSTAT.code;
-    inp.addEventListener("input", function (ev) {
-      TSTAT.code = ev.target.value;
-      /* Pair buttons enable live as the code is typed (the tile
-         itself only re-renders on fetch completions). */
-      var btns = document.querySelectorAll("#tstat-section .tstat-pair-btn");
-      for (var i = 0; i < btns.length; i++) btns[i].disabled = TSTAT.busy || !TSTAT.code.trim();
-    });
-    field.appendChild(inp);
-    card.appendChild(field);
-    card.appendChild(el("div", "tstat-note", "The code is sent to the desktop app for this pairing only and is never stored — only the derived keys are saved."));
     TSTAT.devices.forEach(function (d) {
       var dev = el("div", "tstat-dev");
       dev.appendChild(el("span", "name", d.name || "Thermostat"));
       dev.appendChild(el("span", "meta", (d.model || "HomeKit accessory") + (d.paired ? " (already paired)" : " (unpaired)")));
       dev.appendChild(el("span", "spacer"));
-      var pb = el("button", "btn small primary tstat-pair-btn", "Pair");
-      pb.disabled = TSTAT.busy || !TSTAT.code.trim();
-      pb.addEventListener("click", function () { tstatPair(d.id); });
-      dev.appendChild(pb);
+      if (TSTAT.pendingId && TSTAT.pendingDevice === d.id) {
+        dev.appendChild(el("span", "meta", "Pairing…"));
+      } else {
+        var sb = el("button", "btn small primary", "Start pairing");
+        sb.disabled = TSTAT.busy || !!TSTAT.pendingId;
+        sb.addEventListener("click", function () { tstatBeginPair(d.id); });
+        dev.appendChild(sb);
+      }
       card.appendChild(dev);
+      if (TSTAT.pendingId && TSTAT.pendingDevice === d.id) {
+        card.appendChild(el("div", "tstat-note", "Code shown on your thermostat — type it here:"));
+        var field = el("div", "field");
+        field.style.marginTop = "12px";
+        var inp = el("input");
+        inp.type = "text"; inp.id = "tstat-code"; inp.placeholder = "e.g. 123-45-678";
+        inp.value = TSTAT.code;
+        inp.addEventListener("input", function (ev) {
+          TSTAT.code = ev.target.value;
+          /* The Finish button enables live as the code is typed
+             (the tile itself only re-renders on fetch
+             completions). */
+          var btns = document.querySelectorAll("#tstat-section .tstat-pair-btn");
+          for (var i = 0; i < btns.length; i++) btns[i].disabled = TSTAT.busy || !TSTAT.code.trim();
+        });
+        field.appendChild(inp);
+        card.appendChild(field);
+        card.appendChild(el("div", "tstat-note", "Type it promptly: the thermostat may time out the pairing session. If it expires, press Start pairing and try again with the fresh code."));
+        card.appendChild(el("div", "tstat-note", "The code is sent to the desktop app for this pairing only and is never stored — only the derived keys are saved."));
+        var prow = el("div", "tstat-row");
+        var fb = el("button", "btn small primary tstat-pair-btn", "Finish pairing");
+        fb.disabled = TSTAT.busy || !TSTAT.code.trim();
+        fb.addEventListener("click", tstatFinishPair);
+        prow.appendChild(fb);
+        var cb = el("button", "btn small", "Cancel");
+        cb.disabled = TSTAT.busy;
+        cb.addEventListener("click", tstatCancelPair);
+        prow.appendChild(cb);
+        card.appendChild(prow);
+      }
     });
   } else {
     var st = TSTAT.state;
