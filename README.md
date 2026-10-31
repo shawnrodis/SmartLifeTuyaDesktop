@@ -101,6 +101,13 @@ instructions below.)
   **Normal** (one cell), **Large** (two columns) or **Wide** (the full
   row) — and the Windows tile's stream resolution follows the size.
   See [Camera video](#camera-video).
+- **HomeKit thermostat** — pair a HomeKit thermostat (e.g. Resideo
+  T6 Pro) and control mode, temperature, setpoint, and fan from its
+  dashboard tile. Before pairing, run HomeKit Reset on the unit
+  (Menu → Reset → HomeKit Reset → Yes): the unit only advertises
+  itself for pairing after a reset, even if HomeKit is already in
+  use elsewhere. Local-network only; your Resideo app and Alexa
+  control keep working untouched.
 - **No rate-limit nagging** — when Tuya rate-limits, the apps never show
   a warning: they quietly keep the last known states, retry commands a
   moment later, and stretch the refresh interval until things settle.
