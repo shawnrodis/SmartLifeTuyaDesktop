@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="2.0.5">
+<meta name="version" content="2.0.6">
 <title>Homestead</title>
 <style>
   /* ============ Design tokens ============ */
@@ -429,12 +429,7 @@
       <span class="updated" id="last-updated"></span>
       <div class="hgroup">
         <input type="text" id="inp-search" placeholder="🔍 Search devices…" aria-label="Search devices">
-        <select id="sel-interval" title="Refresh interval">
-          <option value="15">15s</option>
-          <option value="30" selected>30s</option>
-          <option value="60">60s</option>
-          <option value="120">2 min</option>
-        </select>
+        <span class="updated" id="auto-interval" title="Refresh interval — adjusts automatically">Auto 30s</span>
         <button class="btn hidden" id="btn-monitor">🖥 Monitor</button>
         <button class="btn" id="btn-edit">✎ Edit</button>
         <button class="btn" id="btn-settings">⚙ Settings</button>
@@ -503,7 +498,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">2.0.5</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">2.0.6</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -531,13 +526,8 @@
           proxy expects the target address as an encoded query parameter.</p>
         </div>
         <div class="field" style="margin-bottom:0">
-          <label for="set-interval">Autorefresh interval</label>
-          <select id="set-interval">
-            <option value="15">15 seconds</option>
-            <option value="30">30 seconds</option>
-            <option value="60">60 seconds</option>
-            <option value="120">2 minutes</option>
-          </select>
+          <label>Autorefresh interval</label>
+          <span id="auto-interval-set">Auto 30s — adjusts automatically</span>
         </div>
       </div>
 
@@ -983,7 +973,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "2.0.5";
+var APP_VERSION = "2.0.6";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/Homestead/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -3315,7 +3305,9 @@ function startAutorefresh() {
     if (Date.now() < (S.freqUntil || 0)) return;
     await fetchDevices(true);
     if (!S.interacting) renderAll();
-  }, S.prefs.interval * 1000);
+  }, 30000); /* v2.0.6: fixed 30 s — the web timer does not adapt
+     yet (dynamic adjustment is desktop-only until the web
+     re-login follow-up); the interval dropdowns are gone. */
 }
 
 /* ---------------- Login flow ---------------- */
@@ -3396,8 +3388,6 @@ function applyPrefs() {
   var soft = S.prefs.accent + "29";
   document.documentElement.style.setProperty("--accent-soft", soft);
   document.body.setAttribute("data-density", S.prefs.density);
-  $("sel-interval").value = String(S.prefs.interval);
-  $("set-interval").value = String(S.prefs.interval);
   $("set-theme").value = S.prefs.theme;
   $("set-density").value = S.prefs.density;
   var row = $("accent-row");
@@ -3461,11 +3451,6 @@ function init() {
   $("inp-search").addEventListener("input", function (ev) { S.query = ev.target.value; renderAll(); });
   $("login-form").addEventListener("submit", submitLogin);
   $("btn-logout").addEventListener("click", doLogout);
-  function onInterval(v) {
-    S.prefs.interval = parseInt(v, 10) || 30; savePrefs(); applyPrefs(); startAutorefresh();
-  }
-  $("sel-interval").addEventListener("change", function (ev) { onInterval(ev.target.value); });
-  $("set-interval").addEventListener("change", function (ev) { onInterval(ev.target.value); });
   $("btn-edit").addEventListener("click", function () { setEditing(!isEditing()); });
   $("btn-doneedit").addEventListener("click", function () { setEditing(false); });
   $("btn-addgroup").addEventListener("click", addGroup);
