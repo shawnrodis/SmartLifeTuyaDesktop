@@ -628,6 +628,104 @@ impl Conn {
         }
     }
 
+    /// Like fill(), but returns Ok(false) on a clean end-of-stream
+    /// instead of erroring. Plain phase: read() returning 0. Secure
+    /// phase: read_exact hitting UnexpectedEof on a frame boundary
+    /// (or mid-frame, which for a close-delimited body just means the
+    /// final frame was truncated). Any other I/O error -- including
+    /// the socket read timeout -- still propagates, so a
+    /// close-delimited read waits at most NET_IO_TIMEOUT of silence.
+    fn fill_eof(&mut self) -> HapResult<bool> {
+        match self.in_key {
+            None => {
+                let mut tmp = [0u8; 4096];
+                match self.stream.read(&mut tmp) {
+                    Ok(0) => Ok(false),
+                    Ok(n) => {
+                        self.buf.extend_from_slice(&tmp[..n]);
+                        Ok(true)
+                    }
+                    Err(e) => Err(HapError::Io(e)),
+                }
+            }
+            Some(key) => {
+                let mut lenb = [0u8; 2];
+                match self.stream.read_exact(&mut lenb) {
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+                    Err(e) => Err(HapError::Io(e)),
+                    Ok(()) => {
+                        let len = u16::from_le_bytes(lenb) as usize;
+                        let mut ct = vec![0u8; len + 16];
+                        match self.stream.read_exact(&mut ct) {
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                Ok(false)
+                            }
+                            Err(e) => Err(HapError::Io(e)),
+                            Ok(()) => {
+                                let nonce = frame_nonce(self.in_ctr);
+                                let pt = chacha_decrypt(&key, &nonce, &lenb, &ct)?;
+                                self.in_ctr += 1;
+                                self.buf.extend_from_slice(&pt);
+                                Ok(true)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decode one chunked body starting at `pos` in buf, refilling via
+    /// fill() as needed. Works purely on self.buf + fill(), so it is
+    /// correct in both phases (decrypted frames in the secure phase).
+    /// Returns the decoded body and the index just past the terminal
+    /// chunk's trailers; leftover bytes stay buffered for the next
+    /// keep-alive response.
+    fn read_chunked_body(&mut self, mut pos: usize) -> HapResult<(Vec<u8>, usize)> {
+        let mut body = Vec::new();
+        loop {
+            // Chunk-size line: hex, with any ";extension" ignored.
+            let line_end = loop {
+                if let Some(rel) = find_subslice(&self.buf[pos..], b"\r\n") {
+                    break pos + rel;
+                }
+                self.fill()?;
+            };
+            let size_text = String::from_utf8_lossy(&self.buf[pos..line_end]).into_owned();
+            let size_str = size_text.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_str, 16).map_err(|_| {
+                HapError::Msg(format!("bad chunk size {:?}", size_str))
+            })?;
+            pos = line_end + 2;
+            if size == 0 {
+                // Terminal chunk: trailers up to the empty line.
+                loop {
+                    let trailer_end = loop {
+                        if let Some(rel) = find_subslice(&self.buf[pos..], b"\r\n") {
+                            break pos + rel;
+                        }
+                        self.fill()?;
+                    };
+                    let empty = trailer_end == pos;
+                    pos = trailer_end + 2;
+                    if empty {
+                        break;
+                    }
+                }
+                return Ok((body, pos));
+            }
+            // Chunk data + CRLF.
+            while self.buf.len() < pos + size + 2 {
+                self.fill()?;
+            }
+            body.extend_from_slice(&self.buf[pos..pos + size]);
+            if &self.buf[pos + size..pos + size + 2] != b"\r\n" {
+                return err("chunked body: missing CRLF after chunk data");
+            }
+            pos += size + 2;
+        }
+    }
+
     /// Read one HTTP response (status + body). Unsolicited EVENT
     /// responses are consumed and skipped (we never subscribe).
     fn read_http_response(&mut self) -> HapResult<(u16, Vec<u8>)> {
@@ -643,19 +741,42 @@ impl Conn {
             let header_text = String::from_utf8_lossy(&header_bytes);
             let mut lines = header_text.lines();
             let status_line = lines.next().unwrap_or("").to_string();
-            let mut content_len: usize = 0;
+            // Content-Length presence matters: an explicit "0" means
+            // an empty body now, while a missing header means the
+            // body runs to end-of-stream (see below).
+            let mut content_len: Option<usize> = None;
+            let mut chunked = false;
             for line in lines {
                 let lower = line.to_ascii_lowercase();
                 if let Some(v) = lower.strip_prefix("content-length:") {
-                    content_len = v.trim().parse().unwrap_or(0);
+                    content_len = Some(v.trim().parse().unwrap_or(0));
+                } else if let Some(v) = lower.strip_prefix("transfer-encoding:") {
+                    chunked = v
+                        .split(',')
+                        .any(|c| c.trim().eq_ignore_ascii_case("chunked"));
                 }
             }
-            let total = hdr_end + 4 + content_len;
-            while self.buf.len() < total {
-                self.fill()?;
-            }
-            let body = self.buf[hdr_end + 4..total].to_vec();
-            self.buf.drain(..total);
+            let body_start = hdr_end + 4;
+            let (body, consumed) = if chunked {
+                // Chunked wins over Content-Length when both appear.
+                self.read_chunked_body(body_start)?
+            } else if let Some(len) = content_len {
+                let total = body_start + len;
+                while self.buf.len() < total {
+                    self.fill()?;
+                }
+                (self.buf[body_start..total].to_vec(), total)
+            } else {
+                // Neither framing header: the body runs until the
+                // accessory closes the connection (or the read
+                // timeout fires). The connection is unusable
+                // afterwards, but our callers open a fresh session
+                // per operation, so that costs nothing.
+                while self.fill_eof()? {}
+                let body = self.buf[body_start..].to_vec();
+                (body, self.buf.len())
+            };
+            self.buf.drain(..consumed);
             if status_line.starts_with("EVENT") {
                 events_skipped += 1;
                 if events_skipped > 10 {
@@ -2201,5 +2322,258 @@ mod tests {
         let pairing = finish_pair_setup(pending2, pin).unwrap();
         assert_eq!(pairing.accessory_pairing_id, "acc-2");
         server2.join().unwrap();
+    }
+
+    // -- Chunked / headerless response tests ------------------------
+    // A fake secure accessory for response-framing cases: the client
+    // side is a real SecureConn (set_secure + get_accessories), so
+    // these exercise the exact call path that failed in the field
+    // ("bad accessory response: EOF while parsing a value").
+
+    const TEST_OUT_KEY: [u8; 32] = [0x11u8; 32];
+    const TEST_IN_KEY: [u8; 32] = [0x22u8; 32];
+
+    fn secure_test_conn(port: u16) -> SecureConn {
+        let mut conn = Conn::connect("127.0.0.1", port).unwrap();
+        conn.set_secure(TEST_OUT_KEY, TEST_IN_KEY).unwrap();
+        SecureConn { conn }
+    }
+
+    /// Server side: read one framed request (client -> server key),
+    /// tracking the frame counter across calls.
+    fn read_framed_request(
+        s: &mut TcpStream,
+        key: &[u8; 32],
+        ctr: &mut u64,
+    ) -> Vec<u8> {
+        let mut plain = Vec::new();
+        loop {
+            let mut lenb = [0u8; 2];
+            s.read_exact(&mut lenb).unwrap();
+            let len = u16::from_le_bytes(lenb) as usize;
+            let mut ct = vec![0u8; len + 16];
+            s.read_exact(&mut ct).unwrap();
+            let pt = chacha_decrypt(key, &frame_nonce(*ctr), &lenb, &ct).unwrap();
+            *ctr += 1;
+            plain.extend_from_slice(&pt);
+            if find_subslice(&plain, b"\r\n\r\n").is_some() {
+                return plain;
+            }
+        }
+    }
+
+    /// Server side: write plaintext as <=1000-byte frames (server ->
+    /// client key), tracking the frame counter across calls.
+    fn write_framed(s: &mut TcpStream, key: &[u8; 32], ctr: &mut u64, data: &[u8]) {
+        for chunk in data.chunks(1000) {
+            let lenb = (chunk.len() as u16).to_le_bytes();
+            let ct = chacha_encrypt(key, &frame_nonce(*ctr), &lenb, chunk).unwrap();
+            *ctr += 1;
+            s.write_all(&lenb).unwrap();
+            s.write_all(&ct).unwrap();
+        }
+    }
+
+    /// Spawn a fake secure accessory: reads the first framed request
+    /// (asserting it is a GET), then hands the stream plus both frame
+    /// counters to `respond`, which may read further requests and
+    /// write responses. Returning from `respond` closes the socket.
+    fn spawn_secure_responder<F>(respond: F) -> (u16, thread::JoinHandle<()>)
+    where
+        F: FnOnce(&mut TcpStream, &mut u64, &mut u64) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut resp_ctr = 0u64;
+            let mut req_ctr = 0u64;
+            let req = read_framed_request(&mut s, &TEST_OUT_KEY, &mut req_ctr);
+            assert!(
+                req.starts_with(b"GET /accessories"),
+                "unexpected first request"
+            );
+            respond(&mut s, &mut resp_ctr, &mut req_ctr);
+        });
+        (port, handle)
+    }
+
+    fn test_accessories_json() -> Vec<u8> {
+        br#"{"accessories":[{"aid":1,"services":[{"iid":1,"type":"0000003E-0000-1000-8000-0026BB765291","characteristics":[{"iid":2,"type":"00000023-0000-1000-8000-0026BB765291","value":"T6 Pro"}]},{"iid":10,"type":"0000004A-0000-1000-8000-0026BB765291","characteristics":[{"iid":11,"type":"0000000F-0000-1000-8000-0026BB765291","value":1},{"iid":13,"type":"00000011-0000-1000-8000-0026BB765291","value":21.5}]}]}]}"#.to_vec()
+    }
+
+    /// Chunked transfer encoding with small chunks, a ;extension on
+    /// the first chunk, and a trailer on the terminal chunk.
+    fn chunked_encode(body: &[u8], chunk: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut first = true;
+        for part in body.chunks(chunk) {
+            if first {
+                out.extend_from_slice(format!("{:x};ext=1\r\n", part.len()).as_bytes());
+                first = false;
+            } else {
+                out.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            }
+            out.extend_from_slice(part);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\nX-Trailer: yes\r\n\r\n");
+        out
+    }
+
+    #[test]
+    fn secure_get_accessories_chunked() {
+        // The field failure: the T6 answers GET /accessories without
+        // Content-Length (chunked here); the old code read an empty
+        // body and serde failed with EOF at line 1 column 0.
+        let body = test_accessories_json();
+        let mut resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        resp.extend_from_slice(&chunked_encode(&body, 13));
+        let (port, server) = spawn_secure_responder(move |s, resp_ctr, _| {
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &resp);
+        });
+        let mut sess = secure_test_conn(port);
+        let accs = sess.get_accessories().unwrap();
+        assert_eq!(accs.len(), 1);
+        assert_eq!(accs[0].aid, 1);
+        assert_eq!(accs[0].services.len(), 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn secure_get_accessories_close_delimited() {
+        // No framing header at all: the body runs to end-of-stream.
+        // The server closes after writing; the client must take the
+        // buffered remainder as the body, not an empty one.
+        let body = test_accessories_json();
+        let mut resp = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        resp.extend_from_slice(&body);
+        let (port, server) = spawn_secure_responder(move |s, resp_ctr, _| {
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &resp);
+            // Returning closes the socket: end-of-stream for the body.
+        });
+        let mut sess = secure_test_conn(port);
+        let accs = sess.get_accessories().unwrap();
+        assert_eq!(accs.len(), 1);
+        assert_eq!(accs[0].aid, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn secure_get_accessories_content_length_regression() {
+        let body = test_accessories_json();
+        let mut resp =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                .into_bytes();
+        resp.extend_from_slice(&body);
+        let (port, server) = spawn_secure_responder(move |s, resp_ctr, _| {
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &resp);
+        });
+        let mut sess = secure_test_conn(port);
+        let accs = sess.get_accessories().unwrap();
+        assert_eq!(accs.len(), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn secure_get_accessories_large_chunked_multi_frame() {
+        // ~3.5 KB body: chunked decode must survive the plaintext
+        // arriving as several decrypted frames, not just one.
+        let name = "x".repeat(3000);
+        let body = format!(
+            "{{\"accessories\":[{{\"aid\":1,\"services\":[{{\"iid\":1,\"type\":\"0000003E-0000-1000-8000-0026BB765291\",\"characteristics\":[{{\"iid\":2,\"type\":\"00000023-0000-1000-8000-0026BB765291\",\"value\":\"{}\"}}]}}]}}]}}",
+            name
+        )
+        .into_bytes();
+        assert!(body.len() > 3000, "test body must span frames");
+        let mut resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        resp.extend_from_slice(&chunked_encode(&body, 64));
+        let (port, server) = spawn_secure_responder(move |s, resp_ctr, _| {
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &resp);
+        });
+        let mut sess = secure_test_conn(port);
+        let accs = sess.get_accessories().unwrap();
+        assert_eq!(accs.len(), 1);
+        let got = accs[0].services[0].characteristics[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(got.len(), 3000);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn secure_chunked_then_content_length_keep_alive() {
+        // Keep-alive integrity: after a chunked response, leftover
+        // bytes (none here) and frame counters must line up so the
+        // second request on the same connection still parses.
+        let body = test_accessories_json();
+        let mut chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        chunked.extend_from_slice(&chunked_encode(&body, 17));
+        let mut plain =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                .into_bytes();
+        plain.extend_from_slice(&body);
+        let (port, server) = spawn_secure_responder(move |s, resp_ctr, req_ctr| {
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &chunked);
+            let req2 = read_framed_request(s, &TEST_OUT_KEY, req_ctr);
+            assert!(req2.starts_with(b"GET /accessories"));
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &plain);
+        });
+        let mut sess = secure_test_conn(port);
+        let first = sess.get_accessories().unwrap();
+        assert_eq!(first.len(), 1);
+        let second = sess.get_accessories().unwrap();
+        assert_eq!(second.len(), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn secure_chunked_event_skipped() {
+        // An unsolicited EVENT with a chunked body must be fully
+        // consumed (chunks + trailers) before the real response.
+        let body = test_accessories_json();
+        let mut event = b"EVENT/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        event.extend_from_slice(&chunked_encode(b"{}", 1));
+        let mut real =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                .into_bytes();
+        real.extend_from_slice(&body);
+        let mut both = event;
+        both.extend_from_slice(&real);
+        let (port, server) = spawn_secure_responder(move |s, resp_ctr, _| {
+            write_framed(s, &TEST_IN_KEY, resp_ctr, &both);
+        });
+        let mut sess = secure_test_conn(port);
+        let accs = sess.get_accessories().unwrap();
+        assert_eq!(accs.len(), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn plain_chunked_response() {
+        // The shared reader in the plain phase: a chunked response
+        // must parse without waiting for connection close.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let _body = read_http_request(&mut s).unwrap();
+            let mut resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            resp.extend_from_slice(&chunked_encode(b"hello", 2));
+            s.write_all(&resp).unwrap();
+            // Keep the socket open: the client must finish on the
+            // terminal chunk, not on EOF.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut conn = Conn::connect("127.0.0.1", port).unwrap();
+        let (_code, body) = conn.post_plain("/x", b"", "text/plain").unwrap();
+        assert_eq!(body, b"hello");
+        server.join().unwrap();
     }
 }

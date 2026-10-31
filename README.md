@@ -132,6 +132,16 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.6.2
+
+- **Fixed: the thermostat tile couldn't read the thermostat's state
+  after pairing.** Some thermostats (including the Resideo T6 Pro)
+  answer state requests in chunked pieces, which the app's reader
+  didn't reassemble — so refreshes failed even though pairing had
+  worked. The reader now handles chunked answers, and answers with
+  no length header as a fallback. Pairing itself is unchanged from
+  1.6.1.
+
 ## What's new in 1.6.1
 
 - **Fixed: pairing with thermostats that show a fresh setup code on
