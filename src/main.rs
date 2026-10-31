@@ -28,6 +28,8 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod hap;
+
 // ---------------------------------------------------------------------------
 // Design tokens (DESIGN.md — mirrored 1:1 with the web edition's CSS vars)
 // ---------------------------------------------------------------------------
@@ -407,6 +409,10 @@ struct Config {
     update: UpdateCfg,
     #[serde(default)]
     cache_devices: Option<Value>,
+    /// HomeKit thermostat pairing (native editions only). None when
+    /// unpaired; old config files without this field load fine.
+    #[serde(default)]
+    thermostat: Option<crate::hap::ThermostatPairing>,
 }
 
 /// Auto-update bookkeeping (mirrors the web edition's slc_update).
@@ -3626,6 +3632,15 @@ enum NetResult {
     GroupDone { title: String, total: usize, failed: Vec<String> },
 }
 
+/// Results from thermostat (HomeKit/HAP) background threads, reported
+/// over a dedicated channel so Tuya traffic is untouched.
+enum TstatResult {
+    Discovered(Vec<crate::hap::DiscoveredDevice>),
+    Paired(crate::hap::ThermostatPairing),
+    State(crate::hap::ThermostatState),
+    Failed(String),
+}
+
 // ---------------------------------------------------------------------------
 // Auto-update (workstream C) — both editions check the project's GitHub
 // "latest release" at most once per 24 h (attempt-based) and compare
@@ -4333,6 +4348,19 @@ struct App {
     player_for: Option<String>,
     /// ffmpeg lookup cache: (override string it was computed for, hit).
     ffmpeg_cache: Option<(String, Option<PathBuf>)>,
+    // thermostat (HomeKit/HAP, native editions only): the setup code
+    // lives here at runtime ONLY and is never persisted (it is
+    // cleared after every pairing attempt); only the derived
+    // long-term keys in cfg.thermostat are saved, same trust model
+    // as the "keep me logged in" Tuya credentials.
+    tstat_setup_code: String,
+    tstat_busy: bool,
+    tstat_state: Option<crate::hap::ThermostatState>,
+    tstat_error: Option<String>,
+    tstat_discovered: Vec<crate::hap::DiscoveredDevice>,
+    tstat_tx: Sender<TstatResult>,
+    tstat_rx: Receiver<TstatResult>,
+    tstat_last_fetch: Option<Instant>,
 }
 
 /// State of the Add/Edit camera dialog (Rust edition of the web modal).
@@ -4442,6 +4470,7 @@ impl App {
         }
         let cfg = load_config();
         let (tx, rx) = channel::<NetResult>();
+        let (tstat_tx, tstat_rx) = channel::<TstatResult>();
         let mut app = App {
             session: cfg.session.clone(),
             devices: Vec::new(),
@@ -4504,6 +4533,14 @@ impl App {
             applied_style: None,
             view: View::Login,
             cfg: Config::default(),
+            tstat_setup_code: String::new(),
+            tstat_busy: false,
+            tstat_state: None,
+            tstat_error: None,
+            tstat_discovered: Vec::new(),
+            tstat_tx,
+            tstat_rx,
+            tstat_last_fetch: None,
         };
         // Prefill the login form from the saved login (like the web edition).
         if let Some(c) = &cfg.creds {
@@ -5973,7 +6010,111 @@ impl App {
         self.disc_backoff_until = Some(Instant::now() + Duration::from_secs(secs));
     }
 
+    // ---------------- thermostat (HomeKit/HAP) spawns ----------------
+    // Each runs on its own thread and reports over tstat_tx; the UI
+    // never blocks on the LAN. A busy flag serialises operations so
+    // two pair-verify sessions never interleave on one pairing.
+
+    fn spawn_tstat_discover(&mut self) {
+        if self.tstat_busy {
+            return;
+        }
+        self.tstat_busy = true;
+        self.tstat_error = None;
+        let tx = self.tstat_tx.clone();
+        thread::spawn(move || {
+            let res = crate::hap::discover(Duration::from_secs(8));
+            let _ = tx.send(match res {
+                Ok(devs) => TstatResult::Discovered(devs),
+                Err(e) => TstatResult::Failed(format!("Discovery failed: {}", e)),
+            });
+        });
+    }
+
+    fn spawn_tstat_pair(&mut self, device: crate::hap::DiscoveredDevice) {
+        if self.tstat_busy {
+            return;
+        }
+        let code = self.tstat_setup_code.clone();
+        self.tstat_busy = true;
+        self.tstat_error = None;
+        let tx = self.tstat_tx.clone();
+        thread::spawn(move || {
+            let res = crate::hap::pair_device(&device, &code);
+            let _ = tx.send(match res {
+                Ok(p) => TstatResult::Paired(p),
+                Err(e) => TstatResult::Failed(format!("Pairing failed: {}", e)),
+            });
+        });
+    }
+
+    fn spawn_tstat_fetch(&mut self) {
+        if self.tstat_busy {
+            return;
+        }
+        let Some(pairing) = self.cfg.thermostat.clone() else {
+            return;
+        };
+        self.tstat_busy = true;
+        // Attempt time, not just success time: a failed fetch must not
+        // make the autorefresh below retry every frame.
+        self.tstat_last_fetch = Some(Instant::now());
+        let tx = self.tstat_tx.clone();
+        thread::spawn(move || {
+            let res = crate::hap::fetch_state(&pairing);
+            let _ = tx.send(match res {
+                Ok(st) => TstatResult::State(st),
+                Err(e) => TstatResult::Failed(format!("Thermostat refresh failed: {}", e)),
+            });
+        });
+    }
+
+    fn spawn_tstat_set(&mut self, changes: crate::hap::ThermostatChanges) {
+        if self.tstat_busy {
+            return;
+        }
+        let Some(pairing) = self.cfg.thermostat.clone() else {
+            return;
+        };
+        self.tstat_busy = true;
+        let tx = self.tstat_tx.clone();
+        thread::spawn(move || {
+            let res = crate::hap::set_state(&pairing, &changes);
+            let _ = tx.send(match res {
+                Ok(st) => TstatResult::State(st),
+                Err(e) => TstatResult::Failed(format!("Thermostat control failed: {}", e)),
+            });
+        });
+    }
+
     fn poll_net(&mut self) {
+        while let Ok(msg) = self.tstat_rx.try_recv() {
+            match msg {
+                TstatResult::Discovered(devs) => {
+                    self.tstat_busy = false;
+                    self.tstat_discovered = devs;
+                }
+                TstatResult::Paired(p) => {
+                    self.tstat_busy = false;
+                    self.tstat_setup_code.clear();
+                    self.tstat_error = None;
+                    self.cfg.thermostat = Some(p);
+                    self.save();
+                    self.toast("Thermostat paired over HomeKit", false);
+                    self.spawn_tstat_fetch();
+                }
+                TstatResult::State(st) => {
+                    self.tstat_busy = false;
+                    self.tstat_error = None;
+                    self.tstat_last_fetch = Some(Instant::now());
+                    self.tstat_state = Some(st);
+                }
+                TstatResult::Failed(e) => {
+                    self.tstat_busy = false;
+                    self.tstat_error = Some(e);
+                }
+            }
+        }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 NetResult::LoginOk { session, devices } => {
@@ -6488,6 +6629,205 @@ impl App {
         }
     }
 
+    /// Thermostat (HomeKit) card on the dashboard, above the device
+    /// sections and deliberately OUTSIDE the drag/order machinery:
+    /// it is one fixed block, never a sortable section.
+    fn thermostat_block(&mut self, ui: &mut Ui) {
+        let pal = self.pal();
+        // Snapshot what the UI needs so button clicks below can spawn
+        // threads without borrow fights.
+        let paired = self.cfg.thermostat.is_some();
+        let busy = self.tstat_busy;
+        let state = self.tstat_state.clone();
+        let error = self.tstat_error.clone();
+        Frame::new()
+            .fill(pal.card)
+            .stroke(Stroke::new(1.0, pal.border))
+            .corner_radius(CornerRadius::same(14))
+            .inner_margin(Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Thermostat").size(16.5).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(paired && !busy, Button::new("↻ Refresh"))
+                            .clicked()
+                        {
+                            self.spawn_tstat_fetch();
+                        }
+                    });
+                });
+                if !paired {
+                    ui.label(
+                        RichText::new("Not paired — pair in Settings → Thermostat (HomeKit).")
+                            .size(13.0)
+                            .color(pal.dim),
+                    );
+                    ui.label(
+                        RichText::new("Control works on your home network only (local, no cloud).")
+                            .size(12.5)
+                            .color(pal.dim),
+                    );
+                    return;
+                }
+                if busy {
+                    ui.label(RichText::new("Working…").size(12.5).color(pal.dim));
+                }
+                if let Some(e) = error {
+                    ui.label(RichText::new(e).size(12.5).color(DANGER));
+                }
+                let Some(st) = state else {
+                    ui.label(
+                        RichText::new("No reading yet — press ↻ Refresh.")
+                            .size(13.0)
+                            .color(pal.dim),
+                    );
+                    return;
+                };
+                let cur_f = crate::hap::c_to_f(st.current_temp_c);
+                let set_f = crate::hap::c_to_f(st.target_temp_c);
+                ui.label(
+                    RichText::new(format!(
+                        "{} — indoor {:.0}°F, setpoint {:.0}°F{}",
+                        crate::hap::mode_name(st.current_mode),
+                        cur_f,
+                        set_f,
+                        st.humidity
+                            .map(|h| format!(", humidity {:.0}%", h))
+                            .unwrap_or_default()
+                    ))
+                    .size(14.0),
+                );
+                // Mode buttons (Off / Heat / Cool / Auto).
+                ui.horizontal(|ui| {
+                    for (label, mode) in
+                        [("Off", 0u8), ("Heat", 1), ("Cool", 2), ("Auto", 3)]
+                    {
+                        let selected = st.target_mode == mode;
+                        let text = if selected {
+                            RichText::new(label).strong().color(Color32::WHITE)
+                        } else {
+                            RichText::new(label).strong()
+                        };
+                        let btn = Button::new(text);
+                        let resp = if selected {
+                            ui.add_enabled(!busy, btn.fill(self.accent()))
+                        } else {
+                            ui.add_enabled(!busy, btn)
+                        };
+                        if resp.clicked() {
+                            self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                target_mode: Some(mode),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                });
+                // Setpoint −/+ in 1°F steps. Auto mode adjusts its
+                // heat-to / cool-to pair instead of the main setpoint.
+                if st.target_mode == 3 {
+                    if let Some(heat) = st.heat_to_c {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Heat to {:.0}°F",
+                                    crate::hap::c_to_f(heat)
+                                ))
+                                .size(14.0),
+                            );
+                            if ui.add_enabled(!busy, Button::new("−")).clicked() {
+                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                    heat_to_c: Some(crate::hap::f_to_c(
+                                        crate::hap::c_to_f(heat) - 1.0,
+                                    )),
+                                    ..Default::default()
+                                });
+                            }
+                            if ui.add_enabled(!busy, Button::new("+")).clicked() {
+                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                    heat_to_c: Some(crate::hap::f_to_c(
+                                        crate::hap::c_to_f(heat) + 1.0,
+                                    )),
+                                    ..Default::default()
+                                });
+                            }
+                        });
+                    }
+                    if let Some(cool) = st.cool_to_c {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Cool to {:.0}°F",
+                                    crate::hap::c_to_f(cool)
+                                ))
+                                .size(14.0),
+                            );
+                            if ui.add_enabled(!busy, Button::new("−")).clicked() {
+                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                    cool_to_c: Some(crate::hap::f_to_c(
+                                        crate::hap::c_to_f(cool) - 1.0,
+                                    )),
+                                    ..Default::default()
+                                });
+                            }
+                            if ui.add_enabled(!busy, Button::new("+")).clicked() {
+                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                    cool_to_c: Some(crate::hap::f_to_c(
+                                        crate::hap::c_to_f(cool) + 1.0,
+                                    )),
+                                    ..Default::default()
+                                });
+                            }
+                        });
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Setpoint {:.0}°F", set_f)).size(14.0),
+                        );
+                        if ui.add_enabled(!busy, Button::new("−")).clicked() {
+                            self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                target_temp_c: Some(crate::hap::f_to_c(set_f - 1.0)),
+                                ..Default::default()
+                            });
+                        }
+                        if ui.add_enabled(!busy, Button::new("+")).clicked() {
+                            self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                target_temp_c: Some(crate::hap::f_to_c(set_f + 1.0)),
+                                ..Default::default()
+                            });
+                        }
+                    });
+                }
+                // Fan Auto / On, when the accessory exposes a fan.
+                if let Some(fan_on) = st.fan_on {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Fan").size(14.0));
+                        for (label, on) in [("Auto", false), ("On", true)] {
+                            let selected = fan_on == on;
+                            let text = if selected {
+                                RichText::new(label).strong().color(Color32::WHITE)
+                            } else {
+                                RichText::new(label).strong()
+                            };
+                            let btn = Button::new(text);
+                            let resp = if selected {
+                                ui.add_enabled(!busy, btn.fill(self.accent()))
+                            } else {
+                                ui.add_enabled(!busy, btn)
+                            };
+                            if resp.clicked() {
+                                self.spawn_tstat_set(crate::hap::ThermostatChanges {
+                                    fan_on: Some(on),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
     fn view_dashboard(&mut self, ui: &mut Ui) {
         let pal = self.pal();
         let entries = self.all_entries();
@@ -6575,6 +6915,10 @@ impl App {
                         ui.add_space(12.0);
                     }
                 }
+                // ---- thermostat (HomeKit): fixed block above the
+                // sections, outside the drag/order machinery ----
+                self.thermostat_block(ui);
+                ui.add_space(12.0);
                 if self.devices.is_empty() && self.cfg.cameras.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
@@ -8511,6 +8855,129 @@ impl App {
                                 self.toast("Saved login forgotten", false);
                             }
                         });
+                        // ---- Thermostat (HomeKit) ----
+                        Self::settings_panel(ui, &pal, "Thermostat (HomeKit)", |ui| {
+                            ui.label(
+                                RichText::new("Control a HomeKit thermostat (e.g. the Resideo T6 Pro) directly over your home network — no cloud, no account. This works only while this computer is on the same home network as the thermostat; away from home, use the Resideo app or Alexa.")
+                                    .size(12.5)
+                                    .color(pal.dim),
+                            );
+                            ui.add_space(8.0);
+                            let paired = self.cfg.thermostat.clone();
+                            match &paired {
+                                Some(p) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Paired with {} ({}) at {}:{}",
+                                            if p.accessory_name.is_empty() {
+                                                "thermostat"
+                                            } else {
+                                                &p.accessory_name
+                                            },
+                                            if p.accessory_model.is_empty() {
+                                                "HomeKit accessory"
+                                            } else {
+                                                &p.accessory_model
+                                            },
+                                            p.accessory_ip,
+                                            p.accessory_port
+                                        ))
+                                        .size(12.5),
+                                    );
+                                    ui.add_space(6.0);
+                                    if ui
+                                        .add(Button::new(
+                                            RichText::new("Forget pairing").color(DANGER),
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.cfg.thermostat = None;
+                                        self.tstat_state = None;
+                                        self.save();
+                                        self.toast("Thermostat pairing forgotten", false);
+                                    }
+                                    ui.label(
+                                        RichText::new("This only forgets the keys on this computer. To clear the thermostat side, use HomeKit Reset on the unit (Menu → Reset → HomeKit Reset). It never touches WiFi, schedule, or the Resideo link.")
+                                            .size(12.5)
+                                            .color(pal.dim),
+                                    );
+                                }
+                                None => {
+                                    ui.label(RichText::new("Not paired.").size(12.5));
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new("Setup code (shown on the thermostat screen during pairing, or on the sticker in the box):")
+                                            .size(12.5)
+                                            .color(pal.dim),
+                                    );
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.tstat_setup_code)
+                                            .hint_text("123-45-678"),
+                                    );
+                                    ui.label(
+                                        RichText::new("The code is used for this pairing only and is never stored — only the derived keys are saved, like the saved Tuya login above.")
+                                            .size(12.5)
+                                            .color(pal.dim),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !self.tstat_busy,
+                                                Button::new("Discover devices"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.spawn_tstat_discover();
+                                        }
+                                        if self.tstat_busy {
+                                            ui.label(
+                                                RichText::new("Working…")
+                                                    .size(12.5)
+                                                    .color(pal.dim),
+                                            );
+                                        }
+                                    });
+                                    for dev in self.tstat_discovered.clone() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(format!(
+                                                "{} — {} {}",
+                                                dev.name,
+                                                dev.model,
+                                                if dev.unpaired {
+                                                    "(unpaired)"
+                                                } else {
+                                                    "(already paired)"
+                                                }
+                                            )).size(13.0));
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add_enabled(
+                                                            !self.tstat_busy
+                                                                && !self
+                                                                    .tstat_setup_code
+                                                                    .trim()
+                                                                    .is_empty(),
+                                                            Button::new("Pair"),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.spawn_tstat_pair(dev.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.separator();
+                                    }
+                                }
+                            }
+                            if let Some(e) = &self.tstat_error {
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(e.clone()).size(12.5).color(DANGER));
+                            }
+                        });
                         // ---- Hidden devices ----
                         Self::settings_panel(ui, &pal, "Hidden devices", |ui| {
                             ui.label(
@@ -9089,6 +9556,18 @@ impl eframe::App for App {
             }
             ui.ctx().request_repaint_after(Duration::from_millis(500));
         }
+        // Thermostat autorefresh — independent of the Tuya session:
+        // piggybacks the same interval while on the dashboard.
+        if self.view == View::Dashboard && self.cfg.thermostat.is_some() && !self.tstat_busy {
+            let due = self
+                .tstat_last_fetch
+                .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.prefs.interval))
+                .unwrap_or(true);
+            if due {
+                self.spawn_tstat_fetch();
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
         if self.new_group.is_some() {
             self.new_group_window(ui.ctx());
         }
@@ -9217,6 +9696,24 @@ mod tests {
             build_rtsp_url(&c),
             "rtsp://tap%20o:p%40ss%3Aw%2Frd%23%3Fx@192.168.1.50:554/stream1"
         );
+    }
+
+    #[test]
+    fn config_without_thermostat_parses_as_unpaired() {
+        // Old config files predate the HomeKit block: they must load
+        // with thermostat == None, never fail the whole file.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.thermostat.is_none());
+        // A partial thermostat block also parses (serde defaults fill
+        // the rest); validation, not parsing, rejects it.
+        let cfg2: Config = serde_json::from_str(
+            r#"{"thermostat":{"accessory_ip":"192.168.1.5"}}"#,
+        )
+        .unwrap();
+        let p = cfg2.thermostat.unwrap();
+        assert_eq!(p.accessory_ip, "192.168.1.5");
+        assert_eq!(p.accessory_port, 0);
+        assert!(p.validate().is_err());
     }
 
     #[test]
@@ -10891,6 +11388,7 @@ mod tests {
 
     fn test_app(devices: Vec<Device>) -> App {
         let (tx, rx) = channel::<NetResult>();
+        let (tstat_tx, tstat_rx) = channel::<TstatResult>();
         App {
             cfg: Config::default(),
             view: View::Dashboard,
@@ -10953,6 +11451,14 @@ mod tests {
             paused_cams: HashSet::new(),
             player_for: None,
             ffmpeg_cache: None,
+            tstat_setup_code: String::new(),
+            tstat_busy: false,
+            tstat_state: None,
+            tstat_error: None,
+            tstat_discovered: Vec::new(),
+            tstat_tx,
+            tstat_rx,
+            tstat_last_fetch: None,
         }
     }
 
@@ -11121,7 +11627,11 @@ mod tests {
             let mut app = gate_app();
             let ctx = egui::Context::default();
             install_fonts(&ctx);
-            let texts = render_dashboard(&mut app, &ctx, egui::vec2(w, 1080.0), 3);
+            // Rendered at 1200pt tall (was 1080): the dashboard now
+            // carries the fixed Thermostat block above the sections,
+            // so the last section no longer fits in a 1080 fold.
+            // Height does not affect the name budgets under test.
+            let texts = render_dashboard(&mut app, &ctx, egui::vec2(w, 1200.0), 3);
             assert_names_whole(&texts, &GATE_NAMES, &format!("comfortable w={w}"));
         }
         // Compact density: cards shrink to ~198–208pt. Device and

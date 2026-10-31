@@ -17,6 +17,20 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# HomeKit (HAP) thermostat control — pure-Rust, cross-platform pieces
+# only (no OS-specific or Apple-specific dependency). The HAP controller
+# itself is hand-written in src/hap.rs from the protocol description;
+# these crates supply only primitives (hashing, KDF, curves, ciphers,
+# big integers, randomness, mDNS).
+mdns-sd = "0.15"
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+x25519-dalek = "2"
+sha2 = "0.10"
+hkdf = "0.12"
+num-bigint = "0.4"
+rand = "0.8"
+
 # System-tray / menu-bar icon + menu for the startup/tray
 # behaviour. Windows since v1.2.1, macOS since v1.4.0 — the
 # dependency follows the feature (on Linux it would drag in GTK
