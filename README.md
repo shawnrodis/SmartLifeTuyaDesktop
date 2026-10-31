@@ -132,6 +132,25 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 1.6.0
+
+- **New: HomeKit thermostat control.** The desktop editions (Windows
+  and macOS) can now discover, pair with, and control a HomeKit
+  thermostat on your home network — for example a Resideo/Honeywell
+  T6 Pro Smart — with a dashboard tile for indoor temperature, mode,
+  setpoint, and fan. Pairing uses the code shown on the thermostat's
+  screen; the pairing keys are stored in the app's config like the
+  saved Tuya login, and the setup code itself is never stored.
+  Control is local-network only: the app must be running on your
+  home network, and your Resideo app and Alexa control keep working
+  untouched.
+- **Web edition: thermostat via the desktop app.** A browser page
+  can't speak HomeKit directly, so the web edition talks to the
+  desktop app over a loopback-only bridge on the same computer: when
+  the desktop app is running, the web tile shows the same thermostat
+  controls; when it isn't, the tile says so instead of showing dead
+  controls.
+
 ## What's new in 1.5.0
 
 - **Fixed: dragging the window between monitors.** On a mixed-DPI desk

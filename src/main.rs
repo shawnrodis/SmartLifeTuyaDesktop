@@ -29,6 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod hap;
+mod bridge;
 
 // ---------------------------------------------------------------------------
 // Design tokens (DESIGN.md — mirrored 1:1 with the web edition's CSS vars)
@@ -3641,6 +3642,23 @@ enum TstatResult {
     Failed(String),
 }
 
+/// A web-edition thermostat request (arrived over the loopback bridge)
+/// awaiting the background result it dispatched. The reply channel
+/// goes back to the bridge thread, which answers the HTTP request.
+/// The kind is what routes the next TstatResult to the right reply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BridgePendingKind {
+    Status,
+    Discover,
+    Pair,
+    Set,
+}
+
+struct BridgePending {
+    reply: Sender<bridge::BridgeResponse>,
+    kind: BridgePendingKind,
+}
+
 // ---------------------------------------------------------------------------
 // Auto-update (workstream C) — both editions check the project's GitHub
 // "latest release" at most once per 24 h (attempt-based) and compare
@@ -4361,6 +4379,11 @@ struct App {
     tstat_tx: Sender<TstatResult>,
     tstat_rx: Receiver<TstatResult>,
     tstat_last_fetch: Option<Instant>,
+    /// Web-edition bridge requests (see bridge.rs). Drained once per
+    /// frame in poll_net and answered through the same thermostat
+    /// spawns as the desktop tile — never a parallel session.
+    bridge_rx: Receiver<bridge::BridgeJob>,
+    bridge_pending: Option<BridgePending>,
 }
 
 /// State of the Add/Edit camera dialog (Rust edition of the web modal).
@@ -4471,6 +4494,7 @@ impl App {
         let cfg = load_config();
         let (tx, rx) = channel::<NetResult>();
         let (tstat_tx, tstat_rx) = channel::<TstatResult>();
+        let (bridge_tx, bridge_rx) = channel::<bridge::BridgeJob>();
         let mut app = App {
             session: cfg.session.clone(),
             devices: Vec::new(),
@@ -4541,7 +4565,14 @@ impl App {
             tstat_tx,
             tstat_rx,
             tstat_last_fetch: None,
+            bridge_rx,
+            bridge_pending: None,
         };
+        // The loopback bridge for the web edition's thermostat tile:
+        // always running (discovery/pairing need it while unpaired),
+        // never blocking this thread. A bind failure only disables
+        // web-edition control; bridge.rs reports it on stderr.
+        bridge::start_bridge(bridge_tx);
         // Prefill the login form from the saved login (like the web edition).
         if let Some(c) = &cfg.creds {
             app.li_user = c.user_name.clone();
@@ -6087,17 +6118,169 @@ impl App {
         });
     }
 
+    // ---------------- thermostat bridge (web edition) ----------------
+    // Requests arrive on bridge_rx and are answered through the SAME
+    // spawns above: one pairing store (cfg.thermostat), one busy
+    // flag, one result channel. The bridge thread only transports
+    // JSON; it never touches the thermostat or the config itself.
+    // A bridge job that finds the thermostat busy gets a 409 at
+    // once rather than queuing behind the desktop operation.
+
+    fn bridge_busy_reply(reply: Sender<bridge::BridgeResponse>) {
+        let _ = reply.send(bridge::BridgeResponse {
+            status: 409,
+            body: json!({ "error": "thermostat is busy — try again in a moment" }),
+        });
+    }
+
+    fn poll_bridge(&mut self) {
+        while let Ok(job) = self.bridge_rx.try_recv() {
+            self.dispatch_bridge(job);
+        }
+    }
+
+    fn dispatch_bridge(&mut self, job: bridge::BridgeJob) {
+        let reply = job.reply;
+        match job.request {
+            bridge::BridgeRequest::Status => {
+                if self.cfg.thermostat.is_none() {
+                    let _ = reply.send(bridge::BridgeResponse {
+                        status: 200,
+                        body: json!({ "paired": false }),
+                    });
+                } else if self.tstat_busy || self.bridge_pending.is_some() {
+                    Self::bridge_busy_reply(reply);
+                } else {
+                    self.bridge_pending = Some(BridgePending {
+                        reply,
+                        kind: BridgePendingKind::Status,
+                    });
+                    self.spawn_tstat_fetch();
+                }
+            }
+            bridge::BridgeRequest::Discover => {
+                if self.tstat_busy || self.bridge_pending.is_some() {
+                    Self::bridge_busy_reply(reply);
+                } else {
+                    self.bridge_pending = Some(BridgePending {
+                        reply,
+                        kind: BridgePendingKind::Discover,
+                    });
+                    self.spawn_tstat_discover();
+                }
+            }
+            bridge::BridgeRequest::Pair { device_id, pin } => {
+                if self.tstat_busy || self.bridge_pending.is_some() {
+                    Self::bridge_busy_reply(reply);
+                } else {
+                    match self
+                        .tstat_discovered
+                        .iter()
+                        .find(|d| d.id == device_id)
+                        .cloned()
+                    {
+                        None => {
+                            let _ = reply.send(bridge::BridgeResponse {
+                                status: 400,
+                                body: json!({
+                                    "error": "device not found — press Discover again, then pair"
+                                }),
+                            });
+                        }
+                        Some(dev) => {
+                            // Same rule as the desktop panel: the
+                            // code lives in memory only for this
+                            // pairing and is cleared when the
+                            // attempt ends, success or failure.
+                            self.tstat_setup_code = pin;
+                            self.bridge_pending = Some(BridgePending {
+                                reply,
+                                kind: BridgePendingKind::Pair,
+                            });
+                            self.spawn_tstat_pair(dev);
+                        }
+                    }
+                }
+            }
+            bridge::BridgeRequest::Set(req) => {
+                if self.cfg.thermostat.is_none() {
+                    let _ = reply.send(bridge::BridgeResponse {
+                        status: 400,
+                        body: json!({ "error": "thermostat is not paired" }),
+                    });
+                } else if self.tstat_busy || self.bridge_pending.is_some() {
+                    Self::bridge_busy_reply(reply);
+                } else {
+                    let changes = crate::hap::ThermostatChanges {
+                        target_mode: req.mode,
+                        target_temp_c: req.target_f.map(crate::hap::f_to_c),
+                        heat_to_c: req.heat_to_f.map(crate::hap::f_to_c),
+                        cool_to_c: req.cool_to_f.map(crate::hap::f_to_c),
+                        fan_on: req.fan_on,
+                    };
+                    self.bridge_pending = Some(BridgePending {
+                        reply,
+                        kind: BridgePendingKind::Set,
+                    });
+                    self.spawn_tstat_set(changes);
+                }
+            }
+            bridge::BridgeRequest::Forget => {
+                // Exactly the desktop Forget button's semantics:
+                // drop this computer's keys and save. The
+                // thermostat side is cleared with HomeKit Reset on
+                // the unit; the reply carries that note verbatim.
+                self.cfg.thermostat = None;
+                self.tstat_state = None;
+                self.save();
+                let _ = reply.send(bridge::BridgeResponse {
+                    status: 200,
+                    body: json!({
+                        "ok": true,
+                        "note": "This only forgets the keys on this computer. To clear the thermostat side, use HomeKit Reset on the unit (Menu → Reset → HomeKit Reset). It never touches WiFi, schedule, or the Resideo link.",
+                    }),
+                });
+            }
+        }
+    }
+
     fn poll_net(&mut self) {
+        self.poll_bridge();
         while let Ok(msg) = self.tstat_rx.try_recv() {
             match msg {
                 TstatResult::Discovered(devs) => {
                     self.tstat_busy = false;
                     self.tstat_discovered = devs;
+                    if let Some(p) = self.bridge_pending.take() {
+                        if p.kind == BridgePendingKind::Discover {
+                            let _ = p.reply.send(bridge::BridgeResponse {
+                                status: 200,
+                                body: bridge::devices_to_json(&self.tstat_discovered),
+                            });
+                        } else {
+                            // Cannot happen while tstat_busy
+                            // serialises operations, but never
+                            // silently drop a reply channel.
+                            self.bridge_pending = Some(p);
+                        }
+                    }
                 }
                 TstatResult::Paired(p) => {
                     self.tstat_busy = false;
                     self.tstat_setup_code.clear();
                     self.tstat_error = None;
+                    let name = p.accessory_name.clone();
+                    let model = p.accessory_model.clone();
+                    if let Some(bp) = self.bridge_pending.take() {
+                        if bp.kind == BridgePendingKind::Pair {
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 200,
+                                body: json!({ "ok": true, "name": name, "model": model }),
+                            });
+                        } else {
+                            self.bridge_pending = Some(bp);
+                        }
+                    }
                     self.cfg.thermostat = Some(p);
                     self.save();
                     self.toast("Thermostat paired over HomeKit", false);
@@ -6107,11 +6290,47 @@ impl App {
                     self.tstat_busy = false;
                     self.tstat_error = None;
                     self.tstat_last_fetch = Some(Instant::now());
+                    let state_json = bridge::state_to_json(&st);
                     self.tstat_state = Some(st);
+                    match self.bridge_pending.take() {
+                        Some(bp) if bp.kind == BridgePendingKind::Status => {
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 200,
+                                body: json!({ "paired": true, "state": state_json }),
+                            });
+                        }
+                        Some(bp) if bp.kind == BridgePendingKind::Set => {
+                            let _ = bp.reply.send(bridge::BridgeResponse {
+                                status: 200,
+                                body: json!({ "ok": true, "state": state_json }),
+                            });
+                        }
+                        other => self.bridge_pending = other,
+                    }
                 }
                 TstatResult::Failed(e) => {
                     self.tstat_busy = false;
-                    self.tstat_error = Some(e);
+                    self.tstat_error = Some(e.clone());
+                    if let Some(bp) = self.bridge_pending.take() {
+                        // The bridge Pair job's setup code lives
+                        // only for that request: clear it on
+                        // failure too (success clears it above).
+                        if bp.kind == BridgePendingKind::Pair {
+                            self.tstat_setup_code.clear();
+                        }
+                        // A failed Status fetch still proves the
+                        // app is paired (dispatch only fetches when
+                        // paired), so the web page can show
+                        // "paired, no reading" instead of "unpaired".
+                        let mut body = json!({ "error": e });
+                        if bp.kind == BridgePendingKind::Status {
+                            body["paired"] = json!(true);
+                        }
+                        let _ = bp.reply.send(bridge::BridgeResponse {
+                            status: 502,
+                            body,
+                        });
+                    }
                 }
             }
         }
@@ -10119,7 +10338,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "1.5.0");
+        assert_eq!(APP_VERSION, "1.6.0");
     }
 
     #[test]
@@ -11389,6 +11608,9 @@ mod tests {
     fn test_app(devices: Vec<Device>) -> App {
         let (tx, rx) = channel::<NetResult>();
         let (tstat_tx, tstat_rx) = channel::<TstatResult>();
+        // No bridge thread in tests: poll_bridge would just find
+        // the channel disconnected. The sender is dropped here.
+        let (_bridge_tx, bridge_rx) = channel::<bridge::BridgeJob>();
         App {
             cfg: Config::default(),
             view: View::Dashboard,
@@ -11459,6 +11681,8 @@ mod tests {
             tstat_tx,
             tstat_rx,
             tstat_last_fetch: None,
+            bridge_rx,
+            bridge_pending: None,
         }
     }
 

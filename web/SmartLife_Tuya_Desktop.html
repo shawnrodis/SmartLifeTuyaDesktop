@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="1.5.0">
+<meta name="version" content="1.6.0">
 <title>SmartLife &amp; Tuya Desktop</title>
 <style>
   /* ============ Design tokens ============ */
@@ -138,6 +138,21 @@
   .section-head.collapsed .chev{transform:rotate(-90deg)}
   .section-head .count{font-size:12px; color:var(--text-dim); background:var(--card); border:1px solid var(--card-border); padding:1px 8px; border-radius:20px}
   .section-head .spacer{flex:1}
+  .section-head.static{cursor:default}
+  /* Thermostat (web edition, via the desktop app's loopback bridge):
+     a fixed block above the device sections, mirroring the desktop
+     tile. No port numbers or internals in user-facing copy. */
+  .tstat-row{display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px}
+  .tstat-row:first-child{margin-top:0}
+  .tstat-row .spacer{flex:1}
+  .tstat-line{font-size:14px}
+  .tstat-note{font-size:12.5px; color:var(--text-dim); line-height:1.55; margin-top:10px}
+  .tstat-error{font-size:12.5px; color:var(--danger); margin-top:10px}
+  .tstat-dev{display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px solid var(--card-border); flex-wrap:wrap}
+  .tstat-dev:first-child{border-top:none}
+  .tstat-dev .name{font-size:13.5px; font-weight:600}
+  .tstat-dev .meta{font-size:12.5px; color:var(--text-dim)}
+  .tstat-dev .spacer{flex:1}
   /* Group controls strip (Lighting + user groups with lights): sits in
      the header block under the title row, wraps on narrow screens. */
   .group-controls{
@@ -487,7 +502,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">1.5.0</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">1.6.0</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -961,7 +976,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "1.5.0";
+var APP_VERSION = "1.6.0";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/SmartLifeTuyaDesktop/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1989,9 +2004,293 @@ function statusText(d) {
   return parts.join(" · ");
 }
 
+/* ---------------- Thermostat (web edition) ----------------
+   The browser page cannot speak HomeKit, so thermostat control
+   goes through the desktop app's loopback bridge on this computer
+   (the desktop app must be running). The bridge serves thermostat
+   endpoints only. The setup code below is sent to it for one
+   pairing request and is never stored anywhere — not in
+   localStorage, not in any persisted state. */
+var TSTAT_BRIDGE = "http://localhost:18780";
+var TSTAT = {
+  started: false, view: "unknown", busy: false, error: null,
+  state: null, devices: [], code: ""
+};
+
+function tstatRound(f) { return Math.round(f); }
+
+function tstatCall(path, opts, timeoutMs) {
+  var ctrl = null, timer = null;
+  if (typeof AbortController !== "undefined") {
+    ctrl = new AbortController();
+    timer = setTimeout(function () { ctrl.abort(); }, timeoutMs || 100000);
+  }
+  var o = opts || {};
+  if (ctrl) o.signal = ctrl.signal;
+  return fetch(TSTAT_BRIDGE + path, o).then(function (r) {
+    if (timer) clearTimeout(timer);
+    return r.json().then(function (j) {
+      if (!r.ok) {
+        var e = new Error((j && j.error) || ("Bridge error " + r.status));
+        e.body = j;
+        throw e;
+      }
+      return j;
+    });
+  }).catch(function (err) {
+    if (timer) clearTimeout(timer);
+    if (err && err.name === "AbortError") throw new Error("The desktop app took too long to answer — try again.");
+    throw err;
+  });
+}
+
+function tstatFetchStatus() {
+  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  tstatCall("/thermostat/status", {}, 100000).then(function (j) {
+    TSTAT.busy = false;
+    if (j.paired) {
+      TSTAT.view = "paired";
+      TSTAT.state = j.state || null;
+      if (!j.state) TSTAT.error = "No reading yet — press Refresh.";
+    } else {
+      TSTAT.view = "unpaired";
+      TSTAT.state = null;
+    }
+    tstatRender();
+  }, function (err) {
+    TSTAT.busy = false;
+    if (err instanceof TypeError) {
+      /* Network failure (bridge not listening): the desktop app
+         is not running on this computer. */
+      TSTAT.view = "unreachable";
+      TSTAT.error = null;
+    } else {
+      TSTAT.error = err.message;
+      if (err.body && err.body.paired === true) { TSTAT.view = "paired"; TSTAT.state = null; }
+      else if (TSTAT.view === "unknown") TSTAT.view = "unpaired";
+    }
+    tstatRender();
+  });
+}
+
+function tstatDiscover() {
+  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  tstatCall("/thermostat/discover", {}, 60000).then(function (j) {
+    TSTAT.busy = false;
+    TSTAT.devices = j.devices || [];
+    if (!TSTAT.devices.length) TSTAT.error = "No HomeKit devices found on this network.";
+    tstatRender();
+  }, function (err) {
+    TSTAT.busy = false;
+    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
+    else TSTAT.error = err.message;
+    tstatRender();
+  });
+}
+
+function tstatPair(deviceId) {
+  var code = TSTAT.code;
+  TSTAT.code = ""; /* used for this request only; never stored */
+  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  tstatCall("/thermostat/pair", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_id: deviceId, pin: code })
+  }, 100000).then(function () {
+    TSTAT.busy = false;
+    TSTAT.devices = [];
+    toast("Thermostat paired");
+    tstatFetchStatus();
+  }, function (err) {
+    TSTAT.busy = false;
+    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
+    else TSTAT.error = err.message;
+    tstatRender();
+  });
+}
+
+function tstatSet(patch) {
+  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  tstatCall("/thermostat/set", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch)
+  }, 100000).then(function (j) {
+    TSTAT.busy = false;
+    if (j.state) TSTAT.state = j.state;
+    tstatRender();
+  }, function (err) {
+    TSTAT.busy = false;
+    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
+    else TSTAT.error = err.message;
+    tstatRender();
+  });
+}
+
+function tstatSetpoint(delta, which) {
+  var st = TSTAT.state;
+  if (!st) return;
+  var patch = {};
+  if (which === "heat") patch.heat_to_f = tstatRound(st.heat_to_f) + delta;
+  else if (which === "cool") patch.cool_to_f = tstatRound(st.cool_to_f) + delta;
+  else patch.target_f = tstatRound(st.target_f) + delta;
+  tstatSet(patch);
+}
+
+function tstatForget() {
+  TSTAT.busy = true; TSTAT.error = null; tstatRender();
+  tstatCall("/thermostat/forget", { method: "POST" }, 30000).then(function () {
+    TSTAT.busy = false;
+    TSTAT.state = null; TSTAT.devices = [];
+    toast("Thermostat pairing forgotten");
+    tstatFetchStatus();
+  }, function (err) {
+    TSTAT.busy = false;
+    if (err instanceof TypeError) { TSTAT.view = "unreachable"; TSTAT.error = null; }
+    else TSTAT.error = err.message;
+    tstatRender();
+  });
+}
+
+function tstatStepperRow(label, valueF, which) {
+  var row = el("div", "tstat-row");
+  row.appendChild(el("span", "tstat-line", label + " " + tstatRound(valueF) + "°F"));
+  var minus = el("button", "btn small", "−");
+  minus.disabled = TSTAT.busy;
+  minus.addEventListener("click", function () { tstatSetpoint(-1, which); });
+  var plus = el("button", "btn small", "+");
+  plus.disabled = TSTAT.busy;
+  plus.addEventListener("click", function () { tstatSetpoint(1, which); });
+  row.appendChild(minus); row.appendChild(plus);
+  return row;
+}
+
+function renderThermostatSection() {
+  var wrap = el("div", "section");
+  wrap.id = "tstat-section";
+  var head = el("div", "section-head static");
+  head.appendChild(el("h2", null, "Thermostat"));
+  wrap.appendChild(head);
+  var card = el("div", "card");
+  wrap.appendChild(card);
+  if (TSTAT.view === "unknown") {
+    card.appendChild(el("div", "tstat-line", "Checking for the desktop app…"));
+  } else if (TSTAT.view === "unreachable") {
+    card.appendChild(el("div", "tstat-line", "Thermostat control needs the desktop app running on this computer."));
+    card.appendChild(el("div", "tstat-note", "Open the desktop app on this computer, then press Refresh. Thermostat control works on your home network only."));
+    var urow = el("div", "tstat-row");
+    var rb0 = el("button", "btn small primary", "↻ Refresh");
+    rb0.addEventListener("click", tstatFetchStatus);
+    urow.appendChild(rb0);
+    card.appendChild(urow);
+  } else if (TSTAT.view === "unpaired") {
+    card.appendChild(el("div", "tstat-line", "Not paired yet."));
+    card.appendChild(el("div", "tstat-note", "Control works on your home network only, through the desktop app running on this computer."));
+    var drow = el("div", "tstat-row");
+    var db = el("button", "btn small primary", "Discover devices");
+    db.disabled = TSTAT.busy;
+    db.addEventListener("click", tstatDiscover);
+    drow.appendChild(db);
+    card.appendChild(drow);
+    var field = el("div", "field");
+    field.style.marginTop = "12px";
+    field.appendChild(el("label", null, "Setup code (shown on the thermostat screen during pairing, or on the sticker in the box):"));
+    var inp = el("input");
+    inp.type = "text"; inp.id = "tstat-code"; inp.placeholder = "123-45-678";
+    inp.value = TSTAT.code;
+    inp.addEventListener("input", function (ev) {
+      TSTAT.code = ev.target.value;
+      /* Pair buttons enable live as the code is typed (the tile
+         itself only re-renders on fetch completions). */
+      var btns = document.querySelectorAll("#tstat-section .tstat-pair-btn");
+      for (var i = 0; i < btns.length; i++) btns[i].disabled = TSTAT.busy || !TSTAT.code.trim();
+    });
+    field.appendChild(inp);
+    card.appendChild(field);
+    card.appendChild(el("div", "tstat-note", "The code is sent to the desktop app for this pairing only and is never stored — only the derived keys are saved."));
+    TSTAT.devices.forEach(function (d) {
+      var dev = el("div", "tstat-dev");
+      dev.appendChild(el("span", "name", d.name || "Thermostat"));
+      dev.appendChild(el("span", "meta", (d.model || "HomeKit accessory") + (d.paired ? " (already paired)" : " (unpaired)")));
+      dev.appendChild(el("span", "spacer"));
+      var pb = el("button", "btn small primary tstat-pair-btn", "Pair");
+      pb.disabled = TSTAT.busy || !TSTAT.code.trim();
+      pb.addEventListener("click", function () { tstatPair(d.id); });
+      dev.appendChild(pb);
+      card.appendChild(dev);
+    });
+  } else {
+    var st = TSTAT.state;
+    var top = el("div", "tstat-row");
+    if (st) {
+      var line = st.current_mode + " — indoor " + tstatRound(st.temp_f) + "°F, setpoint " + tstatRound(st.target_f) + "°F";
+      if (st.humidity !== null && st.humidity !== undefined) line += ", humidity " + tstatRound(st.humidity) + "%";
+      top.appendChild(el("div", "tstat-line", line));
+    } else {
+      top.appendChild(el("div", "tstat-line", "No reading yet — press Refresh."));
+    }
+    top.appendChild(el("span", "spacer"));
+    var rb = el("button", "btn small", "↻ Refresh");
+    rb.disabled = TSTAT.busy;
+    rb.addEventListener("click", tstatFetchStatus);
+    top.appendChild(rb);
+    card.appendChild(top);
+    if (TSTAT.busy) card.appendChild(el("div", "tstat-note", "Working…"));
+    if (st) {
+      var modes = el("div", "tstat-row");
+      [["Off", "off"], ["Heat", "heat"], ["Cool", "cool"], ["Auto", "auto"]].forEach(function (m) {
+        var b = el("button", "btn small" + (st.mode === m[0] ? " primary" : ""), m[0]);
+        b.disabled = TSTAT.busy;
+        b.addEventListener("click", function () { tstatSet({ mode: m[1] }); });
+        modes.appendChild(b);
+      });
+      card.appendChild(modes);
+      if (st.mode === "Auto") {
+        if (st.heat_to_f !== null && st.heat_to_f !== undefined) card.appendChild(tstatStepperRow("Heat to", st.heat_to_f, "heat"));
+        if (st.cool_to_f !== null && st.cool_to_f !== undefined) card.appendChild(tstatStepperRow("Cool to", st.cool_to_f, "cool"));
+      } else {
+        card.appendChild(tstatStepperRow("Setpoint", st.target_f, "target"));
+      }
+      if (st.fan_on !== null && st.fan_on !== undefined) {
+        var fan = el("div", "tstat-row");
+        fan.appendChild(el("span", "tstat-line", "Fan"));
+        [["Auto", "auto", false], ["On", "on", true]].forEach(function (f) {
+          var b = el("button", "btn small" + (st.fan_on === f[2] ? " primary" : ""), f[0]);
+          b.disabled = TSTAT.busy;
+          b.addEventListener("click", function () { tstatSet({ fan: f[1] }); });
+          fan.appendChild(b);
+        });
+        card.appendChild(fan);
+      }
+    }
+    var frow = el("div", "tstat-row");
+    var fb = el("button", "btn small danger", "Forget pairing");
+    fb.disabled = TSTAT.busy;
+    fb.addEventListener("click", tstatForget);
+    frow.appendChild(fb);
+    card.appendChild(frow);
+    card.appendChild(el("div", "tstat-note", "This only forgets the keys on this computer. To clear the thermostat side, use HomeKit Reset on the unit (Menu → Reset → HomeKit Reset). It never touches WiFi, schedule, or the Resideo link."));
+  }
+  if (TSTAT.error) card.appendChild(el("div", "tstat-error", TSTAT.error));
+  return wrap;
+}
+
+function tstatRender() {
+  var old = $("tstat-section");
+  if (old) old.replaceWith(renderThermostatSection());
+}
+
 function renderAll() {
   var dash = $("dash");
   dash.innerHTML = "";
+  /* Fixed thermostat block above the device sections, mirroring
+     the desktop tile; deliberately outside the section ordering
+     and drag machinery. First render kicks off the bridge check. */
+  dash.appendChild(renderThermostatSection());
+  if (!TSTAT.started) {
+    TSTAT.started = true;
+    tstatFetchStatus();
+  }
   var sections = sectionsModel();
   if (!sections.length) {
     dash.appendChild(el("div", "empty-note", "No devices to show. Press ↻ Refresh, or unhide devices in Settings."));
