@@ -4305,6 +4305,62 @@ fn session_expired_hint_needed(err: &str, has_saved_creds: bool) -> bool {
     err == "Session expired" && !has_saved_creds
 }
 
+// ---------------------------------------------------------------------------
+// Per-refresh background re-login (v2.0.4): only a fresh session
+// returns current states (v2.0.3 field result: refresh on the
+// existing session shows stale explicit states while a fresh login
+// shows truth), so every refresh cycle re-logs in first —
+// internally simulating a sign-off/sign-in with the saved
+// credentials, skipping the refresh token. No form, no toast, no
+// user interaction. Guards keep this from becoming an auth hammer:
+// no saved creds skips it; a throttle error pauses re-logins for
+// a bounded window; any other failure falls back to the existing
+// session for that cycle. Successes are never logged — at
+// autorefresh cadence that would flood the 200-entry log; correct
+// states are the proof of success.
+// ---------------------------------------------------------------------------
+
+/// How long background re-logins pause after the auth endpoint
+/// throttles them. Matches the discovery backoff cap (300s).
+const REFRESH_RELOGIN_BACKOFF_MS: i64 = 300_000;
+
+/// Process-wide throttle window for per-refresh re-logins, set by
+/// the discovery worker when auth throttles it. A static (not App
+/// state) because the worker thread cannot report back to App
+/// except through its single NetResult; the window only gates
+/// re-login attempts, never discovery itself.
+static REFRESH_RELOGIN_THROTTLE_UNTIL_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Whether the no-saved-login hint has already been logged for the
+/// current creds-absent stretch. Bounds the hint to once per
+/// stretch instead of once per 30s cycle; cleared whenever saved
+/// credentials exist, so a later creds-absent stretch logs again.
+static REFRESH_RELOGIN_NO_CREDS_HINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Pure decision: may a background re-login be attempted now?
+fn refresh_relogin_allowed(now_ms: i64, throttle_until_ms: i64) -> bool {
+    now_ms >= throttle_until_ms
+}
+
+/// True when an auth error means the auth endpoint throttled us
+/// (as opposed to wrong credentials or a network failure).
+/// Reuses the discovery rate-limit spellings and adds generic
+/// throttle/429 wording, because net_auth surfaces API messages
+/// verbatim and a throttled login may not use the skill codes.
+fn is_throttle_error(err: &str) -> bool {
+    if is_rate_limit_code(err) {
+        return true;
+    }
+    let e = err.to_ascii_lowercase();
+    e.contains("too many")
+        || e.contains("rate limit")
+        || e.contains("ratelimit")
+        || e.contains("throttl")
+        || e.contains("429")
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ControlOutcome {
     Ok,
@@ -5164,6 +5220,73 @@ impl App {
         let previous = self.raw_devices.clone();
         thread::spawn(move || {
             let client = http_client();
+            // v2.0.4: per-refresh background re-login (see the
+            // header above the helpers). Only a fresh session
+            // returns current states, so re-login with the saved
+            // credentials before discovery — skipping the refresh
+            // token, which is what goes stale. The existing
+            // fresh_session → discovery chain below is unchanged:
+            // it runs on the fresh session when re-login succeeded
+            // (fresh_session returns it as-is, since it is nowhere
+            // near expiry) and on the existing session when
+            // re-login was skipped or failed. The v2.0.2 Auth
+            // retry and v2.0.3 merge-preserve behavior are
+            // preserved because that chain is untouched.
+            let mut session = session;
+            match &creds {
+                Some((c, pw)) => {
+                    // A re-login attempt clears the no-creds hint
+                    // flag, so a later creds-absent stretch logs
+                    // its hint again.
+                    REFRESH_RELOGIN_NO_CREDS_HINTED
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    if refresh_relogin_allowed(
+                        now_ms(),
+                        REFRESH_RELOGIN_THROTTLE_UNTIL_MS
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    ) {
+                        match net_auth(&client, c, pw, &prefs) {
+                            Ok(s) => {
+                                session = s;
+                                // Success: deliberately not logged
+                                // (see header) — correct states are
+                                // the proof.
+                            }
+                            Err(e) => {
+                                if is_throttle_error(&e) {
+                                    REFRESH_RELOGIN_THROTTLE_UNTIL_MS.store(
+                                        now_ms() + REFRESH_RELOGIN_BACKOFF_MS,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    crate::hap::tstat_log(&format!(
+                                        "background re-login throttled ({e}) — re-login paused for 5 minutes, using existing session"
+                                    ));
+                                } else {
+                                    crate::hap::tstat_log(&format!(
+                                        "background re-login failed: {e} — using existing session"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    // else: inside the throttle window — silently
+                    // use the existing session; the engagement line
+                    // already logged when the window opened.
+                }
+                None => {
+                    // No saved login: re-login is impossible. Name
+                    // it once per stretch instead of every cycle;
+                    // the DiscErr path still names it whenever a
+                    // session actually expires with no saved login.
+                    if !REFRESH_RELOGIN_NO_CREDS_HINTED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        crate::hap::tstat_log(
+                            "refresh without saved login — background re-login unavailable (sign in again with Keep me logged in)",
+                        );
+                    }
+                }
+            }
             let msg = match fresh_session(&client, &session, &creds, &prefs, force) {
                 Ok(s1) => match net_discovery(&client, &s1, &prefs, &previous) {
                     Ok(devices) => NetResult::DiscOk { session: s1, devices },
@@ -11483,7 +11606,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.3");
+        assert_eq!(APP_VERSION, "2.0.4");
     }
 
     #[test]
@@ -12928,6 +13051,56 @@ mod tests {
             false
         ));
         assert!(!session_expired_hint_needed("Network error: boom", false));
+    }
+
+    #[test]
+    fn refresh_relogin_allowed_respects_throttle_window() {
+        // v2.0.4: the throttle window gates re-login attempts only;
+        // discovery itself always runs on whatever session results.
+        assert!(refresh_relogin_allowed(1000, 0));
+        assert!(refresh_relogin_allowed(1000, 1000)); // boundary: allowed at expiry
+        assert!(!refresh_relogin_allowed(999, 1000));
+        assert!(!refresh_relogin_allowed(0, 300_000));
+        assert!(refresh_relogin_allowed(300_000, 300_000));
+    }
+
+    #[test]
+    fn refresh_relogin_backoff_window_is_five_minutes() {
+        // Matches the discovery backoff cap (300s).
+        assert_eq!(REFRESH_RELOGIN_BACKOFF_MS, 300_000);
+    }
+
+    #[test]
+    fn throttle_error_classifier() {
+        // Throttle spellings: skill rate-limit codes plus generic
+        // throttle/429 wording, since net_auth surfaces API
+        // messages verbatim.
+        for e in [
+            "FrequentlyInvoke",
+            "TooManyRequests",
+            "API error: FrequentlyInvoke",
+            "too many requests",
+            "Rate limit exceeded",
+            "request throttled",
+            "HTTP 429",
+        ] {
+            assert!(is_throttle_error(e), "{e} should classify as throttle");
+        }
+        // Not throttle: auth-dead, wrong creds, network, device
+        // codes, and empty. A dead session is an Auth failure for
+        // the existing retry path, not a throttle backoff.
+        for e in [
+            "Session expired",
+            "Login failed — check username, password and region.",
+            "Network error: connection timed out",
+            "InvalidDeviceId",
+            "",
+        ] {
+            assert!(
+                !is_throttle_error(e),
+                "{e} should NOT classify as throttle"
+            );
+        }
     }
 
     #[test]

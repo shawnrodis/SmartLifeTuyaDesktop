@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="2.0.3">
+<meta name="version" content="2.0.4">
 <title>Homestead</title>
 <style>
   /* ============ Design tokens ============ */
@@ -505,7 +505,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">2.0.3</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">2.0.4</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -985,7 +985,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "2.0.3";
+var APP_VERSION = "2.0.4";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/Homestead/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 

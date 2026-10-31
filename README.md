@@ -132,6 +132,15 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.4
+
+- **Refresh re-logs in first.** Every refresh cycle — manual and
+  automatic — now signs in again in the background before fetching,
+  so discovery runs on a fresh session exactly like a manual login
+  does. If the login itself is ever throttled, re-logins pause for
+  five minutes and refresh continues on the existing session; if no
+  login is saved, refresh runs on the existing session as before.
+
 ## What's new in 2.0.3
 
 - **Thermostat sets verify before reporting failure.** A lost
