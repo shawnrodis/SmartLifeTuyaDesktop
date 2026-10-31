@@ -301,7 +301,6 @@ struct Prefs {
     theme: String,
     accent: String,
     density: String,
-    autorefresh: bool,
     interval: u64,
     proxy_preset: String,
     proxy_custom: String,
@@ -376,7 +375,6 @@ impl Default for Prefs {
             theme: "black".into(),
             accent: "#6366f1".into(),
             density: "comfortable".into(),
-            autorefresh: true,
             interval: 30,
             proxy_preset: "auto".into(),
             proxy_custom: String::new(),
@@ -4179,6 +4177,14 @@ fn fresh_session(
         }
     }
     if let Some((c, pw)) = creds {
+        // Record the attempt: this fallback auth counts against
+        // Tuya's 180 s limit, so the per-refresh gate must see it
+        // (v2.0.5). The gate itself does not cover this path —
+        // dead-session recovery and control toggles need it
+        // ungated — but its attempts must still advance the
+        // timestamp, or the next refresh re-login would trip
+        // the wall.
+        REFRESH_RELOGIN_LAST_AUTH_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         return net_auth(client, c, pw, prefs);
     }
     Err("Session expired".to_string())
@@ -4306,23 +4312,48 @@ fn session_expired_hint_needed(err: &str, has_saved_creds: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Per-refresh background re-login (v2.0.4): only a fresh session
-// returns current states (v2.0.3 field result: refresh on the
-// existing session shows stale explicit states while a fresh login
-// shows truth), so every refresh cycle re-logs in first —
-// internally simulating a sign-off/sign-in with the saved
+// Per-refresh background re-login (v2.0.4, gated in v2.0.5): only a
+// fresh session returns current states (v2.0.3 field result:
+// refresh on the existing session shows stale explicit states
+// while a fresh login shows truth), so refresh cycles re-login
+// first — internally simulating a sign-off/sign-in with the saved
 // credentials, skipping the refresh token. No form, no toast, no
-// user interaction. Guards keep this from becoming an auth hammer:
-// no saved creds skips it; a throttle error pauses re-logins for
-// a bounded window; any other failure falls back to the existing
-// session for that cycle. Successes are never logged — at
-// autorefresh cadence that would flood the 200-entry log; correct
-// states are the proof of success.
+// user interaction. v2.0.5 gates it: Tuya allows at most one auth
+// per 180 s ("you cannot auth exceed once in 180 seconds"), so
+// the ungated per-cycle re-login ran straight into that wall.
+// Now a re-login runs only when at least 185 s have passed since
+// the last auth attempt (180 s + 5 s skew margin); other cycles
+// run discovery on the existing session, unchanged. That yields
+// the user's cadence exactly: 30 s normal refreshes, a fresh
+// session roughly every 6th cycle. Guards keep this from becoming
+// an auth hammer: no saved creds skips it; a throttle error
+// pauses re-logins for a bounded window; any other failure falls
+// back to the existing session for that cycle. Gated re-login
+// outcomes are logged (at ~20 lines/hour that fits the 200-entry
+// log); the no-saved-login hint stays once per stretch.
 // ---------------------------------------------------------------------------
 
 /// How long background re-logins pause after the auth endpoint
 /// throttles them. Matches the discovery backoff cap (300s).
 const REFRESH_RELOGIN_BACKOFF_MS: i64 = 300_000;
+
+/// Minimum spacing between auth.do attempts (v2.0.5): Tuya allows
+/// at most one auth per 180 s. The 5 s margin covers server-side
+/// clock skew so a re-login at the boundary never trips the wall.
+const REFRESH_RELOGIN_MIN_INTERVAL_MS: i64 = 185_000;
+
+/// Last auth.do attempt (ms since epoch), process-wide like the
+/// throttle window. Every auth attempt counts against Tuya's
+/// 180 s limit, whether it succeeds, fails, or throttles — so the
+/// timestamp is recorded when the attempt is made, not on its
+/// outcome (per-refresh re-login, dead-session retry, fresh
+/// sign-in, and fresh_session's fallback all stamp it). Defaults
+/// to 0 ("long ago"): a restored old session (app start with a
+/// saved session, not freshly authed) therefore re-logs in on its
+/// first refresh, while a fresh sign-in stamps it and the next
+/// immediate refresh does not re-login.
+static REFRESH_RELOGIN_LAST_AUTH_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
 
 /// Process-wide throttle window for per-refresh re-logins, set by
 /// the discovery worker when auth throttles it. A static (not App
@@ -4342,6 +4373,16 @@ static REFRESH_RELOGIN_NO_CREDS_HINTED: std::sync::atomic::AtomicBool =
 /// Pure decision: may a background re-login be attempted now?
 fn refresh_relogin_allowed(now_ms: i64, throttle_until_ms: i64) -> bool {
     now_ms >= throttle_until_ms
+}
+
+/// Pure decision (v2.0.5): may a gated background re-login be
+/// attempted now? Open only when the throttle window has lapsed
+/// AND at least 185 s have passed since the last auth attempt.
+/// Composes the v2.0.4 throttle decision so that test still pins
+/// its half; the interval half is pinned by the gate tests.
+fn refresh_relogin_gate_open(now_ms: i64, last_auth_ms: i64, throttle_until_ms: i64) -> bool {
+    refresh_relogin_allowed(now_ms, throttle_until_ms)
+        && now_ms - last_auth_ms >= REFRESH_RELOGIN_MIN_INTERVAL_MS
 }
 
 /// True when an auth error means the auth endpoint throttled us
@@ -5189,7 +5230,13 @@ impl App {
         let previous = self.raw_devices.clone();
         thread::spawn(move || {
             let client = http_client();
-            let msg = match net_auth(&client, &creds, &plain_pw, &prefs) {
+            // A fresh sign-in counts as an auth attempt (v2.0.5):
+            // record it whether it succeeds or fails, so the next
+            // immediate refresh does not re-login and trip the
+            // 180 s wall.
+            let auth = net_auth(&client, &creds, &plain_pw, &prefs);
+            REFRESH_RELOGIN_LAST_AUTH_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+            let msg = match auth {
                 Ok(session) => match net_discovery(&client, &session, &prefs, &previous) {
                     Ok(devices) => NetResult::LoginOk { session, devices },
                     Err(DiscoveryFail::Frequent) => NetResult::LoginOk { session, devices: Vec::new() },
@@ -5220,11 +5267,13 @@ impl App {
         let previous = self.raw_devices.clone();
         thread::spawn(move || {
             let client = http_client();
-            // v2.0.4: per-refresh background re-login (see the
-            // header above the helpers). Only a fresh session
+            // v2.0.4, gated in v2.0.5: per-refresh background re-login
+            // (see the header above the helpers). Only a fresh session
             // returns current states, so re-login with the saved
             // credentials before discovery — skipping the refresh
-            // token, which is what goes stale. The existing
+            // token, which is what goes stale — but only when the
+            // 180 s gate is open; otherwise discovery runs on the
+            // existing session. The existing
             // fresh_session → discovery chain below is unchanged:
             // it runs on the fresh session when re-login succeeded
             // (fresh_session returns it as-is, since it is nowhere
@@ -5240,22 +5289,35 @@ impl App {
                     // its hint again.
                     REFRESH_RELOGIN_NO_CREDS_HINTED
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    if refresh_relogin_allowed(
-                        now_ms(),
+                    let now = now_ms();
+                    if refresh_relogin_gate_open(
+                        now,
+                        REFRESH_RELOGIN_LAST_AUTH_MS
+                            .load(std::sync::atomic::Ordering::Relaxed),
                         REFRESH_RELOGIN_THROTTLE_UNTIL_MS
                             .load(std::sync::atomic::Ordering::Relaxed),
                     ) {
+                        // Record the attempt BEFORE the call: Tuya
+                        // counts the auth.do call itself against
+                        // the 180 s limit, whatever its outcome.
+                        REFRESH_RELOGIN_LAST_AUTH_MS
+                            .store(now, std::sync::atomic::Ordering::Relaxed);
                         match net_auth(&client, c, pw, &prefs) {
                             Ok(s) => {
                                 session = s;
-                                // Success: deliberately not logged
-                                // (see header) — correct states are
-                                // the proof.
+                                // Gated outcomes are logged (v2.0.5):
+                                // at ~180 s cadence this is ~20
+                                // lines/hour, affordable in the
+                                // 200-entry log, and proves the
+                                // cadence in the field.
+                                crate::hap::tstat_log(
+                                    "background re-login ok — fresh session for discovery",
+                                );
                             }
                             Err(e) => {
                                 if is_throttle_error(&e) {
                                     REFRESH_RELOGIN_THROTTLE_UNTIL_MS.store(
-                                        now_ms() + REFRESH_RELOGIN_BACKOFF_MS,
+                                        now + REFRESH_RELOGIN_BACKOFF_MS,
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
                                     crate::hap::tstat_log(&format!(
@@ -5269,9 +5331,10 @@ impl App {
                             }
                         }
                     }
-                    // else: inside the throttle window — silently
-                    // use the existing session; the engagement line
-                    // already logged when the window opened.
+                    // else: gate closed (inside the 180 s window
+                    // or the throttle window) — silently use the
+                    // existing session; the engagement line already
+                    // logged when the throttle window opened.
                 }
                 None => {
                     // No saved login: re-login is impossible. Name
@@ -5303,7 +5366,18 @@ impl App {
                             "discovery auth failure: {e} — background re-login"
                         ));
                         match &creds {
-                            Some((c, pw)) => match net_auth(&client, c, pw, &prefs) {
+                            Some((c, pw)) => match {
+                                // Record the attempt: a dead-session
+                                // recovery auth counts against
+                                // Tuya's 180 s limit exactly like a
+                                // gated re-login, so the gate must
+                                // see it (v2.0.5).
+                                REFRESH_RELOGIN_LAST_AUTH_MS.store(
+                                    now_ms(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                net_auth(&client, c, pw, &prefs)
+                            } {
                                 Ok(s2) => {
                                     crate::hap::tstat_log(
                                         "background re-login ok — retrying discovery",
@@ -7776,9 +7850,6 @@ impl App {
                         if ui.add(Button::new(edit_label)).clicked() {
                             self.set_editing(!self.editing);
                         }
-                        if ui.add(Button::new("↻ Refresh")).clicked() {
-                            self.spawn_discovery(false);
-                        }
                         // Snap to monitor (v1.3.0) — WINDOWS ONLY
                         // (v1.4.0): the mechanism is direct Win32,
                         // so the button doesn't exist on macOS at
@@ -7839,11 +7910,6 @@ impl App {
                             });
                         if interval != self.cfg.prefs.interval {
                             self.cfg.prefs.interval = interval;
-                            self.save();
-                        }
-                        let mut auto = self.cfg.prefs.autorefresh;
-                        if ui.checkbox(&mut auto, "Autorefresh").changed() {
-                            self.cfg.prefs.autorefresh = auto;
                             self.save();
                         }
                         ui.add(
@@ -10927,6 +10993,35 @@ impl App {
             }
         }
     }
+
+    /// Automatic-refresh driver (v2.0.5): the timer is the only
+    /// Tuya refresh path and it is always on — no toggle, no
+    /// manual button. Paused while editing, dragging, or typing.
+    /// Extracted from `ui` so the timer path is unit-testable
+    /// without an eframe::Frame.
+    fn maybe_autorefresh(&mut self, ctx: &egui::Context) {
+        if self.view == View::Dashboard
+            && self.session.is_some()
+            && !self.editing
+            && !self.dragging_slider
+            && !ctx.input(|i| i.pointer.primary_down())
+        {
+            let due = self
+                .last_fetch
+                .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.prefs.interval))
+                .unwrap_or(false);
+            // Rate-limit backoff (v1.2.0): skip cycles silently until
+            // it lapses — the cached devices stay on screen meanwhile.
+            let backed_off = self
+                .disc_backoff_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
+            if due && !self.disc_busy && !backed_off {
+                self.spawn_discovery(false);
+            }
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -11018,29 +11113,10 @@ impl eframe::App for App {
                     .show(ui, |ui| self.view_settings(ui));
             }
         }
-        // Autorefresh — paused while editing, dragging, or typing.
-        if self.view == View::Dashboard
-            && self.session.is_some()
-            && self.cfg.prefs.autorefresh
-            && !self.editing
-            && !self.dragging_slider
-            && !ui.ctx().input(|i| i.pointer.primary_down())
-        {
-            let due = self
-                .last_fetch
-                .map(|t| t.elapsed() >= Duration::from_secs(self.cfg.prefs.interval))
-                .unwrap_or(false);
-            // Rate-limit backoff (v1.2.0): skip cycles silently until
-            // it lapses — the cached devices stay on screen meanwhile.
-            let backed_off = self
-                .disc_backoff_until
-                .map(|t| Instant::now() < t)
-                .unwrap_or(false);
-            if due && !self.disc_busy && !backed_off {
-                self.spawn_discovery(false);
-            }
-            ui.ctx().request_repaint_after(Duration::from_millis(500));
-        }
+        // Automatic refresh — always on (v2.0.5: no toggle, no
+        // manual button; the timer is the only Tuya refresh path).
+        // Paused while editing, dragging, or typing.
+        self.maybe_autorefresh(ui.ctx());
         // Thermostat autorefresh — independent of the Tuya session:
         // piggybacks the same interval while on the dashboard.
         if self.view == View::Dashboard && self.cfg.thermostat.is_some() && !self.tstat_busy && !self.tstat_fetch_busy && !self.tstat_set_busy {
@@ -11606,7 +11682,7 @@ mod tests {
         assert!(!version_newer("1.1.0", "1.1.0"));
         assert!(version_newer("1.10.0", "1.9.0"));
         assert!(version_newer("v1.2.0", "1.1.0"));
-        assert_eq!(APP_VERSION, "2.0.4");
+        assert_eq!(APP_VERSION, "2.0.5");
     }
 
     #[test]
@@ -13068,6 +13144,123 @@ mod tests {
     fn refresh_relogin_backoff_window_is_five_minutes() {
         // Matches the discovery backoff cap (300s).
         assert_eq!(REFRESH_RELOGIN_BACKOFF_MS, 300_000);
+    }
+
+    #[test]
+    fn refresh_relogin_gate_boundary_185s() {
+        // v2.0.5: the gate is 180 s + 5 s skew margin. Throttle
+        // lapsed (until = 0) throughout, so only the interval half
+        // is under test here.
+        let now = 1_000_000;
+        assert!(!refresh_relogin_gate_open(now, now - 184_999, 0));
+        assert!(refresh_relogin_gate_open(now, now - 185_000, 0)); // boundary: open at exactly 185 s
+        assert!(refresh_relogin_gate_open(now, now - 200_000, 0));
+        assert!(refresh_relogin_gate_open(now, 0, 0)); // "long ago" (restored session default)
+        // Throttle window still blocks even with the interval met.
+        assert!(!refresh_relogin_gate_open(now, 0, now + 1));
+        assert!(refresh_relogin_gate_open(now, 0, now)); // throttle lapsed at expiry
+        assert_eq!(REFRESH_RELOGIN_MIN_INTERVAL_MS, 185_000);
+    }
+
+    #[test]
+    fn refresh_relogin_gate_shared_timestamp_semantics() {
+        // v2.0.5: autorefresh and manual Refresh both funnel into
+        // spawn_discovery's worker, which reads the one process-wide
+        // timestamp — so both paths observe the same gate. This
+        // single test owns the static (no other test reads it) to
+        // avoid parallel-test interference, and resets it to the
+        // 0 default at the end.
+        use std::sync::atomic::Ordering::Relaxed;
+        // Restored old session: never stamped (static default 0 =
+        // "long ago") → first refresh re-logs in promptly.
+        REFRESH_RELOGIN_LAST_AUTH_MS.store(0, Relaxed);
+        assert!(refresh_relogin_gate_open(
+            10_000_000,
+            REFRESH_RELOGIN_LAST_AUTH_MS.load(Relaxed),
+            0
+        ));
+        // Fresh sign-in stamps the gate (spawn_login records its
+        // auth attempt) → the next immediate refresh, manual or
+        // auto, does not re-login.
+        let t0 = 10_000_000;
+        REFRESH_RELOGIN_LAST_AUTH_MS.store(t0, Relaxed);
+        let manual_now = t0 + 100_000;
+        let auto_now = t0 + 100_000;
+        assert!(!refresh_relogin_gate_open(
+            manual_now,
+            REFRESH_RELOGIN_LAST_AUTH_MS.load(Relaxed),
+            0
+        ));
+        assert!(!refresh_relogin_gate_open(
+            auto_now,
+            REFRESH_RELOGIN_LAST_AUTH_MS.load(Relaxed),
+            0
+        ));
+        // ~6th cycle later (185 s+): both paths open.
+        let later = t0 + 200_000;
+        assert!(refresh_relogin_gate_open(
+            later,
+            REFRESH_RELOGIN_LAST_AUTH_MS.load(Relaxed),
+            0
+        ));
+        assert!(refresh_relogin_gate_open(
+            later,
+            REFRESH_RELOGIN_LAST_AUTH_MS.load(Relaxed),
+            0
+        ));
+        REFRESH_RELOGIN_LAST_AUTH_MS.store(0, Relaxed);
+    }
+
+    #[test]
+    fn dashboard_header_has_no_manual_refresh() {
+        // v2.0.5: no manual Tuya-discovery trigger may remain —
+        // the header must render neither a Refresh button nor an
+        // Autorefresh toggle. Unpaired app, so the thermostat
+        // section's own Refresh (a local HAP fetch, kept) is not
+        // on screen either; any "↻ Refresh" text would be the
+        // removed header button.
+        let mut app = gate_app();
+        app.cfg.thermostat = None;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let size = egui::vec2(1330.0, 1200.0);
+        let texts = render_header(&mut app, &ctx, size, 2);
+        let drawn: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            !drawn.contains(&"↻ Refresh"),
+            "header must not render a manual Refresh button: {drawn:?}"
+        );
+        assert!(
+            !drawn.contains(&"Autorefresh"),
+            "header must not render an Autorefresh toggle: {drawn:?}"
+        );
+        // The header itself still renders (brand lives on, not
+        // removed with the button).
+        assert!(drawn.contains(&"Homestead"), "header brand missing: {drawn:?}");
+    }
+
+    #[test]
+    fn autorefresh_timer_runs_without_toggle() {
+        // v2.0.5: the timer is the only Tuya refresh path and it
+        // is always on — no toggle, no flag consulted. With a
+        // session, a stale last_fetch, and the dashboard up, the
+        // driver spawns discovery (disc_busy set synchronously;
+        // the spawned worker's result is never polled here, as in
+        // the thermostat fetch test). The driver lives in `ui`
+        // (which needs an eframe::Frame), so the test calls the
+        // extracted `maybe_autorefresh` directly.
+        let mut app = gate_app();
+        app.session = Some(test_session());
+        app.last_fetch =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3600));
+        app.disc_backoff_until = None;
+        app.disc_busy = false;
+        app.editing = false;
+        app.dragging_slider = false;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        app.maybe_autorefresh(&ctx);
+        assert!(app.disc_busy, "timer driver must spawn discovery");
     }
 
     #[test]

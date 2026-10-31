@@ -132,6 +132,19 @@ instructions below.)
   (web: this browser's local storage; native apps: a JSON config in your
   user profile) so the app can silently re-login when the session expires.
 
+## What's new in 2.0.5
+
+- **The manual Refresh button is gone.** Autorefresh is now the only
+  way Tuya states update, and it is always on — no off switch, since
+  with no manual button, off would leave states frozen. The interval
+  dropdown stays.
+- **Re-login is gated to every 180 seconds.** Normal refreshes run
+  every 30 seconds on the existing session; a background simulated
+  log-off/log-in runs only when at least 180 seconds (plus a small
+  safety margin) have passed since the last login, so the app can
+  never trip Tuya's one-auth-per-180-seconds limit. The diagnostics
+  log shows each re-login, roughly every three minutes.
+
 ## What's new in 2.0.4
 
 - **Refresh re-logs in first.** Every refresh cycle — manual and

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="version" content="2.0.4">
+<meta name="version" content="2.0.5">
 <title>Homestead</title>
 <style>
   /* ============ Design tokens ============ */
@@ -429,14 +429,12 @@
       <span class="updated" id="last-updated"></span>
       <div class="hgroup">
         <input type="text" id="inp-search" placeholder="🔍 Search devices…" aria-label="Search devices">
-        <label class="checkline"><input type="checkbox" id="chk-autorefresh"> Autorefresh</label>
         <select id="sel-interval" title="Refresh interval">
           <option value="15">15s</option>
           <option value="30" selected>30s</option>
           <option value="60">60s</option>
           <option value="120">2 min</option>
         </select>
-        <button class="btn" id="btn-refresh">↻ Refresh</button>
         <button class="btn hidden" id="btn-monitor">🖥 Monitor</button>
         <button class="btn" id="btn-edit">✎ Edit</button>
         <button class="btn" id="btn-settings">⚙ Settings</button>
@@ -505,7 +503,7 @@
 
       <div class="panel">
         <h3>App updates</h3>
-        <p class="hint">You're running version <b id="upd-current">2.0.4</b>. This page checks
+        <p class="hint">You're running version <b id="upd-current">2.0.5</b>. This page checks
         GitHub for updates at most once a day; you can also check now.</p>
         <p class="hint" id="upd-status"></p>
         <div>
@@ -985,7 +983,7 @@ function mergeDeviceData(fresh, previous) {
 /* ---------------- Auto-update (shared with the Windows edition) ----
    Both editions share one version number and check the project's
    GitHub "latest release" at most once per 24 h (attempt-based). */
-var APP_VERSION = "2.0.4";
+var APP_VERSION = "2.0.5";
 var RELEASES_API = "https://api.github.com/repos/shawnrodis/Homestead/releases/latest";
 var UPDATE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
@@ -1516,7 +1514,7 @@ function defaultPrefs() {
     /* Fresh-install default theme is Black (v1.3.0); a stored
        preference overrides this in loadPrefs. */
     theme: "black", accent: "#6366f1", density: "comfortable",
-    autorefresh: true, interval: 30,
+    interval: 30,
     proxyPreset: "auto", proxyCustom: "",
     gatewayUrl: "", gatewayType: "go2rtc",
     previews: true
@@ -1548,7 +1546,7 @@ function migrateLayout(raw) {
   delete L.order;
   return L;
 }
-function loadPrefs() { S.prefs = Object.assign(defaultPrefs(), slcGet("prefs", {})); }
+function loadPrefs() { S.prefs = Object.assign(defaultPrefs(), slcGet("prefs", {})); delete S.prefs.autorefresh; /* v2.0.5: autorefresh is always on — drop any stale toggle value from older saved prefs so it can never disable the timer. */ }
 function savePrefs() { slcSet("prefs", S.prefs); }
 function loadLayout() { S.layout = migrateLayout(slcGet("layout", {})); }
 function saveLayout() { slcSet("layout", S.layout); }
@@ -3309,7 +3307,7 @@ function showSettings() {
 function stopAutorefresh() { if (S.timer) { clearInterval(S.timer); S.timer = null; } }
 function startAutorefresh() {
   stopAutorefresh();
-  if (!S.prefs.autorefresh || !S.session) return;
+  if (!S.session) return;
   S.timer = setInterval(async function () {
     if (S.interacting || isEditing()) return;
     /* Rate-limit backoff (v1.2.0): skip this cycle silently — the
@@ -3398,7 +3396,6 @@ function applyPrefs() {
   var soft = S.prefs.accent + "29";
   document.documentElement.style.setProperty("--accent-soft", soft);
   document.body.setAttribute("data-density", S.prefs.density);
-  $("chk-autorefresh").checked = S.prefs.autorefresh;
   $("sel-interval").value = String(S.prefs.interval);
   $("set-interval").value = String(S.prefs.interval);
   $("set-theme").value = S.prefs.theme;
@@ -3464,13 +3461,6 @@ function init() {
   $("inp-search").addEventListener("input", function (ev) { S.query = ev.target.value; renderAll(); });
   $("login-form").addEventListener("submit", submitLogin);
   $("btn-logout").addEventListener("click", doLogout);
-  $("btn-refresh").addEventListener("click", async function () {
-    var ok = await fetchDevices(true);
-    if (ok) renderAll();
-  });
-  $("chk-autorefresh").addEventListener("change", function (ev) {
-    S.prefs.autorefresh = ev.target.checked; savePrefs(); startAutorefresh();
-  });
   function onInterval(v) {
     S.prefs.interval = parseInt(v, 10) || 30; savePrefs(); applyPrefs(); startAutorefresh();
   }
